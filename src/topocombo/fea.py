@@ -76,7 +76,8 @@ class FEResult:
 
     u: np.ndarray  # (2 * n_nodes,) displacements
     compliance: float  # F . U
-    element_compliance: np.ndarray  # (n_elements,) u_e^T k_e u_e
+    element_compliance: np.ndarray  # (n_elements,) u_e^T k_e u_e, density-scaled
+    element_compliance_unscaled: np.ndarray  # (n_elements,) u_e^T k0_e u_e, the SIMP kernel
     von_mises: np.ndarray  # (n_elements,) centroid stress, MPa
     reactions: np.ndarray  # (2 * n_nodes,) K U - F, non-zero on constrained DOFs
     equilibrium_residual: float  # ||K U - F|| on the free DOFs
@@ -219,14 +220,14 @@ def solve(
     residual = k @ u - f
     dofs = element_dofs(mesh.quads)
     ue = u[dofs]  # (n_elements, 8)
-    element_compliance = np.einsum("ei,eij,ej->e", ue, ke_all, ue)
-    if scale is not None:
-        element_compliance = element_compliance * scale
+    unscaled = np.einsum("ei,eij,ej->e", ue, ke_all, ue)
+    element_compliance = unscaled if scale is None else unscaled * scale
 
     return FEResult(
         u=u,
         compliance=float(f @ u),
         element_compliance=element_compliance,
+        element_compliance_unscaled=unscaled,
         von_mises=centroid_von_mises(mesh, u, material, scale),
         reactions=residual,
         equilibrium_residual=float(np.linalg.norm(residual[free])),

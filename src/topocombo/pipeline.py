@@ -8,6 +8,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from .fea import (
     LoadCase,
     Material,
@@ -18,6 +20,13 @@ from .fea import (
 from .geometry import BeamDomain, export_domain
 from .mesh_io import check_mesh, find_node, load_mesh, save_mesh, save_solution
 from .meshing import PHYS_FIXED, MeshSpec, generate_quad_mesh
+from .optimize import (
+    SimpParams,
+    optimize,
+    save_density_field,
+    save_design,
+    save_history,
+)
 from .runlog import RunLog
 
 
@@ -27,13 +36,17 @@ def run(
     out_dir: Path,
     material: Material | None = None,
     load_fy: float = -1000.0,
+    simp: SimpParams | None = None,
+    optimize_design: bool = True,
+    snapshot_every: int = 10,
     echo: bool = True,
 ) -> tuple[RunLog, dict[str, Any]]:
-    """Mesh the design domain, then solve the full-density plane-stress problem."""
+    """Mesh the domain, solve it at full density, then run the SIMP loop."""
     out_dir = Path(out_dir)
     material = material or Material()
+    simp = simp or SimpParams()
     log = RunLog(
-        name="cantilever beam — geometry, meshing and plane-stress solve",
+        name="cantilever beam — meshing, plane-stress solve and SIMP optimization",
         out_dir=out_dir,
         echo=echo,
     )
@@ -42,16 +55,16 @@ def run(
         "mesh": spec.as_dict(),
         "material": material.as_dict(),
         "load": {"fy": load_fy},
+        "simp": simp.as_dict(),
     }
 
     import cadquery
     import meshio
-    import numpy
     import scipy
 
     log.tool("cadquery", cadquery.__version__)
     log.tool("meshio", meshio.__version__)
-    log.tool("numpy", numpy.__version__)
+    log.tool("numpy", np.__version__)
     log.tool("scipy", scipy.__version__)
 
     with log.step("geometry", "1. Define parametric geometry (CadQuery)"):
@@ -188,6 +201,69 @@ def run(
         log.artifact(sol_paths["npz"], "displacements, element compliances, von Mises (numpy)")
         log.artifact(sol_paths["vtu"], "displacement and stress fields for PyVista / ParaView")
         log.log("the SIMP loop reuses this solve per iteration; nothing here plots.")
+
+    if optimize_design:
+        with log.step("optimize", "7. SIMP compliance minimisation"):
+            log.log(
+                f"volume fraction {simp.volume_fraction:g}, penalty p = {simp.penal:g}, "
+                f"{simp.filter_type} filter with radius {simp.filter_radius:g} mm, "
+                f"move limit {simp.move_limit:g}"
+            )
+            log.log(
+                f"stopping at max density change < {simp.tolerance:g} "
+                f"or {simp.max_iterations} iterations"
+            )
+            snapshots_dir = out_dir / "optimization" / "snapshots"
+
+            def on_iteration(record: dict[str, float], densities) -> None:
+                it = int(record["iteration"])
+                if it <= 3 or it % 5 == 0:
+                    log.log(
+                        f"  it {it:3d}  c = {record['compliance']:10.4f}  "
+                        f"vol = {record['volume_fraction']:.4f}  "
+                        f"change = {record['change']:.4f}  "
+                        f"Mnd = {record['measure_of_discreteness']:5.1f}%"
+                    )
+                if snapshot_every and it % snapshot_every == 0:
+                    save_density_field(
+                        mesh, densities, snapshots_dir / f"density_iter_{it:04d}.vtu"
+                    )
+
+            design = optimize(
+                mesh=mesh,
+                material=material,
+                thickness=domain.thickness,
+                load=load,
+                fixed_node_set=PHYS_FIXED,
+                params=simp,
+                on_iteration=on_iteration,
+            )
+            reduction = (design.compliance / result.compliance) if result.compliance else float("nan")
+            log.log(
+                f"{'converged' if design.converged else 'stopped'} after "
+                f"{design.iterations} iterations"
+            )
+            log.log(
+                f"compliance {design.compliance:.4f} N*mm at {design.volume_fraction:.3f} "
+                f"volume fraction ({reduction:.2f}x the full-density compliance, "
+                f"with {simp.volume_fraction:g} of the material)"
+            )
+            log.log(
+                f"measure of discreteness Mnd = {design.measure_of_discreteness():.1f}% "
+                f"({np.mean(design.densities > 0.9) * 100:.0f}% of elements solid, "
+                f"{np.mean(design.densities < 0.1) * 100:.0f}% void)"
+            )
+            opt_summary = design.as_dict()
+            opt_summary["compliance_ratio_to_full_density"] = reduction
+            log.record(**opt_summary)
+            summary["optimization"] = opt_summary
+
+        with log.step("design_export", "8. Write the optimized design"):
+            paths = save_design(mesh, design, out_dir / "optimization")
+            log.artifact(paths["npz"], "optimized density field (numpy)")
+            log.artifact(paths["vtu"], "density field for PyVista / ParaView")
+            csv_path = save_history(design.history, out_dir / "optimization" / "log.csv")
+            log.artifact(csv_path, "per-iteration scalar log (compliance, volume, change)")
 
     json_path, text_path = log.write()
     print(f"\nrun log: {json_path}")

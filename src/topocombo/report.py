@@ -312,6 +312,228 @@ def _ramp_legend(edges: list[float], label: str, n_steps: int = 7) -> str:
     )
 
 
+def _quad_field_svg(
+    nodes: np.ndarray,
+    quads: np.ndarray,
+    bins: np.ndarray,
+    width: int,
+    pad: int,
+    n_steps: int,
+    aria: str,
+    footer: str,
+) -> str:
+    """Shared renderer: one polygon per element, shaded by a pre-binned field."""
+    xmin, ymin = nodes.min(axis=0)
+    xmax, ymax = nodes.max(axis=0)
+    span_x = max(xmax - xmin, 1e-12)
+    span_y = max(ymax - ymin, 1e-12)
+    scale = (width - 2 * pad) / span_x
+    height = int(span_y * scale + 2 * pad)
+
+    def px(p: np.ndarray) -> tuple[float, float]:
+        return (pad + (p[0] - xmin) * scale, height - pad - (p[1] - ymin) * scale)
+
+    parts = [
+        f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" '
+        f'role="img" aria-label="{_e(aria)}">',
+        "<style>"
+        + "".join(
+            f".s{i + 1}{{fill:var(--seq-{i + 1});stroke:var(--seq-{i + 1});stroke-width:0.4}}"
+            for i in range(n_steps)
+        )
+        + ".lbl{fill:var(--muted);font:12px ui-monospace,monospace}"
+        ".ld{stroke:var(--fail);stroke-width:2.4;fill:var(--fail)}"
+        ".undef{fill:none;stroke:var(--muted);stroke-width:1.2;stroke-dasharray:4 4}"
+        "</style>",
+    ]
+    for quad, b in zip(quads, bins):
+        pts = " ".join(f"{x:.2f},{y:.2f}" for x, y in (px(nodes[i]) for i in quad))
+        parts.append(f'<polygon class="s{int(b) + 1}" points="{pts}"/>')
+
+    parts.append(
+        f'<text class="lbl" x="{width / 2:.2f}" y="{height - 12:.2f}" text-anchor="middle">'
+        f"{_e(footer)}</text>"
+    )
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
+def density_svg(
+    mesh_npz: Path, density_npz: Path, width: int = 900, pad: int = 46, n_steps: int = 7
+) -> str:
+    """The optimized density field, one shading step per 1/7 of density."""
+    mesh_data = np.load(mesh_npz)
+    densities = np.asarray(np.load(density_npz)["densities"], dtype=float)
+    bins = np.clip((densities * n_steps).astype(int), 0, n_steps - 1)
+    return _quad_field_svg(
+        nodes=mesh_data["nodes"],
+        quads=mesh_data["quads"],
+        bins=bins,
+        width=width,
+        pad=pad,
+        n_steps=n_steps,
+        aria="Optimized density field of the cantilever beam",
+        footer=f"{densities.size} design variables, one density per element",
+    )
+
+
+# --------------------------------------------------------------------------
+# convergence charts
+# --------------------------------------------------------------------------
+def _nice_ticks(lo: float, hi: float, count: int = 4) -> list[float]:
+    """Round tick values (1, 2, 5 x 10^k) spanning [lo, hi]."""
+    if hi <= lo:
+        return [lo]
+    raw = (hi - lo) / max(count, 1)
+    magnitude = 10.0 ** np.floor(np.log10(raw))
+    step = next(
+        (m * magnitude for m in (1.0, 2.0, 5.0, 10.0) if m * magnitude >= raw), 10 * magnitude
+    )
+    start = np.floor(lo / step) * step
+    ticks = []
+    value = start
+    while value <= hi + 0.5 * step:
+        if value >= lo - 1e-12:
+            ticks.append(float(value))
+        value += step
+    return ticks
+
+
+def line_chart_svg(
+    xs: list[float],
+    ys: list[float],
+    title: str,
+    value_label: str,
+    log_y: bool = False,
+    reference: tuple[float, str] | None = None,
+    width: int = 430,
+    height: int = 210,
+) -> str:
+    """A single-series line chart: 2px line, hairline grid, one end label.
+
+    One series, so no legend box — the title names what is plotted. Values that
+    are not directly labelled live in the iteration table below the charts.
+    """
+    left, right, top, bottom = 54, 62, 18, 30
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+
+    def ty(value: float) -> float:
+        return np.log10(max(value, 1e-12)) if log_y else value
+
+    y_vals = [ty(v) for v in ys]
+    y_lo, y_hi = min(y_vals), max(y_vals)
+    if reference is not None:
+        y_lo = min(y_lo, ty(reference[0]))
+    if y_hi - y_lo < 1e-12:
+        y_hi = y_lo + 1.0
+    pad_y = 0.08 * (y_hi - y_lo)
+    y_lo, y_hi = y_lo - pad_y, y_hi + pad_y
+
+    x_lo, x_hi = min(xs), max(xs)
+    x_span = max(x_hi - x_lo, 1e-12)
+
+    def sx(x: float) -> float:
+        return left + (x - x_lo) / x_span * plot_w
+
+    def sy(v: float) -> float:
+        return top + (y_hi - v) / (y_hi - y_lo) * plot_h
+
+    if log_y:
+        decades = range(int(np.floor(y_lo)), int(np.ceil(y_hi)) + 1)
+        y_ticks = [(10.0**d, f"1e{d}") for d in decades if y_lo <= d <= y_hi]
+    else:
+        y_ticks = [(t, f"{t:,.0f}") for t in _nice_ticks(y_lo, y_hi)]
+
+    parts = [
+        f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" '
+        f'role="img" aria-label="{_e(title)}">',
+        "<style>"
+        ".grid{stroke:var(--border);stroke-width:1;fill:none}"
+        ".ln{stroke:var(--seq-4);stroke-width:2;fill:none;stroke-linejoin:round;"
+        "stroke-linecap:round}"
+        ".dot{fill:var(--seq-4);stroke:var(--panel);stroke-width:2}"
+        ".ax{fill:var(--muted);font:11px ui-monospace,monospace}"
+        ".ttl{fill:var(--text);font:600 12px -apple-system,BlinkMacSystemFont,sans-serif}"
+        ".ref{stroke:var(--muted);stroke-width:1;fill:none}"
+        "</style>",
+        f'<text class="ttl" x="{left - 40}" y="12">{_e(title)}</text>',
+    ]
+
+    for value, label in y_ticks:
+        y = sy(ty(value))
+        parts.append(f'<line class="grid" x1="{left}" y1="{y:.1f}" x2="{left + plot_w}" y2="{y:.1f}"/>')
+        parts.append(
+            f'<text class="ax" x="{left - 8}" y="{y + 3.5:.1f}" text-anchor="end">{_e(label)}</text>'
+        )
+
+    if reference is not None:
+        ref_value, ref_label = reference
+        y = sy(ty(ref_value))
+        parts.append(f'<line class="ref" x1="{left}" y1="{y:.1f}" x2="{left + plot_w}" y2="{y:.1f}"/>')
+        parts.append(f'<text class="ax" x="{left + 4}" y="{y - 5:.1f}">{_e(ref_label)}</text>')
+
+    points = " ".join(f"{sx(x):.1f},{sy(v):.1f}" for x, v in zip(xs, y_vals))
+    parts.append(f'<polyline class="ln" points="{points}"/>')
+    parts.append(f'<circle class="dot" cx="{sx(xs[-1]):.1f}" cy="{sy(y_vals[-1]):.1f}" r="4.5"/>')
+    parts.append(
+        f'<text class="ax" x="{sx(xs[-1]) + 9:.1f}" y="{sy(y_vals[-1]) + 4:.1f}">'
+        f"{_e(value_label)}</text>"
+    )
+
+    baseline = top + plot_h
+    parts.append(f'<line class="grid" x1="{left}" y1="{baseline}" x2="{left + plot_w}" y2="{baseline}"/>')
+    for x in (x_lo, x_hi):
+        parts.append(
+            f'<text class="ax" x="{sx(x):.1f}" y="{baseline + 16:.1f}" text-anchor="middle">'
+            f"{int(x)}</text>"
+        )
+    parts.append(
+        f'<text class="ax" x="{left + plot_w / 2:.1f}" y="{height - 4:.1f}" text-anchor="middle">'
+        "iteration</text>"
+    )
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
+def read_history(csv_path: Path) -> list[dict[str, float]]:
+    """Parse the loop's ``log.csv`` — the report reads the artifact, not the loop."""
+    rows: list[dict[str, float]] = []
+    lines = Path(csv_path).read_text().strip().splitlines()
+    if not lines:
+        return rows
+    header = lines[0].split(",")
+    for line in lines[1:]:
+        values = line.split(",")
+        rows.append({k: float(v) for k, v in zip(header, values)})
+    return rows
+
+
+def _history_table(history: list[dict[str, float]], every: int = 5) -> str:
+    """Table view of the convergence charts — every value, nothing gated by hover."""
+    picked = [
+        row
+        for i, row in enumerate(history)
+        if i == 0 or i == len(history) - 1 or (i + 1) % every == 0
+    ]
+    rows = "".join(
+        f"<tr><td class='num'>{int(r['iteration'])}</td>"
+        f"<td class='num'>{r['compliance']:.4g}</td>"
+        f"<td class='num'>{r['volume_fraction']:.4f}</td>"
+        f"<td class='num'>{r['change']:.4f}</td>"
+        f"<td class='num'>{r['measure_of_discreteness']:.1f}</td></tr>"
+        for r in picked
+    )
+    return (
+        "<details><summary>Iteration table (every "
+        f"{every}th iteration, plus the first and last)</summary>"
+        "<table><thead><tr><th class='num'>Iter</th><th class='num'>Compliance</th>"
+        "<th class='num'>Volume</th><th class='num'>Max change</th>"
+        "<th class='num'>Mnd %</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table></details>"
+    )
+
+
 # --------------------------------------------------------------------------
 # page
 # --------------------------------------------------------------------------
@@ -356,6 +578,36 @@ def _solve_cards(solve: dict[str, Any]) -> str:
                 "Equilibrium",
                 f"{solve.get('equilibrium_residual', 0):.1e}",
                 f"||KU-F|| on {solve.get('n_free_dofs', 0)} free DOFs",
+            ),
+        ]
+    )
+
+
+def _optimization_cards(opt: dict[str, Any], solve: dict[str, Any]) -> str:
+    ratio = opt.get("compliance_ratio_to_full_density")
+    return _cards(
+        [
+            (
+                "Compliance",
+                f"{opt.get('compliance', 0):.4g}",
+                "N\u00b7mm at the optimized design"
+                + (f", {ratio:.2f}x the solid beam" if ratio else ""),
+            ),
+            (
+                "Material used",
+                f"{opt.get('volume_fraction', 0) * 100:.1f}%",
+                "of the design domain, the volume constraint",
+            ),
+            (
+                "Iterations",
+                opt.get("iterations", "-"),
+                "converged" if opt.get("converged") else "hit the iteration cap",
+            ),
+            (
+                "Discreteness",
+                f"{opt.get('measure_of_discreteness', 0):.1f}%",
+                f"Mnd; {opt.get('solid_fraction', 0) * 100:.0f}% solid,"
+                f" {opt.get('void_fraction', 0) * 100:.0f}% void",
             ),
         ]
     )
@@ -449,6 +701,8 @@ def render_html(
     svg: str,
     copied: dict[str, str],
     solve_figure: tuple[str, list[float]] | None = None,
+    density_figure: str | None = None,
+    history: list[dict[str, float]] | None = None,
 ) -> str:
     params = run.get("params", {})
     domain = params.get("domain", {})
@@ -458,11 +712,14 @@ def render_html(
 
     summary: dict[str, Any] = {}
     solve: dict[str, Any] = {}
+    optimization: dict[str, Any] = {}
     for step in run.get("steps", []):
         if step.get("name") == "validation":
             summary = step.get("data", {})
         elif step.get("name") == "solve":
             solve = step.get("data", {})
+        elif step.get("name") == "optimize":
+            optimization = step.get("data", {})
 
     chips = [f"run {run.get('started_at', '')}", f"{run.get('duration_s', 0):.2f} s total"]
     chips += [f"{name} {version}" for name, version in tools.items()]
@@ -481,11 +738,20 @@ def render_html(
         ("load edge node set size", summary.get("node_sets", {}).get("load_edge")),
     ]
     material = params.get("material", {})
+    simp = params.get("simp", {})
     if material:
         param_rows += [
             ("Young's modulus E (MPa)", material.get("youngs_modulus")),
             ("Poisson's ratio", material.get("poisson_ratio")),
             ("tip load Fy (N)", params.get("load", {}).get("fy")),
+        ]
+    if simp:
+        param_rows += [
+            ("target volume fraction", simp.get("volume_fraction")),
+            ("SIMP penalty p", simp.get("penal")),
+            ("filter", f"{simp.get('filter_type')}, r = {simp.get('filter_radius')} mm"),
+            ("move limit", simp.get("move_limit")),
+            ("convergence tolerance", simp.get("tolerance")),
         ]
 
     solve_section = ""
@@ -512,6 +778,55 @@ def render_html(
             + figure
         )
 
+    optimization_section = ""
+    if optimization:
+        charts = ""
+        if history:
+            xs = [row["iteration"] for row in history]
+            compliance_chart = line_chart_svg(
+                xs,
+                [row["compliance"] for row in history],
+                title="Compliance per iteration (N\u00b7mm)",
+                value_label=f"{history[-1]['compliance']:.0f}",
+            )
+            change_chart = line_chart_svg(
+                xs,
+                [max(row["change"], 1e-6) for row in history],
+                title="Max density change (log scale)",
+                value_label=f"{history[-1]['change']:.3f}",
+                log_y=True,
+                reference=(simp.get("tolerance", 0.01), f"tol {simp.get('tolerance', 0.01):g}"),
+            )
+            charts = (
+                "<div class='grid'>"
+                f"<div class='card'>{compliance_chart}</div>"
+                f"<div class='card'>{change_chart}</div>"
+                "</div>" + _history_table(history)
+            )
+        density_fig = ""
+        if density_figure is not None:
+            density_fig = (
+                "<figure>"
+                + density_figure
+                + _ramp_legend([0.0, 1.0], "element density x (0 = void, 1 = solid)")
+                + "<figcaption>The optimizer keeps material where it carries load: flanges top"
+                " and bottom, a triangulated web, and members converging on the clamped edge and"
+                " the load point. Intermediate densities are the \u201cgrey\u201d that SIMP's penalty"
+                " pushes towards 0 or 1 — the Mnd figure above says how much of it is left."
+                "</figcaption>"
+                "</figure>"
+            )
+        optimization_section = (
+            "<h2>Topology optimization</h2>"
+            "<p class='lede'>SIMP compliance minimisation under a volume constraint:"
+            f" p = {_e(simp.get('penal', 3))}, {_e(simp.get('filter_type', ''))} filter of radius"
+            f" {_e(simp.get('filter_radius', ''))} mm, Optimality Criteria update with a"
+            f" {_e(simp.get('move_limit', ''))} move limit.</p>"
+            + _optimization_cards(optimization, solve)
+            + density_fig
+            + charts
+        )
+
     all_ok = summary.get("all_checks_passed", False)
 
     return f"""<!DOCTYPE html>
@@ -526,13 +841,13 @@ def render_html(
 <body>
 <div class="wrap">
 <header class="top">
-  <h1>Cantilever beam — mesh and solve</h1>
+  <h1>Cantilever beam — mesh, solve, optimize</h1>
   <p class="lede">
     The <a href="https://github.com/anroleroux/topocombo">topocombo</a> pipeline so far, run end
     to end: a parametric design domain defined in CadQuery, exported to BREP, meshed into
-    structured quadrilaterals with Gmsh, and solved as a plane-stress problem at full density with
-    the custom solver. The SIMP loop is not part of this run — it stops at the compliance and the
-    per-element sensitivities the optimizer will iterate on.
+    structured quadrilaterals with Gmsh, solved as a plane-stress problem with the custom solver,
+    and driven through a SIMP compliance-minimisation loop until the density field converges.
+    Every number and figure below comes from the artifacts this run wrote to disk.
   </p>
   <div class="meta">{''.join(f"<span class='chip'>{_e(c)}</span>" for c in chips)}</div>
 </header>
@@ -552,6 +867,8 @@ def render_html(
 </figure>
 
 {solve_section}
+
+{optimization_section}
 
 <h2>Procedure</h2>
 <p class="lede">Terminal output of the run, one block per stage, exactly as it was logged.</p>
@@ -573,8 +890,8 @@ def render_html(
 
 <footer>
   Generated by <code>python -m topocombo.cli report</code> from <code>run.json</code>,
-  <code>mesh.npz</code> and <code>solution.npz</code>. Next stage: the SIMP
-  compliance-minimisation loop (density filtering, OC/MMA update) on top of this solve.
+  <code>mesh.npz</code>, <code>solution.npz</code>, <code>density.npz</code> and the loop's
+  <code>log.csv</code> — no plotting happens inside the pipeline itself.
 </footer>
 </div>
 </body>
@@ -614,6 +931,14 @@ def build_site(run_dir: Path, site_dir: Path) -> Path:
         solution_svg(mesh_npz, solution_npz) if solution_npz.exists() else None
     )
 
+    density_npz = run_dir / "optimization" / "density.npz"
+    density_figure = density_svg(mesh_npz, density_npz) if density_npz.exists() else None
+
+    history_csv = run_dir / "optimization" / "log.csv"
+    history = read_history(history_csv) if history_csv.exists() else None
+
     index = site_dir / "index.html"
-    index.write_text(render_html(run, svg, copied, solve_figure))
+    index.write_text(
+        render_html(run, svg, copied, solve_figure, density_figure, history)
+    )
     return index

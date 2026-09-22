@@ -6,6 +6,7 @@ import json
 
 import numpy as np
 import pytest
+from scipy.spatial import cKDTree
 
 from topocombo.geometry import BeamDomain
 from topocombo.mesh_io import load_mesh
@@ -248,7 +249,152 @@ def test_solution_artifacts_written(coarse_run):
 def test_run_records_the_solve(coarse_run):
     run_json = json.loads((coarse_run["dir"] / "run.json").read_text())
     names = [s["name"] for s in run_json["steps"]]
-    assert names == ["geometry", "meshing", "validation", "export", "solve", "solution_export"]
+    assert names[:6] == ["geometry", "meshing", "validation", "export", "solve", "solution_export"]
     solve_step = next(s for s in run_json["steps"] if s["name"] == "solve")
     assert solve_step["data"]["compliance"] > 0.0
     assert solve_step["data"]["beam_theory_rel_diff"] < 0.25  # stubby beam, loose bound
+
+
+# --------------------------------------------------------------------------
+# SIMP loop
+# --------------------------------------------------------------------------
+from topocombo.optimize import (  # noqa: E402
+    SimpParams,
+    build_filter,
+    element_centroids,
+    oc_update,
+    optimize,
+    save_history,
+)
+from topocombo.report import read_history  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def optimized(slender_beam):
+    """A short, coarse optimization run — enough to exercise every code path."""
+    params = SimpParams(
+        volume_fraction=0.4, filter_radius=2.0, max_iterations=25, tolerance=0.02
+    )
+    seen: list[dict[str, float]] = []
+    result = optimize(
+        mesh=slender_beam["mesh"],
+        material=slender_beam["material"],
+        thickness=slender_beam["domain"].thickness,
+        load=slender_beam["load"],
+        fixed_node_set=PHYS_FIXED,
+        params=params,
+        on_iteration=lambda record, densities: seen.append(record),
+    )
+    return {**slender_beam, "result": result, "params": params, "seen": seen}
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"volume_fraction": 0.0},
+        {"volume_fraction": 1.5},
+        {"penal": 0.5},
+        {"filter_radius": 0.0},
+        {"filter_type": "gaussian"},
+    ],
+)
+def test_simp_params_are_validated(bad):
+    with pytest.raises(ValueError):
+        SimpParams(**bad)
+
+
+def test_filter_is_symmetric_and_preserves_a_uniform_field(coarse_run):
+    mesh = load_mesh(coarse_run["dir"] / "mesh" / "beam.msh")
+    h, hs = build_filter(mesh, radius=2.0)
+
+    assert abs(h - h.T).max() == 0.0  # weights depend only on distance
+    uniform = np.full(mesh.n_elements, 0.37)
+    assert np.allclose(np.asarray(h @ uniform).ravel() / hs, uniform)
+
+
+def test_filter_radius_controls_the_neighbourhood(coarse_run):
+    mesh = load_mesh(coarse_run["dir"] / "mesh" / "beam.msh")
+    centroids = element_centroids(mesh)
+    small, _ = build_filter(mesh, radius=1.01)
+    large, _ = build_filter(mesh, radius=3.0)
+
+    assert small.nnz < large.nnz
+    # no weight reaches past the radius
+    rows, cols = large.nonzero()
+    assert np.linalg.norm(centroids[rows] - centroids[cols], axis=1).max() <= 3.0
+
+
+def test_oc_update_respects_move_limits_and_bounds():
+    rng = np.random.default_rng(0)
+    n = 50
+    x = np.full(n, 0.5)
+    dc = -rng.random(n)
+    dv = np.full(n, 1.0 / n)
+    x_new = oc_update(
+        x=x, dc=dc, dv=dv, volume_fraction=0.4, move=0.1, volume_of=lambda d: float(d.mean())
+    )
+    assert np.all(x_new >= 0.0) and np.all(x_new <= 1.0)
+    assert np.abs(x_new - x).max() <= 0.1 + 1e-12
+    assert x_new.mean() == pytest.approx(0.4, abs=1e-6)
+
+
+def test_optimization_holds_the_volume_constraint(optimized):
+    target = optimized["params"].volume_fraction
+    assert optimized["result"].volume_fraction == pytest.approx(target, abs=1e-6)
+    for record in optimized["seen"]:
+        assert record["volume_fraction"] == pytest.approx(target, abs=1e-6)
+
+
+def test_optimization_reduces_compliance(optimized):
+    history = optimized["result"].history
+    assert history[-1]["compliance"] < history[0]["compliance"]
+    # and beats a uniform design of the same volume, which is the naive alternative
+    uniform = solve(
+        optimized["mesh"], optimized["material"], optimized["domain"].thickness,
+        optimized["load"], PHYS_FIXED,
+        densities=np.full(optimized["mesh"].n_elements, optimized["params"].volume_fraction),
+        penal=optimized["params"].penal,
+    )
+    assert optimized["result"].compliance < uniform.compliance
+
+
+def test_densities_stay_in_bounds_and_report_discreteness(optimized):
+    x = optimized["result"].densities
+    assert x.min() >= 0.0 and x.max() <= 1.0 + 1e-12
+    assert 0.0 <= optimized["result"].measure_of_discreteness() <= 100.0
+
+
+def test_design_is_symmetric_about_mid_height(optimized):
+    """The load sits at mid-height, so the optimum must be top-bottom symmetric."""
+    mesh = optimized["mesh"]
+    height = optimized["domain"].height
+    centroids = element_centroids(mesh)
+    mirrored = np.column_stack([centroids[:, 0], height - centroids[:, 1]])
+
+    tree = cKDTree(centroids)
+    dist, partner = tree.query(mirrored)
+    assert dist.max() < 1e-6  # every element has a mirror image in this mesh
+
+    x = optimized["result"].densities
+    assert np.abs(x - x[partner]).max() < 1e-6
+
+
+def test_history_csv_roundtrips(optimized, tmp_path):
+    path = save_history(optimized["result"].history, tmp_path / "log.csv")
+    rows = read_history(path)
+    assert len(rows) == len(optimized["result"].history)
+    assert rows[-1]["compliance"] == pytest.approx(
+        optimized["result"].history[-1]["compliance"], rel=1e-9
+    )
+    assert path.read_text().splitlines()[0].startswith("iteration,compliance")
+
+
+def test_pipeline_writes_the_design(coarse_run):
+    data = np.load(coarse_run["dir"] / "optimization" / "density.npz")
+    assert data["densities"].shape == (coarse_run["spec"].n_elements,)
+    assert (coarse_run["dir"] / "optimization" / "density.vtu").exists()
+    assert (coarse_run["dir"] / "optimization" / "log.csv").exists()
+
+    run_json = json.loads((coarse_run["dir"] / "run.json").read_text())
+    names = [s["name"] for s in run_json["steps"]]
+    assert names[-2:] == ["optimize", "design_export"]

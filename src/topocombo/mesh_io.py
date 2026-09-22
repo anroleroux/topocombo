@@ -173,3 +173,41 @@ def save_mesh(
     meshio.write_points_cells(str(vtu), points3d, [("quad", mesh.quads)])
 
     return {"npz": npz, "vtu": vtu}
+
+
+def save_solution(mesh: QuadMesh, result: Any, out_dir: Path) -> dict[str, Path]:
+    """Write the FEA result as ``solution.npz`` (solver-facing) and ``solution.vtu``.
+
+    ``result`` is a :class:`topocombo.fea.FEResult`; it is taken structurally to
+    keep this module free of a dependency on the solver.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    displacements = result.u.reshape(-1, 2)
+    npz = out_dir / "solution.npz"
+    np.savez_compressed(
+        npz,
+        displacements=displacements,
+        compliance=np.asarray([result.compliance]),
+        element_compliance=result.element_compliance,
+        von_mises=result.von_mises,
+        reactions=result.reactions.reshape(-1, 2),
+    )
+
+    vtu = out_dir / "solution.vtu"
+    points3d = np.column_stack([mesh.nodes, np.zeros(mesh.n_nodes)])
+    meshio.write_points_cells(
+        str(vtu),
+        points3d,
+        [("quad", mesh.quads)],
+        point_data={
+            "displacement": np.column_stack([displacements, np.zeros(mesh.n_nodes)]),
+        },
+        cell_data={
+            "element_compliance": [result.element_compliance],
+            "von_mises": [result.von_mises],
+        },
+    )
+
+    return {"npz": npz, "vtu": vtu}

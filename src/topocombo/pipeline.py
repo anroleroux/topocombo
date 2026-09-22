@@ -8,9 +8,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .fea import (
+    LoadCase,
+    Material,
+    element_stiffnesses,
+    solve as fea_solve,
+    timoshenko_tip_deflection,
+)
 from .geometry import BeamDomain, export_domain
-from .mesh_io import check_mesh, find_node, load_mesh, save_mesh
-from .meshing import MeshSpec, generate_quad_mesh
+from .mesh_io import check_mesh, find_node, load_mesh, save_mesh, save_solution
+from .meshing import PHYS_FIXED, MeshSpec, generate_quad_mesh
 from .runlog import RunLog
 
 
@@ -18,21 +25,34 @@ def run(
     domain: BeamDomain,
     spec: MeshSpec,
     out_dir: Path,
+    material: Material | None = None,
+    load_fy: float = -1000.0,
     echo: bool = True,
 ) -> tuple[RunLog, dict[str, Any]]:
-    """Build the design domain, mesh it, validate the mesh and export artifacts."""
+    """Mesh the design domain, then solve the full-density plane-stress problem."""
     out_dir = Path(out_dir)
-    log = RunLog(name="cantilever beam — geometry and meshing", out_dir=out_dir, echo=echo)
-    log.params = {"domain": domain.as_dict(), "mesh": spec.as_dict()}
+    material = material or Material()
+    log = RunLog(
+        name="cantilever beam — geometry, meshing and plane-stress solve",
+        out_dir=out_dir,
+        echo=echo,
+    )
+    log.params = {
+        "domain": domain.as_dict(),
+        "mesh": spec.as_dict(),
+        "material": material.as_dict(),
+        "load": {"fy": load_fy},
+    }
 
     import cadquery
-    import gmsh
     import meshio
     import numpy
+    import scipy
 
     log.tool("cadquery", cadquery.__version__)
     log.tool("meshio", meshio.__version__)
     log.tool("numpy", numpy.__version__)
+    log.tool("scipy", scipy.__version__)
 
     with log.step("geometry", "1. Define parametric geometry (CadQuery)"):
         log.log(
@@ -92,11 +112,82 @@ def run(
             raise RuntimeError(f"mesh validation failed: {', '.join(failed)}")
         log.record(**summary)
 
-    with log.step("export", "4. Write result artifacts"):
+    with log.step("export", "4. Write mesh artifacts"):
         paths = save_mesh(mesh, out_dir / "mesh", load_node=load_node)
         log.artifact(paths["npz"], "nodes, quad connectivity and boundary node sets (numpy)")
         log.artifact(paths["vtu"], "mesh for PyVista / ParaView")
-        log.log("next stages (FEA solve, SIMP loop) consume mesh.npz; nothing here plots.")
+
+    with log.step("solve", "5. Assemble and solve (plane stress, full density)"):
+        load = LoadCase(node=load_node, fy=load_fy)
+        log.log(
+            f"material: E = {material.youngs_modulus:g} MPa, nu = {material.poisson_ratio:g}, "
+            f"G = {material.shear_modulus:g} MPa"
+        )
+        log.log(
+            f"boundary conditions: node set '{PHYS_FIXED}' clamped "
+            f"({2 * summary['node_sets'][PHYS_FIXED]} DOFs), "
+            f"Fy = {load.fy:g} N at node {load.node}"
+        )
+        ke_all = element_stiffnesses(mesh, material, domain.thickness)
+        log.log(f"assembled {ke_all.shape[0]} element stiffness matrices (8x8, 2x2 Gauss)")
+        result = fea_solve(
+            mesh=mesh,
+            material=material,
+            thickness=domain.thickness,
+            load=load,
+            fixed_node_set=PHYS_FIXED,
+            ke_all=ke_all,
+        )
+        beam = timoshenko_tip_deflection(
+            domain.length, domain.height, domain.thickness, material, load.fy
+        )
+        tip_uy = float(result.u[2 * load_node + 1])
+        rel = abs(abs(tip_uy) - beam["total"]) / beam["total"]
+        reaction_y = float(result.reactions[1::2].sum())
+
+        log.log(f"solved {result.n_free_dofs} free DOFs (sparse direct)")
+        log.log(f"compliance F.U = {result.compliance:.6g} N*mm")
+        log.log(f"tip deflection uy = {tip_uy:.6g} mm")
+        log.log(
+            f"Timoshenko beam theory: {beam['total']:.6g} mm "
+            f"(bending {beam['bending']:.4g} + shear {beam['shear']:.4g}) "
+            f"-> {rel * 100:.2f}% difference"
+        )
+        log.log(
+            f"equilibrium: ||KU - F|| on free DOFs = {result.equilibrium_residual:.3e}, "
+            f"sum of vertical reactions = {reaction_y:.6g} N vs applied {-load.fy:g} N"
+        )
+        log.log(
+            f"von Mises at centroids: {result.von_mises.min():.4g} – "
+            f"{result.von_mises.max():.4g} MPa"
+        )
+        log.log(
+            "element compliances u_e^T k_e u_e sum to "
+            f"{result.element_compliance.sum():.6g} N*mm — the SIMP sensitivity basis"
+        )
+        solve_summary = {
+            "compliance": result.compliance,
+            "tip_uy": tip_uy,
+            "max_deflection": result.max_deflection(),
+            "beam_theory": beam,
+            "beam_theory_rel_diff": rel,
+            "equilibrium_residual": result.equilibrium_residual,
+            "reaction_y": reaction_y,
+            "n_free_dofs": result.n_free_dofs,
+            "von_mises_min": float(result.von_mises.min()),
+            "von_mises_max": float(result.von_mises.max()),
+            "element_compliance_sum": float(result.element_compliance.sum()),
+            "load": load.as_dict(),
+            "material": material.as_dict(),
+        }
+        log.record(**solve_summary)
+        summary["solve"] = solve_summary
+
+    with log.step("solution_export", "6. Write solution artifacts"):
+        sol_paths = save_solution(mesh, result, out_dir / "solution")
+        log.artifact(sol_paths["npz"], "displacements, element compliances, von Mises (numpy)")
+        log.artifact(sol_paths["vtu"], "displacement and stress fields for PyVista / ParaView")
+        log.log("the SIMP loop reuses this solve per iteration; nothing here plots.")
 
     json_path, text_path = log.write()
     print(f"\nrun log: {json_path}")

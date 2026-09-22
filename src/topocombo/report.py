@@ -22,6 +22,9 @@ _CSS = """
   --bg: #ffffff; --panel: #f6f7f9; --border: #d9dee5; --text: #1b1f24;
   --muted: #5b6672; --accent: #2f6f4f; --accent-soft: #e5f0ea;
   --fail: #a32020; --code-bg: #f0f2f5;
+  /* sequential ramp for magnitude fields, one hue light -> dark */
+  --seq-1: #cde2fb; --seq-2: #9ec5f4; --seq-3: #6da7ec; --seq-4: #3987e5;
+  --seq-5: #256abf; --seq-6: #184f95; --seq-7: #0d366b;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 @media (prefers-color-scheme: dark) {
@@ -29,6 +32,9 @@ _CSS = """
     --bg: #12151a; --panel: #1a1f26; --border: #2c333d; --text: #e6eaef;
     --muted: #9aa5b1; --accent: #6fbf93; --accent-soft: #1d2a24;
     --fail: #e07a7a; --code-bg: #0e1116;
+    /* on a dark surface the ramp runs the other way: low recedes, high stands out */
+    --seq-1: #104281; --seq-2: #184f95; --seq-3: #256abf; --seq-4: #3987e5;
+    --seq-5: #5598e7; --seq-6: #86b6ef; --seq-7: #cde2fb;
   }
 }
 * { box-sizing: border-box; }
@@ -78,6 +84,10 @@ code { font-family: var(--mono); font-size: 0.86em; background: var(--code-bg);
        padding: 1px 5px; border-radius: 4px; }
 a { color: var(--accent); }
 .pass { color: var(--accent); font-family: var(--mono); }
+.legend { display: flex; align-items: center; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+.legend .swatches { display: flex; }
+.legend .swatches span { width: 26px; height: 12px; display: block; }
+.legend .lbl { color: var(--muted); font-family: var(--mono); font-size: 0.75rem; }
 .fail { color: var(--fail); font-family: var(--mono); }
 footer { margin-top: 56px; padding-top: 20px; border-top: 1px solid var(--border);
          color: var(--muted); font-size: 0.85rem; }
@@ -198,6 +208,110 @@ def mesh_svg(npz_path: Path, width: int = 900, pad: int = 46) -> str:
     return "\n".join(parts)
 
 
+def solution_svg(
+    mesh_npz: Path,
+    solution_npz: Path,
+    width: int = 900,
+    pad: int = 46,
+    n_steps: int = 7,
+) -> tuple[str, list[float]]:
+    """Deformed mesh shaded by element compliance; returns (svg, log-scale bin edges).
+
+    The field spans several orders of magnitude (the clamped corners carry almost
+    all of the strain energy), so the shading bins are even in log10 — a linear
+    ramp would paint everything but the support the lightest step.
+    """
+    mesh_data = np.load(mesh_npz)
+    sol = np.load(solution_npz)
+    nodes = mesh_data["nodes"]
+    quads = mesh_data["quads"]
+    disp = sol["displacements"]
+    field = np.asarray(sol["element_compliance"], dtype=float)
+
+    xmin, ymin = nodes.min(axis=0)
+    xmax, ymax = nodes.max(axis=0)
+    span_x = max(xmax - xmin, 1e-12)
+    span_y = max(ymax - ymin, 1e-12)
+    scale = (width - 2 * pad) / span_x
+    height = int(span_y * scale + 2 * pad)
+
+    # exaggerate the deformation to ~12% of the beam height so it is legible
+    max_disp = float(np.abs(disp).max())
+    exaggeration = (0.12 * span_y / max_disp) if max_disp > 0 else 1.0
+    deformed = nodes + exaggeration * disp
+
+    def px(p: np.ndarray) -> tuple[float, float]:
+        return (pad + (p[0] - xmin) * scale, height - pad - (p[1] - ymin) * scale)
+
+    positive = field[field > 0]
+    lo = float(positive.min()) if positive.size else 1e-12
+    hi = float(field.max()) if field.max() > lo else lo * 10.0
+    edges = np.linspace(np.log10(lo), np.log10(hi), n_steps + 1)
+    bins = np.clip(
+        np.digitize(np.log10(np.maximum(field, lo)), edges[1:-1]), 0, n_steps - 1
+    )
+
+    parts: list[str] = [
+        f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" '
+        f'role="img" aria-label="Deformed cantilever beam shaded by element compliance">',
+        "<style>"
+        + "".join(
+            f".s{i + 1}{{fill:var(--seq-{i + 1});stroke:var(--seq-{i + 1});stroke-width:0.4}}"
+            for i in range(n_steps)
+        )
+        + ".undef{fill:none;stroke:var(--muted);stroke-width:1.2;stroke-dasharray:4 4}"
+        ".lbl{fill:var(--muted);font:12px ui-monospace,monospace}"
+        ".ld{stroke:var(--fail);stroke-width:2.4;fill:var(--fail)}"
+        "</style>",
+    ]
+
+    undeformed_outline = [
+        px(np.array([xmin, ymin])),
+        px(np.array([xmax, ymin])),
+        px(np.array([xmax, ymax])),
+        px(np.array([xmin, ymax])),
+    ]
+    parts.append(
+        '<polygon class="undef" points="'
+        + " ".join(f"{x:.2f},{y:.2f}" for x, y in undeformed_outline)
+        + '"/>'
+    )
+
+    for quad, b in zip(quads, bins):
+        pts = " ".join(f"{x:.2f},{y:.2f}" for x, y in (px(deformed[i]) for i in quad))
+        parts.append(f'<polygon class="s{int(b) + 1}" points="{pts}"/>')
+
+    if "load_node" in mesh_data:
+        ln = int(mesh_data["load_node"][0])
+        lx, ly = px(deformed[ln])
+        parts.append(f'<line class="ld" x1="{lx:.2f}" y1="{ly - 34:.2f}" x2="{lx:.2f}" y2="{ly:.2f}"/>')
+        parts.append(
+            f'<polygon class="ld" points="{lx:.2f},{ly:.2f} {lx - 5:.2f},{ly - 11:.2f} '
+            f'{lx + 5:.2f},{ly - 11:.2f}"/>'
+        )
+
+    parts.append(
+        f'<text class="lbl" x="{width / 2:.2f}" y="{height - 12:.2f}" text-anchor="middle">'
+        f'displacements exaggerated {exaggeration:.0f}x (dashed: undeformed domain)</text>'
+    )
+    parts.append("</svg>")
+    return "\n".join(parts), [float(10.0**e) for e in edges]
+
+
+def _ramp_legend(edges: list[float], label: str, n_steps: int = 7) -> str:
+    swatches = "".join(
+        f"<span style='background:var(--seq-{i + 1})'></span>" for i in range(n_steps)
+    )
+    return (
+        "<div class='legend'>"
+        f"<span class='lbl'>{_e(f'{edges[0]:.2g}')}</span>"
+        f"<span class='swatches'>{swatches}</span>"
+        f"<span class='lbl'>{_e(f'{edges[-1]:.2g}')}</span>"
+        f"<span class='lbl'>{_e(label)}</span>"
+        "</div>"
+    )
+
+
 # --------------------------------------------------------------------------
 # page
 # --------------------------------------------------------------------------
@@ -208,31 +322,7 @@ def _kv_table(rows: list[tuple[str, Any]]) -> str:
     return f"<table><thead><tr><th>Parameter</th><th class='num'>Value</th></tr></thead><tbody>{body}</tbody></table>"
 
 
-def _stat_cards(summary: dict[str, Any], params: dict[str, Any]) -> str:
-    domain = params.get("domain", {})
-    mesh = params.get("mesh", {})
-    cards = [
-        (
-            "Elements",
-            summary.get("n_elements", "—"),
-            f"{mesh.get('nelx', '?')} x {mesh.get('nely', '?')} quads",
-        ),
-        (
-            "Nodes",
-            summary.get("n_nodes", "—"),
-            f"{summary.get('n_dofs', '—')} displacement DOFs",
-        ),
-        (
-            "Element size",
-            f"{summary.get('edge_length_max', 0):.3g} mm",
-            f"max aspect ratio {summary.get('aspect_ratio_max', 0):.3f}",
-        ),
-        (
-            "Domain",
-            f"{domain.get('length', '?')} x {domain.get('height', '?')}",
-            f"{summary.get('area_sum', 0):g} mm\u00b2 meshed",
-        ),
-    ]
+def _cards(cards: list[tuple[str, Any, str]]) -> str:
     body = "".join(
         f"<div class='card'><div class='k'>{_e(key)}</div>"
         f"<div class='v'>{_e(value)}</div>"
@@ -240,6 +330,64 @@ def _stat_cards(summary: dict[str, Any], params: dict[str, Any]) -> str:
         for key, value, sub in cards
     )
     return f"<div class='grid'>{body}</div>"
+
+
+def _solve_cards(solve: dict[str, Any]) -> str:
+    beam = solve.get("beam_theory", {})
+    return _cards(
+        [
+            (
+                "Compliance",
+                f"{solve.get('compliance', 0):.4g}",
+                "N\u00b7mm, F\u00b7U at full density",
+            ),
+            (
+                "Tip deflection",
+                f"{solve.get('tip_uy', 0):.4g} mm",
+                f"beam theory {beam.get('total', 0):.4g} mm"
+                f" ({solve.get('beam_theory_rel_diff', 0) * 100:.2f}% off)",
+            ),
+            (
+                "Peak von Mises",
+                f"{solve.get('von_mises_max', 0):.4g} MPa",
+                f"min {solve.get('von_mises_min', 0):.3g} MPa at the free end",
+            ),
+            (
+                "Equilibrium",
+                f"{solve.get('equilibrium_residual', 0):.1e}",
+                f"||KU-F|| on {solve.get('n_free_dofs', 0)} free DOFs",
+            ),
+        ]
+    )
+
+
+def _stat_cards(summary: dict[str, Any], params: dict[str, Any]) -> str:
+    domain = params.get("domain", {})
+    mesh = params.get("mesh", {})
+    return _cards(
+        [
+            (
+                "Elements",
+                summary.get("n_elements", "-"),
+                f"{mesh.get('nelx', '?')} x {mesh.get('nely', '?')} quads",
+            ),
+            (
+                "Nodes",
+                summary.get("n_nodes", "-"),
+                f"{summary.get('n_dofs', '-')} displacement DOFs",
+            ),
+            (
+                "Element size",
+                f"{summary.get('edge_length_max', 0):.3g} mm",
+                f"max aspect ratio {summary.get('aspect_ratio_max', 0):.3f}",
+            ),
+            (
+                "Domain",
+                f"{domain.get('length', '?')} x {domain.get('height', '?')}",
+                f"{summary.get('area_sum', 0):g} mm\u00b2 meshed",
+            ),
+        ]
+    )
 
 
 def _steps_html(steps: list[dict[str, Any]]) -> str:
@@ -296,7 +444,12 @@ def _artifacts_html(run: dict[str, Any], copied: dict[str, str]) -> str:
     )
 
 
-def render_html(run: dict[str, Any], svg: str, copied: dict[str, str]) -> str:
+def render_html(
+    run: dict[str, Any],
+    svg: str,
+    copied: dict[str, str],
+    solve_figure: tuple[str, list[float]] | None = None,
+) -> str:
     params = run.get("params", {})
     domain = params.get("domain", {})
     mesh = params.get("mesh", {})
@@ -304,9 +457,12 @@ def render_html(run: dict[str, Any], svg: str, copied: dict[str, str]) -> str:
     tools = env.get("tools", {})
 
     summary: dict[str, Any] = {}
+    solve: dict[str, Any] = {}
     for step in run.get("steps", []):
         if step.get("name") == "validation":
             summary = step.get("data", {})
+        elif step.get("name") == "solve":
+            solve = step.get("data", {})
 
     chips = [f"run {run.get('started_at', '')}", f"{run.get('duration_s', 0):.2f} s total"]
     chips += [f"{name} {version}" for name, version in tools.items()]
@@ -324,6 +480,37 @@ def render_html(run: dict[str, Any], svg: str, copied: dict[str, str]) -> str:
         ("fixed node set size", summary.get("node_sets", {}).get("fixed")),
         ("load edge node set size", summary.get("node_sets", {}).get("load_edge")),
     ]
+    material = params.get("material", {})
+    if material:
+        param_rows += [
+            ("Young's modulus E (MPa)", material.get("youngs_modulus")),
+            ("Poisson's ratio", material.get("poisson_ratio")),
+            ("tip load Fy (N)", params.get("load", {}).get("fy")),
+        ]
+
+    solve_section = ""
+    if solve:
+        figure = ""
+        if solve_figure is not None:
+            svg_solve, edges = solve_figure
+            figure = (
+                "<figure>"
+                + svg_solve
+                + _ramp_legend(edges, "element compliance u_e^T k_e u_e (N\u00b7mm, log scale)")
+                + "<figcaption>Strain energy concentrates at the clamped corners and falls to"
+                " near zero along the neutral axis. This per-element field is what the SIMP"
+                " sensitivities are built from: the high-energy bands near the top and bottom"
+                " fibres are where material earns its place, and the low-energy core is what the"
+                " optimizer carves away first.</figcaption>"
+                "</figure>"
+            )
+        solve_section = (
+            "<h2>Plane-stress solve</h2>"
+            "<p class='lede'>Full density (every element solid) — the starting point of the"
+            " optimization, and the case where an analytical answer exists to check against.</p>"
+            + _solve_cards(solve)
+            + figure
+        )
 
     all_ok = summary.get("all_checks_passed", False)
 
@@ -332,19 +519,20 @@ def render_html(run: dict[str, Any], svg: str, copied: dict[str, str]) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>topocombo — cantilever beam mesh</title>
-<meta name="description" content="Procedure log of the CadQuery to Gmsh meshing run for the topocombo cantilever beam example.">
+<title>topocombo — cantilever beam</title>
+<meta name="description" content="Procedure log of the topocombo cantilever beam run: CadQuery geometry, Gmsh quad mesh and plane-stress FEA solve.">
 <style>{_CSS}</style>
 </head>
 <body>
 <div class="wrap">
 <header class="top">
-  <h1>Cantilever beam — geometry and mesh</h1>
+  <h1>Cantilever beam — mesh and solve</h1>
   <p class="lede">
-    The first two stages of the <a href="https://github.com/anroleroux/topocombo">topocombo</a>
-    pipeline, run end to end: a parametric design domain defined in CadQuery, exported to BREP,
-    and meshed into structured quadrilaterals with Gmsh. The FEA solve and the SIMP loop are not
-    part of this run — it stops at a validated mesh plus the boundary node sets they will need.
+    The <a href="https://github.com/anroleroux/topocombo">topocombo</a> pipeline so far, run end
+    to end: a parametric design domain defined in CadQuery, exported to BREP, meshed into
+    structured quadrilaterals with Gmsh, and solved as a plane-stress problem at full density with
+    the custom solver. The SIMP loop is not part of this run — it stops at the compliance and the
+    per-element sensitivities the optimizer will iterate on.
   </p>
   <div class="meta">{''.join(f"<span class='chip'>{_e(c)}</span>" for c in chips)}</div>
 </header>
@@ -362,6 +550,8 @@ def render_html(run: dict[str, Any], svg: str, copied: dict[str, str]) -> str:
   <code>mesh.npz</code> — the same file the solver reads.
 </figcaption>
 </figure>
+
+{solve_section}
 
 <h2>Procedure</h2>
 <p class="lede">Terminal output of the run, one block per stage, exactly as it was logged.</p>
@@ -382,8 +572,9 @@ def render_html(run: dict[str, Any], svg: str, copied: dict[str, str]) -> str:
 {_artifacts_html(run, copied)}
 
 <footer>
-  Generated by <code>python -m topocombo.cli report</code> from <code>run.json</code> and
-  <code>mesh.npz</code>. Next stages: plane-stress FEA solve, then the SIMP compliance-minimisation loop.
+  Generated by <code>python -m topocombo.cli report</code> from <code>run.json</code>,
+  <code>mesh.npz</code> and <code>solution.npz</code>. Next stage: the SIMP
+  compliance-minimisation loop (density filtering, OC/MMA update) on top of this solve.
 </footer>
 </div>
 </body>
@@ -416,7 +607,13 @@ def build_site(run_dir: Path, site_dir: Path) -> Path:
             shutil.copyfile(src, artifacts_dir / extra)
             copied[extra] = f"artifacts/{extra}"
 
-    svg = mesh_svg(run_dir / "mesh" / "mesh.npz")
+    mesh_npz = run_dir / "mesh" / "mesh.npz"
+    solution_npz = run_dir / "solution" / "solution.npz"
+    svg = mesh_svg(mesh_npz)
+    solve_figure = (
+        solution_svg(mesh_npz, solution_npz) if solution_npz.exists() else None
+    )
+
     index = site_dir / "index.html"
-    index.write_text(render_html(run, svg, copied))
+    index.write_text(render_html(run, svg, copied, solve_figure))
     return index

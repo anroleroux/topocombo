@@ -1,0 +1,74 @@
+name: mesh + report
+
+on:
+  push:
+    branches:
+      - main
+      - 'claude/**'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; let a running one finish so a half-built site is
+# never published.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      # gmsh ships a shared library that links against GLU even in headless use.
+      - name: Install system libraries for gmsh
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libglu1-mesa libxrender1 libxcursor1 libxft2 libxinerama1
+
+      - name: Install topocombo
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Run the pipeline and render the report
+        run: |
+          python -m topocombo.cli all \
+            --length 60 --height 20 --nelx 60 --nely 20 \
+            --out results/cantilever --site site
+
+      - name: Upload run artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cantilever-run
+          path: results/cantilever
+          if-no-files-found: error
+
+      - name: Upload the site for Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

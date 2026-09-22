@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "topocombo"
+version = "0.1.0"
+description = "Topology optimization from decoupled open-source components (CadQuery, Gmsh, custom FEA, SIMP)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "cadquery>=2.4",
+    "gmsh>=4.11",
+    "meshio>=5.3",
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+viz = ["pyvista>=0.43"]
+
+[project.scripts]
+topocombo = "topocombo.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

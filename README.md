@@ -119,7 +119,7 @@ src/topocombo/
   geometry.py   parametric design domain (CadQuery)
   meshing.py    transfinite quad meshing and physical groups (Gmsh)
   mesh_io.py    .msh -> dimension-agnostic Mesh, quality checks, .npz/.vtu export
-  fea.py        Q4 plane-stress solver: element stiffness, assembly, direct solve
+  fea.py        Q4 plane-stress / H8 solid solver: element stiffness, assembly, direct solve
   optimize.py   SIMP loop: neighbourhood filter, OC update, convergence, log.csv
   pipeline.py   the geometry -> mesh -> solve -> optimize run, terminal-driven
   runlog.py     structured, timed logging of a run
@@ -145,5 +145,7 @@ The pipeline is moving to 3D (hexahedral elements, one element through the
 width by default to keep CI light), alongside the 2D path; the step-by-step
 plan is in [`docs/3d-migration-plan.md`](docs/3d-migration-plan.md). Done so
 far: dimension-agnostic mesh and DOF handling (step 0), the `BeamDomain3D` box
-(step 1) and structured hex meshing with `generate_hex_mesh` (step 2); the
-pipeline itself still runs in 2D until the hex solver lands.
+(step 1), structured hex meshing with `generate_hex_mesh` (step 2), reading and
+checking hex meshes (step 3) and the H8 solid element (step 4), which matches
+the plane-stress solver to round-off with one element through the width and
+nu = 0. The pipeline and CLI still run in 2D until they are wired up (step 7).

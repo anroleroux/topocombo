@@ -485,6 +485,7 @@ def hex_run(request, tmp_path_factory):
         "domain": domain,
         "spec": spec,
         "cad": cad,
+        "msh_path": msh_path,
         "msh": meshio.read(str(msh_path)),
         "gmsh_log": gmsh_log,
     }
@@ -537,3 +538,264 @@ def test_hex_boundary_faces(hex_run):
     # the load line (mid-height, across the width) lies on the loaded face
     on_line = np.isclose(msh.points[loaded, 1], domain.height / 2.0)
     assert on_line.sum() == spec.nelz + 1
+
+
+# --------------------------------------------------------------------------
+# reading and checking the hex mesh (step 3)
+# --------------------------------------------------------------------------
+from topocombo.fea import (  # noqa: E402
+    centroid_von_mises,
+    hex_element_stiffness,
+    load_vector,
+)
+from topocombo.mesh_io import (  # noqa: E402
+    check_mesh,
+    find_node,
+    nodes_on_segment,
+    orient_cells,
+    save_mesh,
+    save_solution,
+)
+from topocombo.meshing import generate_quad_mesh  # noqa: E402
+
+UNIT_CUBE = np.array(
+    [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0], [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]],
+    dtype=float,
+)
+
+
+def test_load_mesh_reads_hexes_and_face_node_sets(hex_run):
+    mesh = load_mesh(hex_run["msh_path"])
+    domain, spec = hex_run["domain"], hex_run["spec"]
+    assert mesh.cell_type == "hexahedron"
+    assert mesh.dim == mesh.dofs_per_node == 3
+    assert mesh.n_elements == spec.n_elements
+    assert mesh.n_nodes == spec.n_nodes
+    assert mesh.n_dofs == 3 * spec.n_nodes
+
+    volumes = mesh.cell_measures()
+    assert np.allclose(volumes, domain.volume / spec.n_elements)  # all positive, all equal
+    face_nodes = (spec.nely + 1) * (spec.nelz + 1)
+    assert mesh.node_sets[PHYS_FIXED].size == mesh.node_sets[PHYS_LOAD].size == face_nodes
+
+    edges = mesh.edge_lengths()
+    assert edges.shape == (spec.n_elements, 12)
+    cell = [domain.length / spec.nelx, domain.height / spec.nely, domain.width / spec.nelz]
+    assert np.allclose(np.sort(np.unique(np.round(edges, 9))), np.unique(np.round(cell, 9)))
+
+
+def test_check_mesh_validates_a_hex_mesh(hex_run):
+    mesh = load_mesh(hex_run["msh_path"])
+    summary = check_mesh(mesh, hex_run["domain"], hex_run["spec"].n_elements)
+    assert summary["all_checks_passed"], summary["checks"]
+    assert summary["dim"] == 3 and summary["cell_type"] == "hexahedron"
+    assert summary["volume_sum"] == pytest.approx(hex_run["domain"].volume)
+    assert "all_elements_positive_volume" in summary["checks"]
+    assert len(summary["bounding_box"]) == 6
+    with pytest.raises(ValueError):
+        check_mesh(mesh, BeamDomain(length=12.0, height=4.0), hex_run["spec"].n_elements)
+
+
+def test_orient_cells_turns_inverted_hexes_right_way_round():
+    inverted = np.array([[4, 5, 6, 7, 0, 1, 2, 3]])  # top face first: a mirrored hex
+    assert Mesh(UNIT_CUBE, inverted, {}, "hexahedron").cell_measures()[0] == pytest.approx(-1.0)
+    fixed = orient_cells(UNIT_CUBE, inverted, "hexahedron")
+    assert Mesh(UNIT_CUBE, fixed, {}, "hexahedron").cell_measures()[0] == pytest.approx(1.0)
+    assert sorted(fixed[0]) == list(range(8))
+    good = np.arange(8)[None, :]
+    assert np.array_equal(orient_cells(UNIT_CUBE, good, "hexahedron"), good)
+
+
+def test_mesh_rejects_nodes_of_the_wrong_dimension():
+    with pytest.raises(ValueError):
+        Mesh(UNIT_CUBE[:, :2], np.arange(8)[None, :], {}, "hexahedron")
+
+
+def test_load_line_is_picked_from_the_loaded_face(hex_run):
+    mesh = load_mesh(hex_run["msh_path"])
+    domain, spec = hex_run["domain"], hex_run["spec"]
+    line = nodes_on_segment(mesh, *domain.load_line, candidates=mesh.node_sets[PHYS_LOAD])
+    assert line.size == spec.nelz + 1
+    assert np.allclose(mesh.nodes[line, :2], [domain.length, domain.height / 2.0])
+    assert np.all(np.diff(mesh.nodes[line, 2]) > 0)  # ordered from the start point
+
+
+def test_hex_mesh_artifacts(hex_run, tmp_path):
+    mesh = load_mesh(hex_run["msh_path"])
+    paths = save_mesh(mesh, tmp_path, load_node=find_node(mesh, hex_run["domain"].load_point))
+    data = np.load(paths["npz"])
+    assert data["nodes"].shape == (mesh.n_nodes, 3)
+    assert data["cells"].shape == (mesh.n_elements, 8)
+    assert str(data["cell_type"]) == "hexahedron"
+    vtu = meshio.read(str(paths["vtu"]))
+    assert [b.type for b in vtu.cells] == ["hexahedron"]
+
+
+# --------------------------------------------------------------------------
+# the H8 solid element (step 4)
+# --------------------------------------------------------------------------
+def _hex_mesh(out, domain: BeamDomain3D, spec: MeshSpec3D) -> Mesh:
+    cad = export_domain(domain, out / "cad")
+    msh, _ = generate_hex_mesh(domain, spec, cad["brep"], out / "mesh")
+    return load_mesh(msh)
+
+
+def _quad_mesh(out, domain: BeamDomain, spec: MeshSpec) -> Mesh:
+    cad = export_domain(domain, out / "cad")
+    msh, _ = generate_quad_mesh(domain, spec, cad["brep"], out / "mesh")
+    return load_mesh(msh)
+
+
+def _tip_line_load(mesh: Mesh, domain: BeamDomain3D, fy: float) -> LoadCase:
+    line = nodes_on_segment(mesh, *domain.load_line, candidates=mesh.node_sets[PHYS_LOAD])
+    return LoadCase.along_line(mesh, line, fy=fy)
+
+
+def test_hex_stiffness_is_symmetric_with_six_rigid_body_modes():
+    coords = UNIT_CUBE * [2.0, 1.0, 0.5] + 0.1 * UNIT_CUBE[:, [1, 2, 0]]  # a sheared brick
+    ke = hex_element_stiffness(coords, Material().constitutive_matrix_3d())
+    assert np.allclose(ke, ke.T)
+
+    x, y, z = coords.T
+    zero = np.zeros(8)
+    modes = [
+        np.tile([1.0, 0.0, 0.0], 8),
+        np.tile([0.0, 1.0, 0.0], 8),
+        np.tile([0.0, 0.0, 1.0], 8),
+        np.column_stack([-y, x, zero]).reshape(-1),  # about z
+        np.column_stack([zero, -z, y]).reshape(-1),  # about x
+        np.column_stack([z, zero, -x]).reshape(-1),  # about y
+    ]
+    for mode in modes:
+        assert ke @ mode == pytest.approx(np.zeros(24), abs=1e-6 * np.abs(ke).max())
+    assert np.linalg.matrix_rank(ke) == 18
+
+
+def test_hex_stiffness_scales_with_youngs_modulus():
+    soft = hex_element_stiffness(UNIT_CUBE, Material(youngs_modulus=1.0).constitutive_matrix_3d())
+    stiff = hex_element_stiffness(UNIT_CUBE, Material(youngs_modulus=3.0).constitutive_matrix_3d())
+    assert np.allclose(stiff, 3.0 * soft)
+
+
+def test_hex_reproduces_a_uniform_strain_state():
+    """u = eps * x (uniaxial strain): exact energy and von Mises on one element."""
+    material = Material()
+    lam = material.constitutive_matrix_3d()[0, 1]
+    mu = material.shear_modulus
+    eps = 1e-3
+    size = np.array([2.0, 1.0, 3.0])
+    nodes = UNIT_CUBE * size
+    mesh = Mesh(nodes, np.arange(8)[None, :], {}, "hexahedron")
+    u = np.column_stack([eps * nodes[:, 0], np.zeros(8), np.zeros(8)]).reshape(-1)
+
+    ke = hex_element_stiffness(nodes, material.constitutive_matrix_3d())
+    assert u @ ke @ u == pytest.approx(np.prod(size) * (lam + 2.0 * mu) * eps**2, rel=1e-12)
+    # sxx = (lam + 2mu) eps, syy = szz = lam eps  ->  von Mises = 2 mu eps
+    vm = centroid_von_mises(mesh, u, material)
+    assert vm[0] == pytest.approx(2.0 * mu * eps, rel=1e-12)
+
+
+def test_line_load_uses_tributary_shares():
+    # a column of three unit cubes along z; the load runs up its x = y = 0 edge
+    corners = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=float)
+    nodes = np.vstack([np.column_stack([corners, np.full(4, z)]) for z in range(4)])
+    cells = np.array([[*range(4 * k, 4 * k + 8)] for k in range(3)])
+    mesh = Mesh(nodes, cells, {}, "hexahedron")
+    line = np.array([0, 4, 8, 12])
+    load = LoadCase.along_line(mesh, line, fy=-600.0)
+    assert load.node_shares() == pytest.approx([1 / 6, 1 / 3, 1 / 3, 1 / 6])
+    f = load_vector(mesh, load).reshape(-1, 3)
+    assert f[line, 1] == pytest.approx([-100.0, -200.0, -200.0, -100.0])
+    assert f[:, 1].sum() == pytest.approx(-600.0)
+    assert f[:, [0, 2]] == pytest.approx(0.0)
+    assert load.as_dict()["node"] == [0, 4, 8, 12]
+    with pytest.raises(ValueError):
+        LoadCase(node=(0, 1), shares=(0.3, 0.3))
+
+
+def test_hex_solve_matches_plane_stress_with_one_element_through_the_width(tmp_path):
+    """With nu = 0 and one element through the width, H8 == Q4 x width, exactly."""
+    material = Material(poisson_ratio=0.0)
+    width = 1.5
+    domain2 = BeamDomain(length=20.0, height=4.0, thickness=width)
+    domain3 = BeamDomain3D(length=20.0, height=4.0, width=width)
+    mesh2 = _quad_mesh(tmp_path / "q4", domain2, MeshSpec(nelx=20, nely=4))
+    mesh3 = _hex_mesh(tmp_path / "h8", domain3, MeshSpec3D(nelx=20, nely=4, nelz=1))
+
+    r2 = solve(mesh2, material, width, LoadCase(node=find_node(mesh2, domain2.load_point), fy=-1000.0), PHYS_FIXED)
+    load3 = _tip_line_load(mesh3, domain3, fy=-1000.0)
+    assert load3.node_shares() == pytest.approx([0.5, 0.5])
+    r3 = solve(mesh3, material, width, load3, PHYS_FIXED)
+
+    assert r3.compliance == pytest.approx(r2.compliance, rel=1e-10)
+
+    # every 3D node moves exactly like the 2D node at the same (x, y); no z motion
+    tree = cKDTree(mesh2.nodes)
+    _, match = tree.query(mesh3.nodes[:, :2])
+    u2 = r2.u.reshape(-1, 2)[match]
+    u3 = r3.u.reshape(-1, 3)
+    scale = np.abs(u2).max()
+    assert np.abs(u3[:, :2] - u2).max() < 1e-9 * scale
+    assert np.abs(u3[:, 2]).max() < 1e-9 * scale
+
+    # element by element, too
+    _, cell_match = cKDTree(mesh2.nodes[mesh2.cells].mean(axis=1)).query(
+        mesh3.nodes[mesh3.cells].mean(axis=1)[:, :2]
+    )
+    assert np.allclose(r3.element_compliance, r2.element_compliance[cell_match], rtol=1e-8)
+    assert np.allclose(r3.von_mises, r2.von_mises[cell_match], rtol=1e-8)
+
+
+@pytest.fixture(scope="module")
+def slender_hex_beam(tmp_path_factory):
+    out = tmp_path_factory.mktemp("slender_hex")
+    domain = BeamDomain3D(length=80.0, height=8.0, width=1.0)
+    mesh = _hex_mesh(out, domain, MeshSpec3D(nelx=80, nely=8, nelz=1))
+    material = Material()
+    load = _tip_line_load(mesh, domain, fy=-500.0)
+    result = solve(mesh, material, domain.width, load, PHYS_FIXED)
+    return {"domain": domain, "mesh": mesh, "material": material, "load": load, "result": result, "dir": out}
+
+
+def test_hex_solution_satisfies_equilibrium(slender_hex_beam):
+    result, load = slender_hex_beam["result"], slender_hex_beam["load"]
+    assert result.dofs_per_node == 3
+    assert result.equilibrium_residual < 1e-6 * abs(load.fy)
+    assert result.component(1, "reactions").sum() == pytest.approx(-load.fy, rel=1e-9)
+    for axis in (0, 2):
+        assert result.component(axis, "reactions").sum() == pytest.approx(0.0, abs=1e-6 * abs(load.fy))
+    assert result.element_compliance.sum() == pytest.approx(result.compliance, rel=1e-9)
+
+
+def test_hex_tip_deflection_matches_beam_theory(slender_hex_beam):
+    domain, material = slender_hex_beam["domain"], slender_hex_beam["material"]
+    result, load = slender_hex_beam["result"], slender_hex_beam["load"]
+    theory = timoshenko_tip_deflection(domain.length, domain.height, domain.width, material, load.fy)
+    tip = abs(result.component(1)[load.nodes].mean())
+    assert tip == pytest.approx(theory["total"], rel=0.05)
+
+
+def test_hex_solution_is_linear_and_softens_with_density(slender_hex_beam):
+    mesh, material, domain = slender_hex_beam["mesh"], slender_hex_beam["material"], slender_hex_beam["domain"]
+    base, load = slender_hex_beam["result"], slender_hex_beam["load"]
+    doubled = solve(
+        mesh, material, domain.width,
+        LoadCase(node=load.node, fy=2.0 * load.fy, shares=load.shares), PHYS_FIXED,
+    )
+    assert np.allclose(doubled.u, 2.0 * base.u)
+    half = solve(
+        mesh, material, domain.width, load, PHYS_FIXED,
+        densities=np.full(mesh.n_elements, 0.5), penal=3.0,
+    )
+    assert half.compliance == pytest.approx(8.0 * base.compliance, rel=1e-6)
+
+
+def test_hex_solution_artifacts(slender_hex_beam, tmp_path):
+    mesh, result = slender_hex_beam["mesh"], slender_hex_beam["result"]
+    paths = save_solution(mesh, result, tmp_path)
+    data = np.load(paths["npz"])
+    assert data["displacements"].shape == (mesh.n_nodes, 3)
+    assert data["reactions"].shape == (mesh.n_nodes, 3)
+    assert data["von_mises"].shape == (mesh.n_elements,)
+    vtu = meshio.read(str(paths["vtu"]))
+    assert vtu.point_data["displacement"].shape == (mesh.n_nodes, 3)

@@ -70,19 +70,30 @@ Each step is one PR with its own tests.
 - Implemented as `generate_hex_mesh`; `load_edge` tags the whole
   x = L face, and the load line (y = H/2) is picked from its nodes in step 4.
 
-### 3. `mesh_io`: read and check hexes
+### 3. `mesh_io`: read and check hexes — done
 - Read `hexahedron` blocks; boundary node sets from `quad` surface blocks.
 - Orientation via the Jacobian at the element centre (flip inverted hexes).
 - `check_mesh`: volumes sum to L*H*W, bounding box, no orphans, non-empty sets.
 - `.vtu` with `hexahedron` cells and 3-component displacement.
+- Implemented: `load_mesh` picks the dimension from the cell type,
+  `orient_cells` flips inverted cells, `cell_measures()` integrates det(J)
+  (exact for Q4/H8), `nodes_on_segment` picks the load line out of the loaded
+  face, and `check_mesh` reports `volume_*` keys for 3D.
 
-### 4. FEA: the H8 element
+### 4. FEA: the H8 element — done
 - Isotropic 6x6 D, 6x24 B, 2x2x2 Gauss, 3D von Mises.
 - On a uniform structured grid all `ke` are identical: compute once and scale
   by density instead of storing one matrix per element.
 - Tests: `ke` symmetric with exactly 6 zero eigenvalues; equilibrium; load
   linearity; tip deflection vs Timoshenko for a b x h section; the
   2D <-> 3D cross-check (nu = 0, `nelz = 1`) to round-off.
+- Implemented: `hex_element_stiffness`, `Material.constitutive_matrix_3d`,
+  `LoadCase.along_line` (consistent tributary shares), 3D centroid von Mises;
+  `element_stiffnesses` shares one matrix across identical elements (both 2D and
+  3D). On the default 60 x 20 x 1 mesh the 3D solve (7686 DOFs) takes ~0.3 s;
+  with nu = 0 it matches 2D to ~1e-11, and with nu = 0.3 it is 0.35% stiffer
+  than plane stress (compliance 559.24 vs 561.21 N*mm), as expected when the
+  width is not free to contract.
 
 ### 5. Solver scaling (only when `nelz > 1` is needed)
 - Direct `spsolve` is fine at the default size. Beyond ~50-100k DOFs switch to

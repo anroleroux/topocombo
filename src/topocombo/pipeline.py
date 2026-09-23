@@ -45,6 +45,7 @@ from .optimize import (
     save_history,
 )
 from .runlog import RunLog
+from .topology import save_topology_stl
 
 
 def run(
@@ -336,6 +337,19 @@ def run(
             log.artifact(paths["vtu"], "density field for PyVista / ParaView")
             csv_path = save_history(design.history, out_dir / "optimization" / "log.csv")
             log.artifact(csv_path, "per-iteration scalar log (compliance, volume, change)")
+
+            stl = save_topology_stl(
+                mesh, design.densities, out_dir / "optimization" / "topology.stl",
+                thickness=depth,
+            )
+            log.log(
+                f"topology: {stl['solid_elements']} of {mesh.n_elements} elements at "
+                f"rho >= {stl['threshold']:g} -> {stl['triangles']} triangles enclosing "
+                f"{stl['volume']:.4g} mm^3"
+                + ("" if three_d else f" (extruded by the {depth:g} mm thickness)")
+            )
+            log.artifact(stl["path"], "thresholded topology as a closed surface, for Blender (STL)")
+            log.record(topology={k: v for k, v in stl.items() if k != "path"})
 
     json_path, text_path = log.write()
     print(f"\nrun log: {json_path}")

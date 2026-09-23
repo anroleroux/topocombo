@@ -933,7 +933,7 @@ def test_report_side_view_of_a_hex_mesh_tiles_the_domain(coarse_run_3d):
     from topocombo.report import _side_view
 
     data = np.load(coarse_run_3d["dir"] / "mesh" / "mesh.npz")
-    nodes, quads = _side_view(data["nodes"], data["cells"])
+    nodes, quads, drawn = _side_view(data["nodes"], data["cells"])
     assert nodes.shape[1] == 2 and quads.shape == (data["cells"].shape[0], 4)
     xy = nodes[quads]
     x, y = xy[:, :, 0], xy[:, :, 1]
@@ -960,3 +960,120 @@ def test_cli_runs_the_3d_pipeline(tmp_path, capsys):
     assert run_json["params"]["mesh"]["nelz"] == 2
     assert run_json["params"]["domain"]["width"] == 2.0
     assert np.load(out / "mesh" / "mesh.npz")["cells"].shape == (4 * 2 * 2, 8)
+
+
+# --------------------------------------------------------------------------
+# result artifacts: the topology surface and the PyVista views (step 8)
+# --------------------------------------------------------------------------
+from topocombo.topology import (  # noqa: E402
+    boundary_faces,
+    enclosed_volume,
+    extrude,
+    save_topology_stl,
+    solid_surface,
+)
+from topocombo.viz import available_views  # noqa: E402
+
+
+def _brick_grid(nx: int, ny: int, nz: int) -> Mesh:
+    """A unit-cube hex grid built by hand, in Gmsh/VTK corner order."""
+    idx = np.arange((nx + 1) * (ny + 1) * (nz + 1)).reshape(nx + 1, ny + 1, nz + 1)
+    gx, gy, gz = np.meshgrid(np.arange(nx + 1), np.arange(ny + 1), np.arange(nz + 1), indexing="ij")
+    nodes = np.column_stack([gx.ravel(), gy.ravel(), gz.ravel()]).astype(float)
+    cells = [
+        [idx[i, j, k], idx[i + 1, j, k], idx[i + 1, j + 1, k], idx[i, j + 1, k],
+         idx[i, j, k + 1], idx[i + 1, j, k + 1], idx[i + 1, j + 1, k + 1], idx[i, j + 1, k + 1]]
+        for i in range(nx) for j in range(ny) for k in range(nz)
+    ]
+    return Mesh(nodes, np.array(cells), {}, "hexahedron")
+
+
+def _edge_counts(triangles: np.ndarray) -> np.ndarray:
+    edges = np.sort(np.vstack([triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]]), axis=1)
+    return np.unique(edges, axis=0, return_counts=True)[1]
+
+
+def test_shared_faces_are_dropped_from_the_surface():
+    mesh = _brick_grid(2, 1, 1)
+    assert boundary_faces(mesh.cells).shape == (10, 4)  # 12 faces, the shared one twice
+    points, triangles = solid_surface(mesh, np.ones(2))
+    assert triangles.shape == (20, 3)
+    assert enclosed_volume(points, triangles) == pytest.approx(2.0)  # closed and outward
+    assert np.all(_edge_counts(triangles) == 2)  # watertight: every edge has two sides
+
+
+def test_surface_of_a_thresholded_design_encloses_the_solid_elements():
+    mesh = _brick_grid(4, 3, 2)
+    rng = np.random.default_rng(3)
+    densities = rng.random(mesh.n_elements)
+    points, triangles = solid_surface(mesh, densities, threshold=0.5)
+    assert enclosed_volume(points, triangles) == pytest.approx(float((densities >= 0.5).sum()))
+
+
+def test_extruding_a_quad_mesh_gives_positive_hexes():
+    nodes = np.array([[0, 0], [2, 0], [2, 1], [0, 1]], dtype=float)
+    quad = Mesh(nodes, np.array([[0, 1, 2, 3]]), {}, "quad")
+    hexes = extrude(quad, thickness=0.5)
+    assert hexes.cell_type == "hexahedron" and hexes.n_nodes == 8
+    assert hexes.cell_measures() == pytest.approx([1.0])
+    with pytest.raises(ValueError):
+        extrude(hexes, 1.0)
+
+
+@pytest.mark.parametrize("which", ["coarse_run", "coarse_run_3d"])
+def test_pipeline_writes_a_closed_topology_stl(which, request):
+    run_fixture = request.getfixturevalue(which)
+    out = run_fixture["dir"]
+    stl = meshio.read(str(out / "optimization" / "topology.stl"))
+    triangles = stl.cells[0].data
+    assert triangles.size and np.all(_edge_counts(triangles) >= 2)
+    data = json.loads((out / "run.json").read_text())
+    step = next(s for s in data["steps"] if s["name"] == "design_export")
+    topo = step["data"]["topology"]
+    assert topo["volume"] == pytest.approx(topo["solid_element_volume"], rel=1e-9)
+    assert enclosed_volume(stl.points, triangles) == pytest.approx(topo["volume"], rel=1e-6)
+
+
+def test_viz_finds_the_views_of_a_run(coarse_run_3d, tmp_path):
+    views = available_views(coarse_run_3d["dir"])
+    assert set(views) == {"topology", "density", "solution"}
+    assert available_views(tmp_path) == {}
+
+
+def test_viz_renders_pngs_off_screen(coarse_run_3d, tmp_path):
+    pytest.importorskip("pyvista", reason="PyVista is the optional [viz] extra")
+    from topocombo.viz import render
+
+    try:
+        written = render(coarse_run_3d["dir"], tmp_path, window_size=(400, 200))
+    except RuntimeError as err:  # pragma: no cover - no off-screen OpenGL on this machine
+        pytest.skip(f"PyVista cannot render off screen here: {err}")
+    assert set(written) == {"topology", "density", "solution"}
+    assert all(p.stat().st_size > 0 for p in written.values())
+
+
+# --------------------------------------------------------------------------
+# projected density views in the report (step 9)
+# --------------------------------------------------------------------------
+from topocombo.report import PROJECTIONS, density_svg, project_field  # noqa: E402
+
+
+def test_projection_averages_through_the_hidden_axis():
+    mesh = _brick_grid(3, 2, 2)
+    field = np.arange(mesh.n_elements, dtype=float)
+    points, rects, means = project_field(mesh.nodes, mesh.cells, field, *PROJECTIONS["side"][:3])
+    assert rects.shape == (6, 4) and means.shape == (6,)
+    # elements are ordered k fastest, so each side column averages a consecutive pair
+    assert sorted(means) == pytest.approx(sorted(field.reshape(-1, 2).mean(axis=1)))
+    assert points.shape == (24, 2)
+    _, _, top = project_field(mesh.nodes, mesh.cells, field, *PROJECTIONS["top"][:3])
+    assert top.size == 3 * 2 and top.mean() == pytest.approx(field.mean())
+
+
+def test_density_figure_adds_top_and_end_views_only_for_deep_meshes(tmp_path):
+    for nz, expected in ((1, 1), (2, 3)):
+        mesh = _brick_grid(4, 2, nz)
+        np.savez(tmp_path / f"mesh{nz}.npz", nodes=mesh.nodes, cells=mesh.cells)
+        np.savez(tmp_path / f"rho{nz}.npz", densities=np.linspace(0, 1, mesh.n_elements))
+        svg = density_svg(tmp_path / f"mesh{nz}.npz", tmp_path / f"rho{nz}.npz")
+        assert svg.count("<svg") == expected

@@ -41,10 +41,12 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
+      # The published run is the 3D cantilever, one hexahedron through the width
+      # to keep the job light; the 2D path is still covered by the tests.
       - name: Run the pipeline and render the report
         run: |
-          python -m topocombo.cli all \
-            --length 60 --height 20 --nelx 60 --nely 20 \
+          python -m topocombo.cli all --dim 3 \
+            --length 60 --height 20 --width 1 --nelx 60 --nely 20 --nelz 1 \
             --out results/cantilever --site site
 
       - name: Upload run artifacts

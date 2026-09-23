@@ -1,6 +1,9 @@
-"""The geometry → mesh stage of the main flow, as one terminal-driven run.
+"""The main flow — geometry, mesh, solve, SIMP — as one terminal-driven run.
 
-Everything is written to a run directory; nothing is plotted or rendered here.
+The domain decides the dimension: a :class:`BeamDomain` runs the 2D
+plane-stress quad pipeline, a :class:`BeamDomain3D` the solid hex pipeline
+with the tip load spread along a line across the width.  Everything is
+written to a run directory; nothing is plotted or rendered here.
 """
 
 from __future__ import annotations
@@ -17,9 +20,23 @@ from .fea import (
     solve as fea_solve,
     timoshenko_tip_deflection,
 )
-from .geometry import BeamDomain, export_domain
-from .mesh_io import check_mesh, find_node, load_mesh, save_mesh, save_solution
-from .meshing import PHYS_FIXED, MeshSpec, generate_quad_mesh
+from .geometry import BeamDomain, BeamDomain3D, export_domain
+from .mesh_io import (
+    check_mesh,
+    find_node,
+    load_mesh,
+    nodes_on_segment,
+    save_mesh,
+    save_solution,
+)
+from .meshing import (
+    PHYS_FIXED,
+    PHYS_LOAD,
+    MeshSpec,
+    MeshSpec3D,
+    generate_hex_mesh,
+    generate_quad_mesh,
+)
 from .optimize import (
     SimpParams,
     optimize,
@@ -28,11 +45,12 @@ from .optimize import (
     save_history,
 )
 from .runlog import RunLog
+from .topology import save_topology_stl
 
 
 def run(
-    domain: BeamDomain,
-    spec: MeshSpec,
+    domain: BeamDomain | BeamDomain3D,
+    spec: MeshSpec | MeshSpec3D,
     out_dir: Path,
     material: Material | None = None,
     load_fy: float = -1000.0,
@@ -42,15 +60,23 @@ def run(
     echo: bool = True,
 ) -> tuple[RunLog, dict[str, Any]]:
     """Mesh the domain, solve it at full density, then run the SIMP loop."""
+    three_d = isinstance(domain, BeamDomain3D)
+    if three_d != isinstance(spec, MeshSpec3D):
+        raise TypeError("a 3D domain needs a MeshSpec3D, a 2D domain a MeshSpec")
     out_dir = Path(out_dir)
     material = material or Material()
     simp = simp or SimpParams()
+    # the out-of-plane size: plane-stress thickness in 2D, the modelled width in 3D
+    depth = domain.width if three_d else domain.thickness
+    analysis = "3D solid" if three_d else "plane-stress"
     log = RunLog(
-        name="cantilever beam — meshing, plane-stress solve and SIMP optimization",
+        name=f"cantilever beam — meshing, {analysis} solve and SIMP optimization",
         out_dir=out_dir,
         echo=echo,
     )
     log.params = {
+        "dim": 3 if three_d else 2,
+        "element": "H8 hexahedron" if three_d else "Q4 quadrilateral",
         "domain": domain.as_dict(),
         "mesh": spec.as_dict(),
         "material": material.as_dict(),
@@ -68,56 +94,87 @@ def run(
     log.tool("scipy", scipy.__version__)
 
     with log.step("geometry", "1. Define parametric geometry (CadQuery)"):
-        log.log(
-            f"design domain {domain.length} x {domain.height} mm "
-            f"(aspect ratio {domain.aspect_ratio:.2f}), "
-            f"out-of-plane thickness {domain.thickness} mm"
-        )
-        log.log(f"clamped edge: x = 0; tip load applied at {domain.load_point}")
-        face = domain.face()
-        log.log(f"planar face area: {face.Area():.3f} mm^2 (expected {domain.area:.3f})")
+        if three_d:
+            log.log(
+                f"design domain {domain.length} x {domain.height} x {domain.width} mm box "
+                f"(aspect ratio {domain.aspect_ratio:.2f})"
+            )
+            (x0, y0, z0), (_, _, z1) = domain.load_line
+            log.log(
+                f"clamped face: x = 0; tip load along x = {x0:g}, y = {y0:g}, "
+                f"z = {z0:g} .. {z1:g}"
+            )
+            solid = domain.solid()
+            log.log(f"solid volume: {solid.Volume():.3f} mm^3 (expected {domain.volume:.3f})")
+            cad_record = {"solid_volume": solid.Volume()}
+        else:
+            log.log(
+                f"design domain {domain.length} x {domain.height} mm "
+                f"(aspect ratio {domain.aspect_ratio:.2f}), "
+                f"out-of-plane thickness {domain.thickness} mm"
+            )
+            log.log(f"clamped edge: x = 0; tip load applied at {domain.load_point}")
+            face = domain.face()
+            log.log(f"planar face area: {face.Area():.3f} mm^2 (expected {domain.area:.3f})")
+            cad_record = {"face_area": face.Area()}
         exported = export_domain(domain, out_dir / "cad")
         for kind, path in exported.items():
             log.artifact(path, f"design domain, {kind.upper()} format")
-        log.record(face_area=face.Area(), **domain.as_dict())
+        log.record(**cad_record, **domain.as_dict())
 
-    with log.step("meshing", "2. Mesh with Gmsh (structured quadrilaterals)"):
+    cells_word = "hexahedra" if three_d else "quadrilaterals"
+    with log.step("meshing", f"2. Mesh with Gmsh (structured {cells_word})"):
+        grid = f"{spec.nelx} x {spec.nely}" + (f" x {spec.nelz}" if three_d else "")
         log.log(
-            f"transfinite grid: {spec.nelx} x {spec.nely} = {spec.n_elements} quads, "
+            f"transfinite grid: {grid} = {spec.n_elements} {cells_word}, "
             f"{spec.n_nodes} nodes expected"
         )
-        msh_path, _ = generate_quad_mesh(
+        mesher = generate_hex_mesh if three_d else generate_quad_mesh
+        msh_path, _ = mesher(
             domain=domain,
             spec=spec,
             brep_path=exported["brep"],
             out_dir=out_dir / "mesh",
             log=log,
         )
-        log.artifact(msh_path, "quadrilateral mesh with physical groups (Gmsh 2.2 ASCII)")
+        mesh_word = "hexahedral" if three_d else "quadrilateral"
+        log.artifact(msh_path, f"{mesh_word} mesh with physical groups (Gmsh 2.2 ASCII)")
         log.record(**spec.as_dict())
 
     with log.step("validation", "3. Load the mesh and check it"):
         mesh = load_mesh(msh_path)
-        load_node = find_node(mesh, domain.load_point)
+        if three_d:
+            load_nodes = nodes_on_segment(
+                mesh, *domain.load_line, candidates=mesh.node_sets[PHYS_LOAD]
+            )
+            if load_nodes.size == 0:  # pragma: no cover - nely odd: no node row at H/2
+                load_nodes = np.array([find_node(mesh, domain.load_point)])
+        else:
+            load_nodes = np.array([find_node(mesh, domain.load_point)])
+        load_node = int(load_nodes[0])
         summary = check_mesh(mesh, domain, expected_elements=spec.n_elements)
         summary["load_node"] = load_node
+        summary["load_nodes"] = [int(n) for n in load_nodes]
         summary["load_node_coords"] = [float(c) for c in mesh.nodes[load_node]]
 
-        log.log(f"{summary['n_nodes']} nodes, {summary['n_elements']} quads, {summary['n_dofs']} DOFs")
+        log.log(f"{summary['n_nodes']} nodes, {summary['n_elements']} {cells_word}, {summary['n_dofs']} DOFs")
         log.log(
             "element edge lengths: "
             f"{summary['edge_length_min']:.4f} – {summary['edge_length_max']:.4f} mm, "
             f"max aspect ratio {summary['aspect_ratio_max']:.4f}"
         )
+        m, unit = mesh.measure_name, "mm^3" if three_d else "mm^2"
         log.log(
-            f"meshed area {summary['area_sum']:.6f} mm^2 vs domain {summary['domain_area']:.6f} mm^2"
+            f"meshed {m} {summary[f'{m}_sum']:.6f} {unit} vs domain "
+            f"{summary[f'domain_{m}']:.6f} {unit}"
         )
         for name, count in summary["node_sets"].items():
             log.log(f"node set '{name}': {count} nodes")
-        log.log(
-            f"tip load node: #{load_node} at "
-            f"({summary['load_node_coords'][0]:.3f}, {summary['load_node_coords'][1]:.3f})"
-        )
+        coords = ", ".join(f"{c:.3f}" for c in summary["load_node_coords"])
+        if load_nodes.size > 1:
+            log.log(f"tip load line: {load_nodes.size} nodes, starting at #{load_node} ({coords})")
+        else:
+            log.log(f"tip load node: #{load_node} at ({coords})")
         for name, passed in summary["checks"].items():
             log.log(f"  [{'PASS' if passed else 'FAIL'}] {name}")
         if not summary["all_checks_passed"]:
@@ -126,41 +183,57 @@ def run(
         log.record(**summary)
 
     with log.step("export", "4. Write mesh artifacts"):
-        paths = save_mesh(mesh, out_dir / "mesh", load_node=load_node)
-        log.artifact(paths["npz"], "nodes, quad connectivity and boundary node sets (numpy)")
+        paths = save_mesh(mesh, out_dir / "mesh", load_node=load_node, load_nodes=load_nodes)
+        log.artifact(paths["npz"], f"nodes, {mesh.cell_type} connectivity and boundary node sets (numpy)")
         log.artifact(paths["vtu"], "mesh for PyVista / ParaView")
 
-    with log.step("solve", "5. Assemble and solve (plane stress, full density)"):
-        load = LoadCase(node=load_node, fy=load_fy)
+    with log.step("solve", f"5. Assemble and solve ({analysis}, full density)"):
+        if load_nodes.size > 1:
+            load = LoadCase.along_line(mesh, load_nodes, fy=load_fy)
+        else:
+            load = LoadCase(node=load_node, fy=load_fy)
         log.log(
             f"material: E = {material.youngs_modulus:g} MPa, nu = {material.poisson_ratio:g}, "
             f"G = {material.shear_modulus:g} MPa"
         )
         log.log(
             f"boundary conditions: node set '{PHYS_FIXED}' clamped "
-            f"({2 * summary['node_sets'][PHYS_FIXED]} DOFs), "
-            f"Fy = {load.fy:g} N at node {load.node}"
+            f"({mesh.dofs_per_node * summary['node_sets'][PHYS_FIXED]} DOFs), "
+            + (
+                f"Fy = {load.fy:g} N spread over {load.nodes.size} nodes "
+                f"(shares {', '.join(f'{v:.3g}' for v in load.node_shares())})"
+                if load.nodes.size > 1
+                else f"Fy = {load.fy:g} N at node {load.node}"
+            )
         )
-        ke_all = element_stiffnesses(mesh, material, domain.thickness)
-        log.log(f"assembled {ke_all.shape[0]} element stiffness matrices (8x8, 2x2 Gauss)")
+        ke_all = element_stiffnesses(mesh, material, depth)
+        n_edof = ke_all.shape[1]
+        gauss = "x".join(["2"] * mesh.dim)
+        log.log(
+            f"assembled {ke_all.shape[0]} element stiffness matrices "
+            f"({n_edof}x{n_edof}, {gauss} Gauss)"
+        )
         result = fea_solve(
             mesh=mesh,
             material=material,
-            thickness=domain.thickness,
+            thickness=depth,
             load=load,
             fixed_node_set=PHYS_FIXED,
             ke_all=ke_all,
         )
         beam = timoshenko_tip_deflection(
-            domain.length, domain.height, domain.thickness, material, load.fy
+            domain.length, domain.height, depth, material, load.fy
         )
-        tip_uy = float(result.u[2 * load_node + 1])
+        tip_uy = float(result.component(1)[load.nodes].mean())
         rel = abs(abs(tip_uy) - beam["total"]) / beam["total"]
-        reaction_y = float(result.reactions[1::2].sum())
+        reaction_y = float(result.component(1, "reactions").sum())
 
         log.log(f"solved {result.n_free_dofs} free DOFs (sparse direct)")
         log.log(f"compliance F.U = {result.compliance:.6g} N*mm")
-        log.log(f"tip deflection uy = {tip_uy:.6g} mm")
+        log.log(
+            f"tip deflection uy = {tip_uy:.6g} mm"
+            + (" (mean over the load line)" if load.nodes.size > 1 else "")
+        )
         log.log(
             f"Timoshenko beam theory: {beam['total']:.6g} mm "
             f"(bending {beam['bending']:.4g} + shear {beam['shear']:.4g}) "
@@ -232,7 +305,7 @@ def run(
             design = optimize(
                 mesh=mesh,
                 material=material,
-                thickness=domain.thickness,
+                thickness=depth,
                 load=load,
                 fixed_node_set=PHYS_FIXED,
                 params=simp,
@@ -264,6 +337,19 @@ def run(
             log.artifact(paths["vtu"], "density field for PyVista / ParaView")
             csv_path = save_history(design.history, out_dir / "optimization" / "log.csv")
             log.artifact(csv_path, "per-iteration scalar log (compliance, volume, change)")
+
+            stl = save_topology_stl(
+                mesh, design.densities, out_dir / "optimization" / "topology.stl",
+                thickness=depth,
+            )
+            log.log(
+                f"topology: {stl['solid_elements']} of {mesh.n_elements} elements at "
+                f"rho >= {stl['threshold']:g} -> {stl['triangles']} triangles enclosing "
+                f"{stl['volume']:.4g} mm^3"
+                + ("" if three_d else f" (extruded by the {depth:g} mm thickness)")
+            )
+            log.artifact(stl["path"], "thresholded topology as a closed surface, for Blender (STL)")
+            log.record(topology={k: v for k, v in stl.items() if k != "path"})
 
     json_path, text_path = log.write()
     print(f"\nrun log: {json_path}")

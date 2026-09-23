@@ -1,0 +1,159 @@
+# Moving the pipeline to 3D
+
+The CadQuery → Gmsh → solver → SIMP → artifacts chain stays the same; each
+stage changes its representation. 3D is added **next to** 2D (`--dim 3`), not
+in place of it: the 2D path is verified against beam theory, fast in CI, and
+gives the 3D solver an exact cross-check.
+
+## Default discretisation: one element through the width
+
+The pipeline runs on GitHub Actions and has to stay light, so accuracy through
+the width is not a goal yet. The default 3D mesh is **60 x 20 x 1** — the same
+1200 design variables as the 2D benchmark, as hexahedra one element thick in
+the current out-of-plane direction:
+
+| | 2D (60 x 20) | 3D (60 x 20 x 1) |
+| --- | --- | --- |
+| elements | 1200 quads | 1200 hexes |
+| nodes | 1281 | 2562 |
+| DOFs | 2562 | 7686 |
+| element matrix | 8 x 8 | 24 x 24 |
+
+A direct sparse solve at ~7.7k DOFs is cheap, so the SIMP loop keeps its
+current run time within a small factor. `nelz` stays a parameter, so finer
+through-width meshes can be switched on later without code changes.
+
+With one element through the width, Poisson's ratio set to 0 and the load
+spread evenly across the width, the 3D solve reproduces the 2D plane-stress
+solve (times the width) to round-off, which makes the most useful single test
+of the new element.
+
+## What changes, module by module
+
+| Module | 2D today | 3D |
+| --- | --- | --- |
+| `geometry.py` | planar face, `thickness` is a scalar | a box: length x height x width |
+| `meshing.py` | transfinite quads, edges as physical groups | transfinite hexes, faces as physical groups |
+| `mesh_io.py` | quads, shoelace area, `line` boundary blocks | hexes, element volume, `quad` boundary blocks |
+| `fea.py` | Q4, 3x3 D, 2 DOFs/node, 8x8 ke | H8, 6x6 D, 3 DOFs/node, 24x24 ke |
+| `optimize.py` | almost dimension-agnostic (centroid KD-tree) | area -> volume, larger filter neighbourhood |
+| `report.py` | per-element SVG polygons | projected views (side / top / end) |
+
+## Steps
+
+Each step is one PR with its own tests.
+
+### 0. Dimension-agnostic interfaces (no behaviour change) — done
+- `QuadMesh` becomes `Mesh`: `nodes (n, dim)`, `cells (m, k)`, `cell_type`,
+  `node_sets`, `cell_measures()` (area or volume).
+- DOF indexing in `fea.py` uses `dofs_per_node = dim` instead of a hard-coded 2;
+  element routines dispatch on `cell_type`.
+- `optimize.py` weighs the volume constraint with `cell_measures()`.
+- `mesh.npz` stores `cells` and `cell_type` instead of `quads`.
+- All existing tests pass unchanged in substance.
+
+### 1. Geometry: `BeamDomain3D` — done
+- `length`, `height`, `width`; `cq.Solid.makeBox(...)` with the corner at the
+  origin; BREP + STEP export through the same `export_domain`.
+- The load becomes a line load along the free end at mid-height, spread over the
+  width (a point load in 3D gives a stress singularity; with `nelz = 1` it is
+  simply split over the two tip nodes).
+
+### 2. Meshing: structured hexes — done
+- `setTransfiniteCurve` on the 12 edges (classified x / y / z),
+  `setTransfiniteSurface` + `setRecombine(2, ...)` on the 6 faces,
+  `setTransfiniteVolume`, `generate(3)`.
+- Physical groups: `design_domain` (dim 3), `fixed` (face x = 0),
+  `load_edge` (face x = L).
+- A separate `MeshSpec3D` (`nelx`, `nely`, `nelz`), with `nelz` **default 1**.
+- Tests: counts, uniform grid, every face classified.
+- Implemented as `generate_hex_mesh`; `load_edge` tags the whole
+  x = L face, and the load line (y = H/2) is picked from its nodes in step 4.
+
+### 3. `mesh_io`: read and check hexes — done
+- Read `hexahedron` blocks; boundary node sets from `quad` surface blocks.
+- Orientation via the Jacobian at the element centre (flip inverted hexes).
+- `check_mesh`: volumes sum to L*H*W, bounding box, no orphans, non-empty sets.
+- `.vtu` with `hexahedron` cells and 3-component displacement.
+- Implemented: `load_mesh` picks the dimension from the cell type,
+  `orient_cells` flips inverted cells, `cell_measures()` integrates det(J)
+  (exact for Q4/H8), `nodes_on_segment` picks the load line out of the loaded
+  face, and `check_mesh` reports `volume_*` keys for 3D.
+
+### 4. FEA: the H8 element — done
+- Isotropic 6x6 D, 6x24 B, 2x2x2 Gauss, 3D von Mises.
+- On a uniform structured grid all `ke` are identical: compute once and scale
+  by density instead of storing one matrix per element.
+- Tests: `ke` symmetric with exactly 6 zero eigenvalues; equilibrium; load
+  linearity; tip deflection vs Timoshenko for a b x h section; the
+  2D <-> 3D cross-check (nu = 0, `nelz = 1`) to round-off.
+- Implemented: `hex_element_stiffness`, `Material.constitutive_matrix_3d`,
+  `LoadCase.along_line` (consistent tributary shares), 3D centroid von Mises;
+  `element_stiffnesses` shares one matrix across identical elements (both 2D and
+  3D). On the default 60 x 20 x 1 mesh the 3D solve (7686 DOFs) takes ~0.3 s;
+  with nu = 0 it matches 2D to ~1e-11, and with nu = 0.3 it is 0.35% stiffer
+  than plane stress (compliance 559.24 vs 561.21 N*mm), as expected when the
+  width is not free to contract.
+
+### 5. Solver scaling (only when `nelz > 1` is needed)
+- Direct `spsolve` is fine at the default size. Beyond ~50-100k DOFs switch to
+  CG + AMG (`pyamg`) or CHOLMOD (`scikit-sparse`), warm-started from the
+  previous iteration's displacement; log per-iteration solve time.
+- Optional: exploit the z mid-plane symmetry.
+
+### 6. Optimizer in 3D — done
+- Mostly parameters after step 0. With `nelz = 1` the filter neighbourhood stays
+  in-plane, so behaviour should track the 2D run closely.
+- Tests: volume constraint every iteration, beats a uniform design, symmetric
+  about mid-height (and mid-width once `nelz > 1`).
+- Implemented: no optimizer code changed. With nu = 0 and `nelz = 1` the 3D
+  loop reproduces the 2D loop iteration by iteration (compliance to 1e-8,
+  densities to 1e-6); a `nelz = 2` run is symmetric about mid-height and
+  mid-width.
+
+### 7. Pipeline + CLI — done
+- `--dim {2,3}`, `--width`, `--nelz` (default 1); record dim / element type in
+  `run.json`.
+- Implemented: `pipeline.run` takes a `BeamDomain3D` + `MeshSpec3D`, meshes with
+  `generate_hex_mesh`, applies the tip load along the load line
+  (`load_nodes` in `run.json` and `mesh.npz`), and uses the width as the section
+  depth for the beam-theory check. Default 3D run: 60 iterations to
+  899.98 N·mm in ~15 s (2D: 903.54 N·mm), the same truss.
+- The report renders a 3D run as its side view (each hex's z-normal face) and
+  its prose follows the run's dimension; step 9 replaces this with projections.
+
+### 8. Result artifacts — done
+- `density.vtu` with hex cells.
+- Iso-surface at rho = 0.5 -> `optimization/topology.stl` (for Blender).
+- The standalone PyVista script from the README roadmap.
+- Implemented: `topology.py` thresholds the density at 0.5 and keeps the solid
+  elements' faces that no other solid element shares — a blocky but always
+  closed, outward-facing surface with no new dependencies (a 2D run is extruded
+  by its thickness first). Its enclosed volume equals the solid elements'
+  volume exactly, which the pipeline logs and the tests check. `topocombo.viz`
+  renders the thresholded topology, the density and the warped von Mises field
+  with PyVista, off screen or with `--show`; PyVista stays an optional extra.
+
+### 9. Report — done
+- Replace per-element polygons with projected views (side x-y, top x-z, end
+  y-z) of density, rendered with the existing `_quad_field_svg`. With
+  `nelz = 1` the side view is exactly the current figure.
+- Optional later: an isometric PNG from off-screen PyVista (needs xvfb/OSMesa).
+- Implemented: `project_field` averages the density over the hidden axis per
+  column of the structured grid. The side view is always drawn; top and end
+  views are added once the mesh is at least two elements deep in both drawn
+  directions (at `nelz = 1` they would be 1 mm strips). The mesh and solution
+  figures draw the front layer of hexes. The isometric PNG stays out of CI.
+
+### 10. CI + docs — done
+- Tests use a coarse 3D mesh (e.g. 12 x 4 x 1); Pages runs the 3D default.
+- README: artifacts table, benchmark numbers, layout, status.
+- Implemented: the Pages job runs `cli all --dim 3` on 60 x 20 x 1 (about 15 s);
+  the 2D path stays covered by the tests.
+
+## Risks
+- **Run time** grows with `nelz`; the default of 1 keeps CI cost near today's.
+- **Load modelling** changes from point to line load; the 2D <-> 3D cross-check
+  keeps the benchmarks comparable.
+- **CalculiX** becomes more attractive in 3D (C3D8 maps onto H8) as an
+  independent check of step 4.

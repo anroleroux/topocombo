@@ -4,13 +4,13 @@ A topology optimization pipeline built from decoupled, open-source components �
 
 ## Goal
 
-Explore topology optimization (SIMP-based compliance minimization) on a 2D cantilever beam meshed with quadrilateral elements, using an open-source toolchain end to end. The initial focus is a working, terminal-driven optimization loop; visualization is treated as a downstream, optional concern rather than something embedded in the loop itself. The FEA solver starts as a custom, minimal plane-stress implementation, with CalculiX as a planned future swap-in once the core loop is validated.
+Explore topology optimization (SIMP-based compliance minimization) on a cantilever beam, using an open-source toolchain end to end — as a 3D solid meshed with hexahedra (the default published run), or as the original 2D plane-stress problem meshed with quadrilaterals. The focus is a working, terminal-driven optimization loop; visualization is treated as a downstream, optional concern rather than something embedded in the loop itself. The FEA solver is a custom, minimal implementation, with CalculiX as a planned future swap-in once the core loop is validated.
 
 ## Components
 
 - **CAD (geometry)** — [CadQuery](https://github.com/CadQuery/cadquery): parametric definition of the design domain (beam dimensions, aspect ratio, load/support regions), scripted in Python.
-- **Mesher** — [Gmsh](https://gmsh.info/): quadrilateral meshing of the CAD geometry (transfinite or recombined mesh), driven via its Python API.
-- **FEA solver** — custom 2D plane-stress solver (numpy/scipy: sparse stiffness assembly, direct solve), implemented in `src/topocombo/fea.py`. Chosen over an external solver initially so the optimizer has direct, in-memory access to element stiffness matrices and displacement fields for sensitivity analysis. [CalculiX](http://www.calculix.de/) is the planned later alternative for a verified, general-purpose solver.
+- **Mesher** — [Gmsh](https://gmsh.info/): structured (transfinite) quadrilateral or hexahedral meshing of the CAD geometry, driven via its Python API.
+- **FEA solver** — custom solver with Q4 plane-stress quads and H8 solid hexahedra (numpy/scipy: sparse stiffness assembly, direct solve), implemented in `src/topocombo/fea.py`. Chosen over an external solver initially so the optimizer has direct, in-memory access to element stiffness matrices and displacement fields for sensitivity analysis. [CalculiX](http://www.calculix.de/) is the planned later alternative for a verified, general-purpose solver.
 - **Optimizer** — SIMP (Solid Isotropic Material with Penalization) loop, implemented in `src/topocombo/optimize.py`: density update via Optimality Criteria (with [NLopt](https://nlopt.readthedocs.io/)'s MMA as a planned alternative), with sensitivity or density filtering to avoid checkerboarding. The per-iteration coupling (FEA solve → compliance + sensitivity → filter → update) is custom code.
 - **Visualization (decoupled)**:
   - [PyVista](https://pyvista.org/) — scripted plotting of density fields and results, run as a separate process/script against exported data, not called from within the optimization loop.
@@ -20,9 +20,9 @@ Explore topology optimization (SIMP-based compliance minimization) on a 2D canti
 
 ### Main optimization loop (terminal, headless)
 1. Define parametric geometry in CadQuery → export CAD file.
-2. Mesh with Gmsh → quadrilateral mesh.
+2. Mesh with Gmsh → hexahedral (3D) or quadrilateral (2D) mesh.
 3. Run the SIMP loop:
-   - Assemble stiffness matrix, solve FEA (custom plane-stress solver).
+   - Assemble stiffness matrix, solve FEA (custom H8 solid / Q4 plane-stress solver).
    - Compute compliance and sensitivities.
    - Apply density/sensitivity filter.
    - Update design variables (OC or NLopt-MMA).
@@ -33,8 +33,8 @@ Explore topology optimization (SIMP-based compliance minimization) on a 2D canti
 No plotting or rendering happens inside this loop — it only reads geometry/mesh input and writes result artifacts.
 
 ### Visualization (separate, on demand)
-- **PyVista**: a standalone script reads exported result files from a run directory and produces static or interactive plots of density evolution / final topology.
-- **Blender**: a standalone script or manual workflow imports an exported mesh (thresholded density field converted to OBJ/STL/PLY via `meshio`) for polished rendering.
+- **PyVista**: `python -m topocombo.viz --run <run dir>` reads the exported `.vtu` files and renders the thresholded topology, the density field and the deformed stress field — to PNGs off screen, or interactively with `--show`.
+- **Blender**: import `optimization/topology.stl` — the density field thresholded at 0.5, as a closed, outward-facing surface written with `meshio` — for polished rendering.
 
 Because both visualization paths consume the same on-disk result artifacts rather than talking to the solver directly, swapping the FEA backend (e.g. to CalculiX later) does not require changes to either visualization script.
 
@@ -56,10 +56,25 @@ python -m topocombo.cli report --run results/cantilever --site site
 
 # or both at once
 python -m topocombo.cli all
+
+# the same cantilever as a 3D solid: hexahedra, one element through the width
+# (this is what CI runs and publishes)
+python -m topocombo.cli all --dim 3 --width 1 --nelz 1 --out results/cantilever3d
+
+# PyVista views of a finished run, written to <run>/figures (optional extra)
+pip install -e ".[viz]"
+python -m topocombo.viz --run results/cantilever3d
 ```
+
+With `--dim 3` the beam is a CadQuery box meshed into hexahedra, solved with
+the H8 solid element, and loaded along a line across the width at mid-height of
+the free end. The default 60 x 20 x 1 mesh (1200 hexes, 7686 DOFs) converges in
+60 iterations to 899.98 N·mm in about 15 s, the same truss as the 2D run; it is
+0.4% stiffer than plane stress because the width is not free to contract.
 
 `gmsh`'s shared library links against GLU, so on a bare Linux box install it first:
 `sudo apt-get install libglu1-mesa libxrender1 libxcursor1 libxft2 libxinerama1`.
+Rendering PyVista off screen on a headless box also needs `libosmesa6` or `libegl1`.
 
 Run the tests with `pytest` — they mesh a coarse beam and assert the grid is
 uniform, every element is counter-clockwise, the meshed area matches the design
@@ -68,7 +83,12 @@ solver against rigid-body modes, load linearity, equilibrium of the reactions,
 and Timoshenko beam theory on a slender beam; and they check the loop holds the
 volume constraint every iteration, beats a uniform design of the same volume,
 and produces a design symmetric about the beam's mid-height, as the symmetric
-load case demands.
+load case demands. The 3D tests check the hex mesh the same way, the H8 element
+against its six rigid-body modes, a uniform strain state and beam theory, and
+the strongest single check: with nu = 0 and one element through the width, the
+3D solve and the whole 3D SIMP loop reproduce the 2D ones to round-off. They
+also check that the exported topology surface is closed and encloses exactly
+the solid elements.
 
 ### Artifacts of a run
 
@@ -76,18 +96,20 @@ load case demands.
 | --- | --- |
 | `cad/design_domain.brep` | design domain, consumed by Gmsh's OCC importer |
 | `cad/design_domain.step` | same geometry for exchange with other CAD tools |
-| `mesh/beam.msh` | quad mesh with `design_domain`, `fixed` and `load_edge` physical groups |
-| `mesh/mesh.npz` | nodes, quad connectivity, boundary node sets, tip-load node — what the solver reads |
+| `mesh/beam.msh` | hex (3D) or quad (2D) mesh with `design_domain`, `fixed` and `load_edge` physical groups |
+| `mesh/mesh.npz` | nodes, cell connectivity (`cells`, `cell_type`), boundary node sets, tip-load node(s) — what the solver reads |
 | `mesh/mesh.vtu` | the same mesh for PyVista / ParaView |
 | `solution/solution.npz` | displacements, per-element compliance and von Mises stress |
 | `solution/solution.vtu` | displacement and stress fields for PyVista / ParaView |
 | `optimization/density.npz` | the optimized density field (one value per element) |
 | `optimization/density.vtu` | the same field for PyVista / ParaView |
+| `optimization/topology.stl` | the design thresholded at rho >= 0.5 as a closed surface, for Blender (2D runs extruded by the thickness) |
 | `optimization/log.csv` | per-iteration compliance, volume fraction, change, Mnd |
 | `optimization/snapshots/` | density field every 10 iterations, for animations |
 | `run.json`, `pipeline.log` | structured and plain-text log of the run |
+| `figures/*.png` | PyVista views, written by `python -m topocombo.viz` (not by the loop) |
 
-The 60 x 20 default gives 1200 quadrilaterals (one design variable each), 1281
+In 2D, the 60 x 20 default gives 1200 quadrilaterals (one design variable each), 1281
 nodes and 2562 displacement DOFs, with unit-square elements — the standard
 cantilever benchmark discretisation.
 
@@ -103,40 +125,61 @@ The design is the expected cantilever truss: top and bottom flanges with a
 triangulated web. Measure of discreteness Mnd = 23%, with 37% of elements fully
 solid and 35% void.
 
+In 3D, the 60 x 20 x 1 default gives the same 1200 design variables as
+hexahedra, 2562 nodes and 7686 DOFs; the tip load is spread over the two nodes
+of the mid-height line across the width. At full density the compliance is
+559.2 N·mm, 0.07% from Timoshenko theory for the 20 x 1 mm section (0.35%
+stiffer than plane stress, since the width cannot contract freely). The loop
+converges in 60 iterations to 899.98 N·mm — the same truss as the 2D run —
+and the whole run takes about 15 s. `--nelz` refines the width; at
+30 x 10 x 6 the design develops an I-section, which the report's top and end
+projections show.
+
 ### Report
 
-Each push runs the pipeline in CI and publishes the procedure log — parameters,
-per-stage terminal output, mesh validation and an SVG of the mesh — to GitHub
-Pages: <https://anroleroux.github.io/topocombo/>. The page is generated by
-`topocombo.report`, which reads only `run.json` and `mesh.npz` from a run
-directory, so it is a downstream consumer of artifacts like the other
-visualization paths, not part of the loop.
+Each push runs the tests and the 3D pipeline in CI and publishes the procedure
+log — parameters, per-stage terminal output, mesh validation, the full-density
+solve and the optimized density — to GitHub Pages:
+<https://anroleroux.github.io/topocombo/>. The page is generated by
+`topocombo.report`, which reads only the artifacts of a run directory, so it is
+a downstream consumer like the other visualization paths, not part of the loop.
+A 3D density field is shown as projections: the mean through the width (side
+view), plus top and end views once the mesh is more than one element deep.
 
 ## Layout
 
 ```
 src/topocombo/
   geometry.py   parametric design domain (CadQuery)
-  meshing.py    transfinite quad meshing and physical groups (Gmsh)
-  mesh_io.py    .msh -> numpy arrays, mesh quality checks, .npz/.vtu export
-  fea.py        Q4 plane-stress solver: element stiffness, assembly, direct solve
+  meshing.py    transfinite quad / hex meshing and physical groups (Gmsh)
+  mesh_io.py    .msh -> dimension-agnostic Mesh, quality checks, .npz/.vtu export
+  fea.py        Q4 plane-stress / H8 solid solver: element stiffness, assembly, direct solve
   optimize.py   SIMP loop: neighbourhood filter, OC update, convergence, log.csv
   pipeline.py   the geometry -> mesh -> solve -> optimize run, terminal-driven
   runlog.py     structured, timed logging of a run
+  topology.py   thresholded design -> closed STL surface (for Blender)
   report.py     static HTML report built from a run directory
-  cli.py        `python -m topocombo.cli run|report|all`
-tests/          mesh invariants, solver verification, optimizer invariants
+  viz.py        `python -m topocombo.viz`: PyVista views of a run (optional)
+  cli.py        `python -m topocombo.cli run|report|all [--dim 3]`
+tests/          mesh invariants, solver verification, optimizer invariants, 2D <-> 3D checks
+docs/           the 3D migration plan
 ```
 
 ## Status
 
-The main optimization loop is implemented end to end: parametric geometry,
-quadrilateral meshing with validation, the custom plane-stress FEA solve, and
-SIMP compliance minimisation (sensitivities, sensitivity or density filtering,
-Optimality Criteria update, convergence check) — all terminal-driven, writing
-result artifacts to a run directory, with the published run report built
-separately from those artifacts.
+The main optimization loop is implemented end to end, in 2D and 3D:
+parametric geometry, structured quad or hex meshing with validation, the
+custom Q4 plane-stress / H8 solid FEA solve, and SIMP compliance minimisation
+(sensitivities, sensitivity or density filtering, Optimality Criteria update,
+convergence check) — all terminal-driven, writing result artifacts to a run
+directory. The published report, the PyVista views and the STL for Blender are
+built separately from those artifacts.
 
-Next, in rough order: the standalone PyVista script against the exported `.vtu`
-files, NLopt-MMA as an alternative to the OC update, and the CalculiX swap-in
-for the solver once the loop is trusted. Blender rendering stays optional.
+The move to 3D followed [`docs/3d-migration-plan.md`](docs/3d-migration-plan.md);
+all steps but solver scaling (step 5) are done. Step 5 — an iterative solver
+for meshes many elements through the width — is only needed once `--nelz`
+grows well beyond the default of 1.
+
+Next, in rough order: NLopt-MMA as an alternative to the OC update, the
+CalculiX swap-in for the solver once the loop is trusted (its C3D8 element maps
+directly onto H8), and iterative solves for deeper 3D meshes.

@@ -6,18 +6,37 @@ import argparse
 import sys
 from pathlib import Path
 
-from .geometry import BeamDomain
-from .meshing import MeshSpec
+from .geometry import BeamDomain, BeamDomain3D
+from .meshing import MeshSpec, MeshSpec3D
 
 
 def _add_model_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--dim",
+        type=int,
+        choices=(2, 3),
+        default=2,
+        help="2: plane-stress quads; 3: solid hexahedra (default: 2)",
+    )
     p.add_argument("--length", type=float, default=60.0, help="beam length in mm (default: 60)")
     p.add_argument("--height", type=float, default=20.0, help="beam height in mm (default: 20)")
     p.add_argument(
-        "--thickness", type=float, default=1.0, help="out-of-plane thickness in mm (default: 1)"
+        "--thickness",
+        type=float,
+        default=1.0,
+        help="2D only: out-of-plane thickness in mm (default: 1)",
+    )
+    p.add_argument(
+        "--width", type=float, default=1.0, help="3D only: beam width along z in mm (default: 1)"
     )
     p.add_argument("--nelx", type=int, default=60, help="elements along the length (default: 60)")
     p.add_argument("--nely", type=int, default=20, help="elements through the height (default: 20)")
+    p.add_argument(
+        "--nelz",
+        type=int,
+        default=1,
+        help="3D only: elements through the width (default: 1, keeps runs light)",
+    )
     p.add_argument(
         "--youngs", type=float, default=210_000.0, help="Young's modulus in MPa (default: 210000)"
     )
@@ -59,7 +78,7 @@ def _add_model_args(p: argparse.ArgumentParser) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="topocombo",
-        description="The topocombo pipeline: geometry, meshing, plane-stress solve, SIMP loop.",
+        description="The topocombo pipeline: geometry, meshing, FEA solve (2D or 3D), SIMP loop.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -81,8 +100,12 @@ def main(argv: list[str] | None = None) -> int:
         from .optimize import SimpParams
         from .pipeline import run
 
-        domain = BeamDomain(length=args.length, height=args.height, thickness=args.thickness)
-        spec = MeshSpec(nelx=args.nelx, nely=args.nely)
+        if args.dim == 3:
+            domain = BeamDomain3D(length=args.length, height=args.height, width=args.width)
+            spec = MeshSpec3D(nelx=args.nelx, nely=args.nely, nelz=args.nelz)
+        else:
+            domain = BeamDomain(length=args.length, height=args.height, thickness=args.thickness)
+            spec = MeshSpec(nelx=args.nelx, nely=args.nely)
         material = Material(youngs_modulus=args.youngs, poisson_ratio=args.poisson)
         simp = SimpParams(
             volume_fraction=args.volfrac,

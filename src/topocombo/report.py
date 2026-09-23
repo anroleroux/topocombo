@@ -191,10 +191,20 @@ def project_field(
 # --------------------------------------------------------------------------
 # mesh figure
 # --------------------------------------------------------------------------
-def mesh_svg(npz_path: Path, width: int = 900, pad: int = 46) -> str:
-    """Inline SVG of the quad mesh with the supports and the tip load marked."""
+def mesh_svg(
+    npz_path: Path,
+    width: int = 900,
+    pad: int = 46,
+    holes: list[list[float]] | tuple = (),
+) -> str:
+    """Inline SVG of the quad mesh with the supports and the tip load marked.
+
+    Elements held void (``passive`` in the npz) are drawn empty, with the CAD
+    cutouts in ``holes`` — (x, y, diameter) — outlined over them.
+    """
     data = np.load(npz_path)
-    nodes, quads, _ = _side_view(data["nodes"], data["cells"])
+    nodes, quads, drawn = _side_view(data["nodes"], data["cells"])
+    passive = data["passive"][drawn] if "passive" in data else np.zeros(len(quads), dtype=bool)
     fixed = data["set_fixed"] if "set_fixed" in data else np.empty(0, dtype=int)
     load_node = int(data["load_node"][0]) if "load_node" in data else None
 
@@ -214,6 +224,8 @@ def mesh_svg(npz_path: Path, width: int = 900, pad: int = 46) -> str:
         f'role="img" aria-label="Mesh of the cantilever beam design domain">',
         '<style>'
         '.el{fill:var(--accent-soft);stroke:var(--accent);stroke-width:0.6;stroke-opacity:0.55}'
+        '.pv{fill:none;stroke:var(--muted);stroke-width:0.6;stroke-opacity:0.35}'
+        '.hole{fill:none;stroke:var(--text);stroke-width:1.4;stroke-dasharray:5 3}'
         '.bd{fill:none;stroke:var(--text);stroke-width:1.6}'
         '.sup{stroke:var(--text);stroke-width:1.6}'
         '.ld{stroke:var(--fail);stroke-width:2.4;fill:var(--fail)}'
@@ -221,9 +233,19 @@ def mesh_svg(npz_path: Path, width: int = 900, pad: int = 46) -> str:
         '</style>',
     ]
 
-    for quad in quads:
+    for quad, void in zip(quads, passive):
         pts = " ".join(f"{x:.2f},{y:.2f}" for x, y in (px(nodes[i]) for i in quad))
-        parts.append(f'<polygon class="el" points="{pts}"/>')
+        cls = "pv" if void else "el"
+        parts.append(f'<polygon class="{cls}" points="{pts}"/>')
+    for hx, hy, hd in holes:
+        cx, cy = px(np.array([hx, hy]))
+        parts.append(
+            f'<circle class="hole" cx="{cx:.2f}" cy="{cy:.2f}" r="{hd / 2 * scale:.2f}"/>'
+        )
+        parts.append(
+            f'<text class="lbl" x="{cx:.2f}" y="{cy + hd / 2 * scale + 16:.2f}" '
+            f'text-anchor="middle">\u2300{hd:g} cutout</text>'
+        )
 
     # outline
     corners = [
@@ -839,6 +861,11 @@ def _cad_section(
     else:
         rows.append(("thickness, solver only (mm)", domain.get("thickness")))
         rows.append(("area (mm\u00b2)", geometry.get("face_area", domain.get("area"))))
+    holes = domain.get("holes") or []
+    rows.append((
+        "cutouts through z (x, y, \u2300 mm)",
+        "; ".join(f"({x:g}, {y:g}, \u2300{d:g})" for x, y, d in holes) if holes else "none",
+    ))
     rows.append(("parameters from", geometry.get("cad_config") or "command-line flags / defaults"))
 
     image = ""
@@ -848,7 +875,12 @@ def _cad_section(
             f"<figure><img src='{_e(cad_image)}' alt='Shaded view of the CadQuery design"
             f" domain: a {_e(domain.get('length'))} by {_e(domain.get('height'))} mm {shape}'>"
             "<figcaption>The CadQuery output, read back from <code>design_domain.brep</code> and"
-            " rendered by <code>topocombo.cadview</code> — the exact shape Gmsh meshed.</figcaption>"
+            " rendered by <code>topocombo.cadview</code>"
+            + (
+                ". Gmsh meshes its envelope; the elements inside the cutouts are held void."
+                if holes else " — the exact shape Gmsh meshed."
+            )
+            + "</figcaption>"
             "</figure>"
         )
     table = f"<div>{_kv_table(rows)}</div>"
@@ -921,6 +953,12 @@ def render_html(
             "Every quad is one design variable for the SIMP loop. The left edge is clamped"
             f" (all {n_fixed} nodes, both DOFs); the tip load acts downwards at the"
             " mid-height node of the free edge."
+        )
+    if summary.get("passive_elements"):
+        mesh_caption += (
+            f" The {_e(summary['passive_elements'])} elements whose centres fall inside the"
+            " dashed CAD cutout are drawn empty: the grid still covers them, but the optimizer"
+            " holds them void."
         )
 
     chips = [f"run {run.get('started_at', '')}", f"{run.get('duration_s', 0):.2f} s total"]
@@ -1139,7 +1177,7 @@ def build_site(run_dir: Path, site_dir: Path) -> Path:
 
     mesh_npz = run_dir / "mesh" / "mesh.npz"
     solution_npz = run_dir / "solution" / "solution.npz"
-    svg = mesh_svg(mesh_npz)
+    svg = mesh_svg(mesh_npz, holes=run.get("params", {}).get("domain", {}).get("holes", ()))
     solve_figure = (
         solution_svg(mesh_npz, solution_npz) if solution_npz.exists() else None
     )

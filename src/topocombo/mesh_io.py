@@ -328,8 +328,12 @@ def save_mesh(
     out_dir: Path,
     load_node: int | None = None,
     load_nodes: np.ndarray | None = None,
+    passive: np.ndarray | None = None,
 ) -> dict[str, Path]:
-    """Write the solver-facing ``mesh.npz`` and the visualisation-facing ``mesh.vtu``."""
+    """Write the solver-facing ``mesh.npz`` and the visualisation-facing ``mesh.vtu``.
+
+    ``passive`` marks the elements held void (inside a CAD cutout).
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -344,6 +348,8 @@ def save_mesh(
         arrays["load_node"] = np.asarray([load_node], dtype=int)
     if load_nodes is not None:  # a load spread over several nodes (3D load line)
         arrays["load_nodes"] = np.asarray(load_nodes, dtype=int)
+    if passive is not None:
+        arrays["passive"] = np.asarray(passive, dtype=bool)
 
     npz = out_dir / "mesh.npz"
     np.savez_compressed(npz, **arrays)

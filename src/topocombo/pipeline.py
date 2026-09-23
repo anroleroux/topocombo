@@ -39,6 +39,7 @@ from .meshing import (
 )
 from .optimize import (
     SimpParams,
+    element_centroids,
     optimize,
     save_density_field,
     save_design,
@@ -110,7 +111,9 @@ def run(
                 f"z = {z0:g} .. {z1:g}"
             )
             solid = domain.solid()
-            log.log(f"solid volume: {solid.Volume():.3f} mm^3 (expected {domain.volume:.3f})")
+            log.log(
+                f"solid volume: {solid.Volume():.3f} mm^3 (expected {domain.material_volume:.3f})"
+            )
             cad_record = {"solid_volume": solid.Volume()}
         else:
             log.log(
@@ -120,8 +123,12 @@ def run(
             )
             log.log(f"clamped edge: x = 0; tip load applied at {domain.load_point}")
             face = domain.face()
-            log.log(f"planar face area: {face.Area():.3f} mm^2 (expected {domain.area:.3f})")
+            log.log(
+                f"planar face area: {face.Area():.3f} mm^2 (expected {domain.material_area:.3f})"
+            )
             cad_record = {"face_area": face.Area()}
+        for x, y, d in domain.holes:
+            log.log(f"cutout through z: diameter {d:g} mm at x = {x:g}, y = {y:g}")
         if cad_config is not None:
             log.log(f"CAD parameters read from {cad_config}")
         exported = export_domain(domain, out_dir / "cad")
@@ -130,6 +137,7 @@ def run(
             "script": "design domain, the CadQuery script that built it (runs in CQ-editor)",
             "brep": "design domain, BREP format",
             "step": "design domain, STEP format",
+            "envelope": "design envelope without cutouts, BREP format — what Gmsh meshes",
         }
         for kind, path in exported.items():
             log.artifact(path, descriptions[kind])
@@ -147,11 +155,16 @@ def run(
             f"transfinite grid: {grid} = {spec.n_elements} {cells_word}, "
             f"{spec.n_nodes} nodes expected"
         )
+        if domain.holes:
+            log.log(
+                "the structured grid covers the whole envelope; elements inside the "
+                "cutouts are held void by the optimizer"
+            )
         mesher = generate_hex_mesh if three_d else generate_quad_mesh
         msh_path, _ = mesher(
             domain=domain,
             spec=spec,
-            brep_path=exported["brep"],
+            brep_path=exported.get("envelope", exported["brep"]),
             out_dir=out_dir / "mesh",
             log=log,
         )
@@ -174,6 +187,16 @@ def run(
         summary["load_node"] = load_node
         summary["load_nodes"] = [int(n) for n in load_nodes]
         summary["load_node_coords"] = [float(c) for c in mesh.nodes[load_node]]
+        passive = domain.void_mask(element_centroids(mesh))
+        if passive.any():
+            measures = mesh.cell_measures()
+            if three_d:
+                cut = domain.volume - domain.material_volume
+            else:
+                cut = domain.area - domain.material_area
+            summary["passive_elements"] = int(passive.sum())
+            summary["passive_measure"] = float(measures[passive].sum())
+            summary["cutout_measure"] = float(cut)
 
         log.log(f"{summary['n_nodes']} nodes, {summary['n_elements']} {cells_word}, {summary['n_dofs']} DOFs")
         log.log(
@@ -188,6 +211,13 @@ def run(
         )
         for name, count in summary["node_sets"].items():
             log.log(f"node set '{name}': {count} nodes")
+        if passive.any():
+            log.log(
+                f"cutouts: {summary['passive_elements']} elements held void, "
+                f"{summary['passive_measure']:.4g} {unit} of grid vs "
+                f"{summary['cutout_measure']:.4g} {unit} in the CAD model "
+                "(the grid resolves a cutout to whole elements)"
+            )
         coords = ", ".join(f"{c:.3f}" for c in summary["load_node_coords"])
         if load_nodes.size > 1:
             log.log(f"tip load line: {load_nodes.size} nodes, starting at #{load_node} ({coords})")
@@ -201,7 +231,10 @@ def run(
         log.record(**summary)
 
     with log.step("export", "4. Write mesh artifacts"):
-        paths = save_mesh(mesh, out_dir / "mesh", load_node=load_node, load_nodes=load_nodes)
+        paths = save_mesh(
+            mesh, out_dir / "mesh", load_node=load_node, load_nodes=load_nodes,
+            passive=passive if passive.any() else None,
+        )
         log.artifact(paths["npz"], f"nodes, {mesh.cell_type} connectivity and boundary node sets (numpy)")
         log.artifact(paths["vtu"], "mesh for PyVista / ParaView")
 
@@ -237,6 +270,7 @@ def run(
             thickness=depth,
             load=load,
             fixed_node_set=PHYS_FIXED,
+            densities=np.where(passive, 0.0, 1.0) if passive.any() else None,
             ke_all=ke_all,
         )
         beam = timoshenko_tip_deflection(
@@ -256,6 +290,7 @@ def run(
             f"Timoshenko beam theory: {beam['total']:.6g} mm "
             f"(bending {beam['bending']:.4g} + shear {beam['shear']:.4g}) "
             f"-> {rel * 100:.2f}% difference"
+            + (" (beam theory ignores the cutouts)" if passive.any() else "")
         )
         log.log(
             f"equilibrium: ||KU - F|| on free DOFs = {result.equilibrium_residual:.3e}, "
@@ -328,6 +363,7 @@ def run(
                 fixed_node_set=PHYS_FIXED,
                 params=simp,
                 on_iteration=on_iteration,
+                passive=passive,
             )
             reduction = (design.compliance / result.compliance) if result.compliance else float("nan")
             log.log(

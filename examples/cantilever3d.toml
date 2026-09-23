@@ -6,3 +6,10 @@ dim = 3        # 2: planar face (plane stress), 3: solid box
 length = 60.0  # mm, along x
 height = 20.0  # mm, along y
 width = 1.0    # mm, along z (3D only; 2D takes `thickness` instead)
+
+# circular cutouts through z (repeat the table for more); the optimizer holds
+# the elements inside them void
+[[cad.holes]]
+x = 20.0
+y = 10.0
+diameter = 10.0

@@ -12,7 +12,18 @@ from .meshing import MeshSpec, MeshSpec3D
 #: CadQuery inputs and their defaults.  The flags default to None so an
 #: explicit flag can be told apart from a value read from --cad-config:
 #: flag > config file > these defaults.
-CAD_DEFAULTS = {"dim": 2, "length": 60.0, "height": 20.0, "thickness": 1.0, "width": 1.0}
+CAD_DEFAULTS = {
+    "dim": 2, "length": 60.0, "height": 20.0, "thickness": 1.0, "width": 1.0, "holes": (),
+}
+
+
+def _hole(text: str) -> tuple[float, float, float]:
+    """``X,Y,D`` -> (x, y, diameter)."""
+    try:
+        x, y, d = (float(v) for v in text.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected X,Y,DIAMETER in mm, not {text!r}") from None
+    return x, y, d
 
 
 def _add_cad_args(p: argparse.ArgumentParser) -> None:
@@ -21,7 +32,7 @@ def _add_cad_args(p: argparse.ArgumentParser) -> None:
         type=Path,
         default=None,
         help="JSON or TOML file with the CadQuery inputs (dim, length, height, thickness,"
-        " width); flags given on the command line override it",
+        " width, holes); flags given on the command line override it",
     )
     p.add_argument(
         "--dim",
@@ -41,6 +52,16 @@ def _add_cad_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--width", type=float, default=None, help="3D only: beam width along z in mm (default: 1)"
     )
+    p.add_argument(
+        "--hole",
+        dest="holes",
+        type=_hole,
+        action="append",
+        default=None,
+        metavar="X,Y,D",
+        help="circular cutout through z, diameter D centred at (X, Y) in mm; repeatable,"
+        " and replaces any holes from --cad-config (default: none)",
+    )
 
 
 def _resolve_cad_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -59,8 +80,12 @@ def _resolve_cad_args(parser: argparse.ArgumentParser, args: argparse.Namespace)
 def _domain(parser: argparse.ArgumentParser, args: argparse.Namespace) -> BeamDomain | BeamDomain3D:
     try:
         if args.dim == 3:
-            return BeamDomain3D(length=args.length, height=args.height, width=args.width)
-        return BeamDomain(length=args.length, height=args.height, thickness=args.thickness)
+            return BeamDomain3D(
+                length=args.length, height=args.height, width=args.width, holes=args.holes
+            )
+        return BeamDomain(
+            length=args.length, height=args.height, thickness=args.thickness, holes=args.holes
+        )
     except ValueError as exc:
         parser.error(str(exc))
 

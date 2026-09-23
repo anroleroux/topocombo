@@ -67,6 +67,9 @@ python -m topocombo.cli all --cad-config examples/cantilever3d.toml --out result
 # just the CAD stage: print the CadQuery script, write it with BREP, STEP and a PNG preview
 python -m topocombo.cli cad --cad-config examples/cantilever3d.toml --width 5 --out results/cad
 
+# a 10 mm hole through z at x = 20, y = 10 (repeat --hole for more)
+python -m topocombo.cli all --dim 3 --hole 20,10,10 --out results/holed
+
 # a shaded PNG of any exported BREP or STL, no OpenGL needed
 python -m topocombo.cadview results/cantilever3d/optimization/topology.stl
 
@@ -80,12 +83,24 @@ python -m topocombo.viz --run results/cantilever3d
 The design domain is not built by hidden API calls: each run generates a
 standalone CadQuery script from its parameters, builds the shape by executing
 exactly that script, and writes it to `cad/design_domain.py` (it opens as-is in
-CQ-editor). The parameters — `dim`, `length`, `height`, `thickness` (2D) and
-`width` (3D) — come from the flags, from a `--cad-config` JSON or TOML file
-(flat, or under a `[cad]` table), or the defaults, in that order of precedence.
+CQ-editor). The parameters — `dim`, `length`, `height`, `thickness` (2D),
+`width` (3D) and circular cutouts through z (`holes`) — come from the flags,
+from a `--cad-config` JSON or TOML file (flat, or under a `[cad]` table), or
+the defaults, in that order of precedence.
 The config is validated before anything runs: unknown keys (a typo such as
 `lenght`), non-numbers, non-positive lengths and a `dim` other than 2 or 3 are
-rejected with a message naming the allowed keys. The report prints the
+rejected with a message naming the allowed keys, and a cutout must lie strictly
+inside the beam and clear of the others.
+
+Cutouts are given as `--hole X,Y,D` (repeatable; replaces any holes from the
+config) or as `[[cad.holes]]` tables with `x`, `y` and `diameter`. The
+published run has one: diameter 10 mm at x = 20, y = 10. CadQuery cuts them
+from the model, so the script, STEP, BREP and picture all carry them. The
+structured grid still covers the full L x H envelope (`design_envelope.brep`
+is what Gmsh meshes), and the elements whose centres fall inside a cutout are
+held at zero density by the optimizer: a passive, non-design region, the usual
+SIMP treatment. The volume fraction stays relative to the whole envelope, and
+the full-density solve already has the cutout void. The report prints the
 parameters and the script, and shows a shaded picture of the resulting CAD
 shape alongside one of the optimized topology.
 
@@ -118,10 +133,11 @@ the solid elements.
 | File | Contents |
 | --- | --- |
 | `cad/design_domain.py` | the CadQuery script that built the design domain (runs in CQ-editor) |
-| `cad/design_domain.brep` | design domain, consumed by Gmsh's OCC importer |
+| `cad/design_domain.brep` | design domain; Gmsh's OCC importer meshes it directly when there are no cutouts |
+| `cad/design_envelope.brep` | with cutouts: the L x H envelope Gmsh meshes instead |
 | `cad/design_domain.step` | same geometry for exchange with other CAD tools |
 | `mesh/beam.msh` | hex (3D) or quad (2D) mesh with `design_domain`, `fixed` and `load_edge` physical groups |
-| `mesh/mesh.npz` | nodes, cell connectivity (`cells`, `cell_type`), boundary node sets, tip-load node(s) — what the solver reads |
+| `mesh/mesh.npz` | nodes, cell connectivity (`cells`, `cell_type`), boundary node sets, tip-load node(s), `passive` void elements (with cutouts) — what the solver reads |
 | `mesh/mesh.vtu` | the same mesh for PyVista / ParaView |
 | `solution/solution.npz` | displacements, per-element compliance and von Mises stress |
 | `solution/solution.vtu` | displacement and stress fields for PyVista / ParaView |

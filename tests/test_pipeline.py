@@ -1181,3 +1181,102 @@ def test_report_prints_the_cadquery_input_and_shows_the_cad_output(which, reques
     assert (site / "figures" / "topology.png").stat().st_size > 0
     assert (site / "artifacts" / "design_domain.py").exists()
 
+
+
+# --------------------------------------------------------------------------
+# circular cutouts through z
+# --------------------------------------------------------------------------
+import cadquery as cq  # noqa: E402
+
+HOLE = (20.0, 10.0, 10.0)
+
+
+@pytest.mark.parametrize("cls", [BeamDomain, BeamDomain3D])
+def test_cutout_is_cut_from_the_cad_model(cls):
+    domain = cls(holes=[HOLE])
+    shape = domain.workplane().val()
+    hole_area = np.pi * 5.0**2
+    if cls is BeamDomain3D:
+        assert isinstance(shape, cq.Solid)
+        assert shape.Volume() == pytest.approx(domain.volume - hole_area * domain.width)
+        assert domain.material_volume == pytest.approx(shape.Volume())
+    else:
+        assert isinstance(shape, cq.Face)
+        assert shape.Area() == pytest.approx(domain.area - hole_area)
+        assert domain.material_area == pytest.approx(shape.Area())
+    assert "holes = [(20.0, 10.0, 10.0)]" in domain.cadquery_script()
+    assert domain.envelope().holes == ()
+
+
+@pytest.mark.parametrize(
+    "hole, message",
+    [((58.0, 10.0, 10.0), "fit"), ((20.0, 10.0, 0.0), "positive"), ((20.0, 10.0), "diameter")],
+)
+def test_cutouts_must_fit_inside_the_domain(hole, message):
+    with pytest.raises(ValueError, match=message):
+        BeamDomain3D(holes=[hole])
+
+
+def test_overlapping_cutouts_are_rejected():
+    with pytest.raises(ValueError, match="overlap"):
+        BeamDomain(holes=[(20.0, 10.0, 10.0), (26.0, 10.0, 4.0)])
+
+
+def test_void_mask_picks_the_centroids_inside_the_cutout():
+    domain = BeamDomain(holes=[HOLE])
+    centroids = np.array([[20.0, 10.0], [24.9, 10.0], [25.1, 10.0], [50.0, 10.0]])
+    assert domain.void_mask(centroids).tolist() == [True, True, False, False]
+
+
+def test_cad_config_reads_hole_tables(tmp_path):
+    path = tmp_path / "cad.toml"
+    path.write_text("[cad]\ndim = 3\n[[cad.holes]]\nx = 20\ny = 10\ndiameter = 10\n")
+    assert load_cad_config(path) == {"dim": 3, "holes": (HOLE,)}
+    (tmp_path / "cad.json").write_text('{"holes": [[20, 10, 10]]}')
+    assert load_cad_config(tmp_path / "cad.json") == {"holes": (HOLE,)}
+    (tmp_path / "bad.json").write_text('{"holes": [{"x": 20, "y": 10, "d": 10}]}')
+    with pytest.raises(ValueError, match="unknown: d"):
+        load_cad_config(tmp_path / "bad.json")
+
+
+def test_passive_elements_stay_void_and_the_volume_holds():
+    mesh = _brick_grid(8, 4, 1)
+    mesh.node_sets[PHYS_FIXED] = np.flatnonzero(mesh.nodes[:, 0] == 0.0)
+    tip = int(np.flatnonzero((mesh.nodes[:, 0] == 8.0) & (mesh.nodes[:, 1] == 2.0))[0])
+    passive = np.zeros(mesh.n_elements, dtype=bool)
+    passive[:4] = True  # the column of elements next to the clamp
+    for filter_type in ("sensitivity", "density"):
+        design = optimize(
+            mesh, Material(), 1.0, LoadCase(node=tip, fy=-10.0), PHYS_FIXED,
+            SimpParams(max_iterations=8, filter_type=filter_type, filter_radius=1.5),
+            passive=passive,
+        )
+        assert np.all(design.densities[passive] == 0.0)
+        assert design.volume_fraction == pytest.approx(0.5, abs=1e-6)
+
+
+@pytest.fixture(scope="module")
+def holed_run_3d(tmp_path_factory):
+    out = tmp_path_factory.mktemp("holed3d")
+    domain = BeamDomain3D(length=24.0, height=8.0, width=1.0, holes=[(8.0, 4.0, 4.0)])
+    spec = MeshSpec3D(nelx=24, nely=8, nelz=1)
+    _, summary = run(domain=domain, spec=spec, out_dir=out,
+                     simp=SimpParams(max_iterations=6), echo=False)
+    return {"dir": out, "domain": domain, "summary": summary}
+
+
+def test_pipeline_holds_the_cutout_void(holed_run_3d):
+    out, summary = holed_run_3d["dir"], holed_run_3d["summary"]
+    assert summary["all_checks_passed"]
+    assert (out / "cad" / "design_envelope.brep").exists()
+    passive = np.load(out / "mesh" / "mesh.npz")["passive"]
+    assert passive.sum() == summary["passive_elements"] > 0
+    assert summary["passive_measure"] == pytest.approx(summary["cutout_measure"], rel=0.25)
+    densities = np.load(out / "optimization" / "density.npz")["densities"]
+    assert np.all(densities[passive] == 0.0)
+
+
+def test_report_shows_the_cutout(holed_run_3d, tmp_path):
+    html = build_site(run_dir=holed_run_3d["dir"], site_dir=tmp_path / "site").read_text()
+    assert 'class="hole"' in html and "held void" in html
+    assert "(8, 4, ⌀4)" in html

@@ -799,3 +799,164 @@ def test_hex_solution_artifacts(slender_hex_beam, tmp_path):
     assert data["von_mises"].shape == (mesh.n_elements,)
     vtu = meshio.read(str(paths["vtu"]))
     assert vtu.point_data["displacement"].shape == (mesh.n_nodes, 3)
+
+
+# --------------------------------------------------------------------------
+# the SIMP loop on hexahedra (step 6)
+# --------------------------------------------------------------------------
+def test_hex_optimization_matches_the_2d_design_with_one_element_through_the_width(tmp_path):
+    """nu = 0, nelz = 1: every iteration of the 3D loop reproduces the 2D loop."""
+    material = Material(poisson_ratio=0.0)
+    width = 1.0
+    params = SimpParams(volume_fraction=0.4, filter_radius=1.5, max_iterations=15, tolerance=1e-4)
+    domain2 = BeamDomain(length=30.0, height=10.0, thickness=width)
+    domain3 = BeamDomain3D(length=30.0, height=10.0, width=width)
+    mesh2 = _quad_mesh(tmp_path / "q4", domain2, MeshSpec(nelx=30, nely=10))
+    mesh3 = _hex_mesh(tmp_path / "h8", domain3, MeshSpec3D(nelx=30, nely=10, nelz=1))
+
+    load2 = LoadCase(node=find_node(mesh2, domain2.load_point), fy=-1000.0)
+    design2 = optimize(mesh2, material, width, load2, PHYS_FIXED, params)
+    design3 = optimize(mesh3, material, width, _tip_line_load(mesh3, domain3, -1000.0), PHYS_FIXED, params)
+
+    assert design3.iterations == design2.iterations
+    c2 = [h["compliance"] for h in design2.history]
+    c3 = [h["compliance"] for h in design3.history]
+    assert c3 == pytest.approx(c2, rel=1e-8)
+    _, match = cKDTree(element_centroids(mesh2)).query(element_centroids(mesh3)[:, :2])
+    assert np.abs(design3.densities - design2.densities[match]).max() < 1e-6
+
+
+@pytest.fixture(scope="module")
+def optimized_hex(tmp_path_factory):
+    """Two elements through the width, so the width direction is exercised too."""
+    out = tmp_path_factory.mktemp("opt_hex")
+    domain = BeamDomain3D(length=24.0, height=8.0, width=2.0)
+    mesh = _hex_mesh(out, domain, MeshSpec3D(nelx=24, nely=8, nelz=2))
+    material = Material()
+    load = _tip_line_load(mesh, domain, fy=-1000.0)
+    params = SimpParams(volume_fraction=0.4, filter_radius=1.5, max_iterations=15, tolerance=0.02)
+    seen: list[dict[str, float]] = []
+    result = optimize(
+        mesh, material, domain.width, load, PHYS_FIXED, params,
+        on_iteration=lambda record, densities: seen.append(record),
+    )
+    return {"domain": domain, "mesh": mesh, "material": material, "load": load,
+            "params": params, "result": result, "seen": seen}
+
+
+def test_hex_optimization_holds_the_volume_constraint(optimized_hex):
+    target = optimized_hex["params"].volume_fraction
+    assert all(r["volume_fraction"] == pytest.approx(target, abs=1e-6) for r in optimized_hex["seen"])
+    d = optimized_hex["result"].densities
+    assert d.min() >= 0.0 and d.max() <= 1.0
+
+
+def test_hex_optimization_beats_a_uniform_design(optimized_hex):
+    o = optimized_hex
+    uniform = solve(
+        o["mesh"], o["material"], o["domain"].width, o["load"], PHYS_FIXED,
+        densities=np.full(o["mesh"].n_elements, o["params"].volume_fraction), penal=o["params"].penal,
+    )
+    assert o["result"].compliance < 0.5 * uniform.compliance
+
+
+def test_hex_design_is_symmetric_about_mid_height_and_mid_width(optimized_hex):
+    mesh, domain = optimized_hex["mesh"], optimized_hex["domain"]
+    d = optimized_hex["result"].densities
+    c = element_centroids(mesh)
+    tree = cKDTree(c)
+    for mirror in ([1.0, -1.0, 1.0], [1.0, 1.0, -1.0]):
+        reflected = c * mirror + [0.0, domain.height, domain.width] * (np.array(mirror) < 0)
+        dist, partner = tree.query(reflected)
+        assert dist.max() < 1e-9
+        assert np.abs(d - d[partner]).max() < 1e-6
+
+
+# --------------------------------------------------------------------------
+# the 3D pipeline and CLI (step 7)
+# --------------------------------------------------------------------------
+from topocombo.cli import main as cli_main  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def coarse_run_3d(tmp_path_factory):
+    out = tmp_path_factory.mktemp("run3d")
+    domain = BeamDomain3D(length=12.0, height=4.0, width=1.0)
+    spec = MeshSpec3D(nelx=12, nely=4, nelz=1)
+    simp = SimpParams(max_iterations=5)
+    log, summary = run(domain=domain, spec=spec, out_dir=out, simp=simp, echo=False)
+    return {"dir": out, "domain": domain, "spec": spec, "summary": summary}
+
+
+def test_pipeline_runs_in_3d(coarse_run_3d):
+    run_json = json.loads((coarse_run_3d["dir"] / "run.json").read_text())
+    assert run_json["params"]["dim"] == 3
+    assert run_json["params"]["element"] == "H8 hexahedron"
+    assert all(s["status"] == "ok" for s in run_json["steps"])
+    names = [s["name"] for s in run_json["steps"]]
+    assert names == ["geometry", "meshing", "validation", "export", "solve",
+                     "solution_export", "optimize", "design_export"]
+
+    summary, spec = coarse_run_3d["summary"], coarse_run_3d["spec"]
+    assert summary["all_checks_passed"]
+    assert summary["n_dofs"] == 3 * spec.n_nodes
+    assert summary["volume_sum"] == pytest.approx(coarse_run_3d["domain"].volume)
+    assert len(summary["load_nodes"]) == spec.nelz + 1
+    solve_data = summary["solve"]
+    assert solve_data["load"]["shares"] == pytest.approx([0.5, 0.5])
+    assert solve_data["reaction_y"] == pytest.approx(1000.0, rel=1e-9)
+    assert summary["optimization"]["iterations"] == 5
+
+
+def test_pipeline_3d_artifacts(coarse_run_3d):
+    out, spec = coarse_run_3d["dir"], coarse_run_3d["spec"]
+    mesh_data = np.load(out / "mesh" / "mesh.npz")
+    assert mesh_data["nodes"].shape == (spec.n_nodes, 3)
+    assert mesh_data["cells"].shape == (spec.n_elements, 8)
+    assert mesh_data["load_nodes"].size == spec.nelz + 1
+    assert np.load(out / "solution" / "solution.npz")["displacements"].shape == (spec.n_nodes, 3)
+    assert np.load(out / "optimization" / "density.npz")["densities"].shape == (spec.n_elements,)
+    vtu = meshio.read(str(out / "optimization" / "density.vtu"))
+    assert [b.type for b in vtu.cells] == ["hexahedron"]
+
+
+def test_report_renders_a_3d_run(coarse_run_3d, tmp_path):
+    index = build_site(run_dir=coarse_run_3d["dir"], site_dir=tmp_path / "site")
+    html = index.read_text()
+    assert html.count("<svg") >= 3  # mesh, solution and density figures
+    assert "hexahedra" in html
+    assert "3D solid solve" in html and "Plane-stress solve" not in html
+
+
+def test_report_side_view_of_a_hex_mesh_tiles_the_domain(coarse_run_3d):
+    """Each hex is drawn by its z-normal face, counter-clockwise, covering L x H."""
+    from topocombo.report import _side_view
+
+    data = np.load(coarse_run_3d["dir"] / "mesh" / "mesh.npz")
+    nodes, quads = _side_view(data["nodes"], data["cells"])
+    assert nodes.shape[1] == 2 and quads.shape == (data["cells"].shape[0], 4)
+    xy = nodes[quads]
+    x, y = xy[:, :, 0], xy[:, :, 1]
+    areas = 0.5 * np.sum(x * np.roll(y, -1, axis=1) - np.roll(x, -1, axis=1) * y, axis=1)
+    domain = coarse_run_3d["domain"]
+    assert np.all(areas > 0)
+    assert areas.sum() == pytest.approx(domain.length * domain.height)
+
+
+def test_pipeline_rejects_a_mismatched_domain_and_spec(tmp_path):
+    with pytest.raises(TypeError):
+        run(domain=BeamDomain3D(), spec=MeshSpec(), out_dir=tmp_path, echo=False)
+
+
+def test_cli_runs_the_3d_pipeline(tmp_path, capsys):
+    out = tmp_path / "cli3d"
+    code = cli_main([
+        "run", "--dim", "3", "--length", "8", "--height", "4", "--width", "2",
+        "--nelx", "4", "--nely", "2", "--nelz", "2", "--no-optimize", "--out", str(out),
+    ])
+    assert code == 0
+    run_json = json.loads((out / "run.json").read_text())
+    assert run_json["params"]["dim"] == 3
+    assert run_json["params"]["mesh"]["nelz"] == 2
+    assert run_json["params"]["domain"]["width"] == 2.0
+    assert np.load(out / "mesh" / "mesh.npz")["cells"].shape == (4 * 2 * 2, 8)

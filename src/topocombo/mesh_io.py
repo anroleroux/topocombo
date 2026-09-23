@@ -91,7 +91,7 @@ class Mesh:
     """A finite-element mesh of one cell type, with named boundary node sets.
 
     ``nodes`` has one column per spatial dimension, so the same container serves
-    the 2D quad mesh and, later, a 3D hex mesh; element routines dispatch on
+    the 2D quad mesh and the 3D hex mesh; element routines dispatch on
     ``cell_type``.
     """
 
@@ -327,6 +327,7 @@ def save_mesh(
     mesh: Mesh,
     out_dir: Path,
     load_node: int | None = None,
+    load_nodes: np.ndarray | None = None,
 ) -> dict[str, Path]:
     """Write the solver-facing ``mesh.npz`` and the visualisation-facing ``mesh.vtu``."""
     out_dir = Path(out_dir)
@@ -341,6 +342,8 @@ def save_mesh(
         arrays[f"set_{name}"] = idx
     if load_node is not None:
         arrays["load_node"] = np.asarray([load_node], dtype=int)
+    if load_nodes is not None:  # a load spread over several nodes (3D load line)
+        arrays["load_nodes"] = np.asarray(load_nodes, dtype=int)
 
     npz = out_dir / "mesh.npz"
     np.savez_compressed(npz, **arrays)

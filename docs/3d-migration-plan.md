@@ -101,15 +101,26 @@ Each step is one PR with its own tests.
   previous iteration's displacement; log per-iteration solve time.
 - Optional: exploit the z mid-plane symmetry.
 
-### 6. Optimizer in 3D
+### 6. Optimizer in 3D — done
 - Mostly parameters after step 0. With `nelz = 1` the filter neighbourhood stays
   in-plane, so behaviour should track the 2D run closely.
 - Tests: volume constraint every iteration, beats a uniform design, symmetric
   about mid-height (and mid-width once `nelz > 1`).
+- Implemented: no optimizer code changed. With nu = 0 and `nelz = 1` the 3D
+  loop reproduces the 2D loop iteration by iteration (compliance to 1e-8,
+  densities to 1e-6); a `nelz = 2` run is symmetric about mid-height and
+  mid-width.
 
-### 7. Pipeline + CLI
+### 7. Pipeline + CLI — done
 - `--dim {2,3}`, `--width`, `--nelz` (default 1); record dim / element type in
   `run.json`.
+- Implemented: `pipeline.run` takes a `BeamDomain3D` + `MeshSpec3D`, meshes with
+  `generate_hex_mesh`, applies the tip load along the load line
+  (`load_nodes` in `run.json` and `mesh.npz`), and uses the width as the section
+  depth for the beam-theory check. Default 3D run: 60 iterations to
+  899.98 N·mm in ~15 s (2D: 903.54 N·mm), the same truss.
+- The report renders a 3D run as its side view (each hex's z-normal face) and
+  its prose follows the run's dimension; step 9 replaces this with projections.
 
 ### 8. Result artifacts
 - `density.vtu` with hex cells.

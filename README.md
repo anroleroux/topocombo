@@ -56,7 +56,16 @@ python -m topocombo.cli report --run results/cantilever --site site
 
 # or both at once
 python -m topocombo.cli all
+
+# the same cantilever as a 3D solid: hexahedra, one element through the width
+python -m topocombo.cli all --dim 3 --width 1 --nelz 1 --out results/cantilever3d
 ```
+
+With `--dim 3` the beam is a CadQuery box meshed into hexahedra, solved with
+the H8 solid element, and loaded along a line across the width at mid-height of
+the free end. The default 60 x 20 x 1 mesh (1200 hexes, 7686 DOFs) converges in
+60 iterations to 899.98 N·mm in about 15 s, the same truss as the 2D run; it is
+0.4% stiffer than plane stress because the width is not free to contract.
 
 `gmsh`'s shared library links against GLU, so on a bare Linux box install it first:
 `sudo apt-get install libglu1-mesa libxrender1 libxcursor1 libxft2 libxinerama1`.
@@ -146,6 +155,8 @@ width by default to keep CI light), alongside the 2D path; the step-by-step
 plan is in [`docs/3d-migration-plan.md`](docs/3d-migration-plan.md). Done so
 far: dimension-agnostic mesh and DOF handling (step 0), the `BeamDomain3D` box
 (step 1), structured hex meshing with `generate_hex_mesh` (step 2), reading and
-checking hex meshes (step 3) and the H8 solid element (step 4), which matches
+checking hex meshes (step 3), the H8 solid element (step 4), which matches
 the plane-stress solver to round-off with one element through the width and
-nu = 0. The pipeline and CLI still run in 2D until they are wired up (step 7).
+nu = 0, the SIMP loop on hexahedra (step 6) and `--dim 3` in the pipeline and
+CLI (step 7). The report draws a 3D run as its side view for now; projected
+views, an STL of the topology and switching CI to 3D come next.

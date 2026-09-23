@@ -109,14 +109,41 @@ def _fmt(value: Any) -> str:
     return str(value)
 
 
+#: The six faces of a hexahedron, as corner indices (Gmsh / VTK order).
+_HEX_FACES = np.array(
+    [[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
+)
+
+
+def _side_view(nodes: np.ndarray, cells: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(x-y node coordinates, quads) to draw: the mesh itself in 2D.
+
+    A hex mesh is drawn as its side view: each hexahedron by its face at the
+    lowest z, with the corners put counter-clockwise in x-y.  Gmsh's corner
+    numbering says nothing about which face that is, so it is found from the
+    coordinates.  With one element through the width this is exactly the 3D
+    field; projected views for deeper meshes come later.
+    """
+    if cells.shape[1] != 8:
+        return nodes, cells
+    faces = cells[:, _HEX_FACES]  # (m, 6, 4)
+    z = nodes[faces, 2]
+    # the face normal to z has no z extent; among the two, take the lower one
+    score = np.round(np.ptp(z, axis=2), 9) * 1e6 + z.mean(axis=2)
+    quads = faces[np.arange(cells.shape[0]), np.argmin(score, axis=1)]  # (m, 4)
+    xy = nodes[quads, :2]
+    angle = np.arctan2(*(xy - xy.mean(axis=1, keepdims=True)).transpose(2, 0, 1)[::-1])
+    quads = np.take_along_axis(quads, np.argsort(angle, axis=1), axis=1)
+    return nodes[:, :2], quads
+
+
 # --------------------------------------------------------------------------
 # mesh figure
 # --------------------------------------------------------------------------
 def mesh_svg(npz_path: Path, width: int = 900, pad: int = 46) -> str:
     """Inline SVG of the quad mesh with the supports and the tip load marked."""
     data = np.load(npz_path)
-    nodes = data["nodes"]
-    quads = data["cells"]
+    nodes, quads = _side_view(data["nodes"], data["cells"])
     fixed = data["set_fixed"] if "set_fixed" in data else np.empty(0, dtype=int)
     load_node = int(data["load_node"][0]) if "load_node" in data else None
 
@@ -133,7 +160,7 @@ def mesh_svg(npz_path: Path, width: int = 900, pad: int = 46) -> str:
 
     parts: list[str] = [
         f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" '
-        f'role="img" aria-label="Quadrilateral mesh of the cantilever beam design domain">',
+        f'role="img" aria-label="Mesh of the cantilever beam design domain">',
         '<style>'
         '.el{fill:var(--accent-soft);stroke:var(--accent);stroke-width:0.6;stroke-opacity:0.55}'
         '.bd{fill:none;stroke:var(--text);stroke-width:1.6}'
@@ -198,7 +225,7 @@ def mesh_svg(npz_path: Path, width: int = 900, pad: int = 46) -> str:
     # dimension labels
     parts.append(
         f'<text class="lbl" x="{width / 2:.2f}" y="{height - 12:.2f}" text-anchor="middle">'
-        f'L = {span_x:g} mm, {int(quads.shape[0])} quads</text>'
+        f'L = {span_x:g} mm, {int(quads.shape[0])} elements</text>'
     )
     parts.append(
         f'<text class="lbl" x="{pad - 14:.2f}" y="{height / 2:.2f}" text-anchor="middle" '
@@ -223,9 +250,8 @@ def solution_svg(
     """
     mesh_data = np.load(mesh_npz)
     sol = np.load(solution_npz)
-    nodes = mesh_data["nodes"]
-    quads = mesh_data["cells"]
-    disp = sol["displacements"]
+    nodes, quads = _side_view(mesh_data["nodes"], mesh_data["cells"])
+    disp = sol["displacements"][:, :2]
     field = np.asarray(sol["element_compliance"], dtype=float)
 
     xmin, ymin = nodes.min(axis=0)
@@ -365,9 +391,10 @@ def density_svg(
     mesh_data = np.load(mesh_npz)
     densities = np.asarray(np.load(density_npz)["densities"], dtype=float)
     bins = np.clip((densities * n_steps).astype(int), 0, n_steps - 1)
+    nodes, quads = _side_view(mesh_data["nodes"], mesh_data["cells"])
     return _quad_field_svg(
-        nodes=mesh_data["nodes"],
-        quads=mesh_data["cells"],
+        nodes=nodes,
+        quads=quads,
         bins=bins,
         width=width,
         pad=pad,
@@ -621,7 +648,8 @@ def _stat_cards(summary: dict[str, Any], params: dict[str, Any]) -> str:
             (
                 "Elements",
                 summary.get("n_elements", "-"),
-                f"{mesh.get('nelx', '?')} x {mesh.get('nely', '?')} quads",
+                f"{mesh.get('nelx', '?')} x {mesh.get('nely', '?')}"
+                + (f" x {mesh['nelz']} hexahedra" if "nelz" in mesh else " quads"),
             ),
             (
                 "Nodes",
@@ -636,7 +664,9 @@ def _stat_cards(summary: dict[str, Any], params: dict[str, Any]) -> str:
             (
                 "Domain",
                 f"{domain.get('length', '?')} x {domain.get('height', '?')}",
-                f"{summary.get('area_sum', 0):g} mm\u00b2 meshed",
+                f"{summary['volume_sum']:g} mm\u00b3 meshed"
+                if "volume_sum" in summary
+                else f"{summary.get('area_sum', 0):g} mm\u00b2 meshed",
             ),
         ]
     )
@@ -707,6 +737,13 @@ def render_html(
     params = run.get("params", {})
     domain = params.get("domain", {})
     mesh = params.get("mesh", {})
+    three_d = params.get("dim") == 3
+    if three_d:
+        meshed_as = "structured hexahedra (one element through the width by default)"
+        solved_as = "a 3D solid problem"
+    else:
+        meshed_as = "structured quadrilaterals"
+        solved_as = "a plane-stress problem"
     env = run.get("environment", {})
     tools = env.get("tools", {})
 
@@ -720,6 +757,20 @@ def render_html(
             solve = step.get("data", {})
         elif step.get("name") == "optimize":
             optimization = step.get("data", {})
+
+    n_fixed = _e(summary.get("node_sets", {}).get("fixed", "?"))
+    if three_d:
+        mesh_caption = (
+            "Side view: every hexahedron is one design variable for the SIMP loop. The x = 0"
+            f" face is clamped (all {n_fixed} nodes, all three DOFs); the tip load acts"
+            " downwards along the mid-height line across the free end."
+        )
+    else:
+        mesh_caption = (
+            "Every quad is one design variable for the SIMP loop. The left edge is clamped"
+            f" (all {n_fixed} nodes, both DOFs); the tip load acts downwards at the"
+            " mid-height node of the free edge."
+        )
 
     chips = [f"run {run.get('started_at', '')}", f"{run.get('duration_s', 0):.2f} s total"]
     chips += [f"{name} {version}" for name, version in tools.items()]
@@ -771,7 +822,7 @@ def render_html(
                 "</figure>"
             )
         solve_section = (
-            "<h2>Plane-stress solve</h2>"
+            f"<h2>{'3D solid' if three_d else 'Plane-stress'} solve</h2>"
             "<p class='lede'>Full density (every element solid) — the starting point of the"
             " optimization, and the case where an analytical answer exists to check against.</p>"
             + _solve_cards(solve)
@@ -835,7 +886,7 @@ def render_html(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>topocombo — cantilever beam</title>
-<meta name="description" content="Procedure log of the topocombo cantilever beam run: CadQuery geometry, Gmsh quad mesh and plane-stress FEA solve.">
+<meta name="description" content="Procedure log of the topocombo cantilever beam run: CadQuery geometry, Gmsh mesh, FEA solve and SIMP optimization.">
 <style>{_CSS}</style>
 </head>
 <body>
@@ -845,7 +896,7 @@ def render_html(
   <p class="lede">
     The <a href="https://github.com/anroleroux/topocombo">topocombo</a> pipeline so far, run end
     to end: a parametric design domain defined in CadQuery, exported to BREP, meshed into
-    structured quadrilaterals with Gmsh, solved as a plane-stress problem with the custom solver,
+    {meshed_as} with Gmsh, solved as {solved_as} with the custom solver,
     and driven through a SIMP compliance-minimisation loop until the density field converges.
     Every number and figure below comes from the artifacts this run wrote to disk.
   </p>
@@ -859,9 +910,7 @@ def render_html(
 <figure>
 {svg}
 <figcaption>
-  Every quad is one design variable for the SIMP loop. The left edge is clamped
-  (all {_e(summary.get('node_sets', {}).get('fixed', '?'))} nodes, both DOFs); the tip load acts
-  downwards at the mid-height node of the free edge. Drawn directly from
+  {mesh_caption} Drawn directly from
   <code>mesh.npz</code> — the same file the solver reads.
 </figcaption>
 </figure>

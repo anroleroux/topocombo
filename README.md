@@ -143,5 +143,7 @@ for the solver once the loop is trusted. Blender rendering stays optional.
 
 The pipeline is moving to 3D (hexahedral elements, one element through the
 width by default to keep CI light), alongside the 2D path; the step-by-step
-plan is in [`docs/3d-migration-plan.md`](docs/3d-migration-plan.md). Step 0 —
-dimension-agnostic mesh and DOF handling — is done.
+plan is in [`docs/3d-migration-plan.md`](docs/3d-migration-plan.md). Done so
+far: dimension-agnostic mesh and DOF handling (step 0), the `BeamDomain3D` box
+(step 1) and structured hex meshing with `generate_hex_mesh` (step 2); the
+pipeline itself still runs in 2D until the hex solver lands.

@@ -43,7 +43,7 @@ of the new element.
 
 Each step is one PR with its own tests.
 
-### 0. Dimension-agnostic interfaces (no behaviour change)
+### 0. Dimension-agnostic interfaces (no behaviour change) — done
 - `QuadMesh` becomes `Mesh`: `nodes (n, dim)`, `cells (m, k)`, `cell_type`,
   `node_sets`, `cell_measures()` (area or volume).
 - DOF indexing in `fea.py` uses `dofs_per_node = dim` instead of a hard-coded 2;
@@ -52,14 +52,14 @@ Each step is one PR with its own tests.
 - `mesh.npz` stores `cells` and `cell_type` instead of `quads`.
 - All existing tests pass unchanged in substance.
 
-### 1. Geometry: `BeamDomain3D`
+### 1. Geometry: `BeamDomain3D` — done
 - `length`, `height`, `width`; `cq.Workplane("XY").box(...)` with the corner at
   the origin; BREP + STEP export.
 - The load becomes a line load along the free end at mid-height, spread over the
   width (a point load in 3D gives a stress singularity; with `nelz = 1` it is
   simply split over the two tip nodes).
 
-### 2. Meshing: structured hexes
+### 2. Meshing: structured hexes — done
 - `setTransfiniteCurve` on the 12 edges (classified x / y / z),
   `setTransfiniteSurface` + `setRecombine(2, ...)` on the 6 faces,
   `setTransfiniteVolume`, `generate(3)`.
@@ -67,6 +67,8 @@ Each step is one PR with its own tests.
   `load_edge` (face x = L).
 - `MeshSpec` gains `nelz`, **default 1**.
 - Tests: counts, uniform grid, every face classified.
+- Implemented as `MeshSpec3D` / `generate_hex_mesh`; `load_edge` tags the whole
+  x = L face, and the load line (y = H/2) is picked from its nodes in step 4.
 
 ### 3. `mesh_io`: read and check hexes
 - Read `hexahedron` blocks; boundary node sets from `quad` surface blocks.

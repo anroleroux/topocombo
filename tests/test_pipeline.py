@@ -436,3 +436,104 @@ def test_pipeline_writes_the_design(coarse_run):
     run_json = json.loads((coarse_run["dir"] / "run.json").read_text())
     names = [s["name"] for s in run_json["steps"]]
     assert names[-2:] == ["optimize", "design_export"]
+
+
+# --------------------------------------------------------------------------
+# 3D design domain and hexahedral mesh
+# --------------------------------------------------------------------------
+import meshio  # noqa: E402
+
+from topocombo.geometry import BeamDomain3D, export_domain  # noqa: E402
+from topocombo.meshing import PHYS_DOMAIN, MeshSpec3D, generate_hex_mesh  # noqa: E402
+
+
+def test_domain_3d_geometry():
+    domain = BeamDomain3D(length=60.0, height=20.0, width=2.0)
+    assert domain.volume == pytest.approx(2400.0)
+    assert domain.load_point == (60.0, 10.0, 1.0)
+    assert domain.load_line == ((60.0, 10.0, 0.0), (60.0, 10.0, 2.0))
+    solid = domain.solid()
+    assert solid.Volume() == pytest.approx(domain.volume)
+    bb = solid.BoundingBox()
+    assert (bb.xmin, bb.ymin, bb.zmin) == pytest.approx((0.0, 0.0, 0.0))
+    assert (bb.xmax, bb.ymax, bb.zmax) == pytest.approx((60.0, 20.0, 2.0))
+
+
+@pytest.mark.parametrize("bad", [{"length": 0.0}, {"height": -1.0}, {"width": 0.0}])
+def test_domain_3d_rejects_non_positive_dimensions(bad):
+    with pytest.raises(ValueError):
+        BeamDomain3D(**bad)
+
+
+def test_mesh_spec_3d_defaults_to_one_element_through_the_width():
+    spec = MeshSpec3D()
+    assert (spec.nelx, spec.nely, spec.nelz) == (60, 20, 1)
+    assert spec.n_elements == 1200
+    assert spec.n_nodes == 61 * 21 * 2
+    with pytest.raises(ValueError):
+        MeshSpec3D(nelz=0)
+
+
+@pytest.fixture(scope="module", params=[1, 2], ids=["nelz1", "nelz2"])
+def hex_run(request, tmp_path_factory):
+    out = tmp_path_factory.mktemp(f"hex{request.param}")
+    domain = BeamDomain3D(length=12.0, height=4.0, width=2.0)
+    spec = MeshSpec3D(nelx=6, nely=2, nelz=request.param)
+    cad = export_domain(domain, out / "cad")
+    msh_path, gmsh_log = generate_hex_mesh(domain, spec, cad["brep"], out / "mesh")
+    return {
+        "domain": domain,
+        "spec": spec,
+        "cad": cad,
+        "msh": meshio.read(str(msh_path)),
+        "gmsh_log": gmsh_log,
+    }
+
+
+def _group_cells(msh: meshio.Mesh, name: str, cell_type: str) -> np.ndarray:
+    tag = int(msh.field_data[name][0])
+    rows = [
+        block.data[np.asarray(phys) == tag]
+        for block, phys in zip(msh.cells, msh.cell_data["gmsh:physical"])
+        if block.type == cell_type
+    ]
+    return np.vstack(rows) if rows else np.empty((0, 0), dtype=int)
+
+
+def test_cad_3d_artifacts_written(hex_run):
+    for path in hex_run["cad"].values():
+        assert path.exists() and path.stat().st_size > 0
+    assert hex_run["gmsh_log"]
+
+
+def test_hex_mesh_counts_match_spec(hex_run):
+    msh, spec = hex_run["msh"], hex_run["spec"]
+    hexes = _group_cells(msh, PHYS_DOMAIN, "hexahedron")
+    assert hexes.shape == (spec.n_elements, 8)
+    assert np.unique(hexes).size == spec.n_nodes  # every node belongs to a hex
+    assert {b.type for b in msh.cells} <= {"hexahedron", "quad"}  # no tets or prisms
+
+
+def test_hex_mesh_is_a_uniform_structured_grid(hex_run):
+    msh, domain, spec = hex_run["msh"], hex_run["domain"], hex_run["spec"]
+    xyz = msh.points[_group_cells(msh, PHYS_DOMAIN, "hexahedron")]  # (m, 8, 3)
+    size = xyz.max(axis=1) - xyz.min(axis=1)
+    cell = np.array([domain.length / spec.nelx, domain.height / spec.nely, domain.width / spec.nelz])
+    assert np.allclose(size, cell)  # axis-aligned bricks of one size
+    assert np.prod(size, axis=1).sum() == pytest.approx(domain.volume)
+    # each brick has exactly its 8 corners: 2 distinct values per axis
+    for axis in range(3):
+        assert all(np.unique(np.round(c, 9)).size == 2 for c in xyz[:, :, axis])
+
+
+def test_hex_boundary_faces(hex_run):
+    msh, domain, spec = hex_run["msh"], hex_run["domain"], hex_run["spec"]
+    face_nodes = (spec.nely + 1) * (spec.nelz + 1)
+    fixed = np.unique(_group_cells(msh, PHYS_FIXED, "quad"))
+    loaded = np.unique(_group_cells(msh, PHYS_LOAD, "quad"))
+    assert fixed.size == loaded.size == face_nodes
+    assert np.allclose(msh.points[fixed, 0], 0.0)
+    assert np.allclose(msh.points[loaded, 0], domain.length)
+    # the load line (mid-height, across the width) lies on the loaded face
+    on_line = np.isclose(msh.points[loaded, 1], domain.height / 2.0)
+    assert on_line.sum() == spec.nelz + 1

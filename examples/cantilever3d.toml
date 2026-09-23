@@ -1,0 +1,8 @@
+# CadQuery inputs for the published 3D cantilever run:
+#   python -m topocombo.cli all --cad-config examples/cantilever3d.toml
+# Only these keys are accepted; flags given on the command line override them.
+[cad]
+dim = 3        # 2: planar face (plane stress), 3: solid box
+length = 60.0  # mm, along x
+height = 20.0  # mm, along y
+width = 1.0    # mm, along z (3D only; 2D takes `thickness` instead)

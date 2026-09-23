@@ -58,8 +58,13 @@ def run(
     optimize_design: bool = True,
     snapshot_every: int = 10,
     echo: bool = True,
+    cad_config: Path | None = None,
 ) -> tuple[RunLog, dict[str, Any]]:
-    """Mesh the domain, solve it at full density, then run the SIMP loop."""
+    """Mesh the domain, solve it at full density, then run the SIMP loop.
+
+    ``cad_config`` is only recorded: the file the domain's parameters were read
+    from, if any (see :func:`topocombo.geometry.load_cad_config`).
+    """
     three_d = isinstance(domain, BeamDomain3D)
     if three_d != isinstance(spec, MeshSpec3D):
         raise TypeError("a 3D domain needs a MeshSpec3D, a 2D domain a MeshSpec")
@@ -117,10 +122,23 @@ def run(
             face = domain.face()
             log.log(f"planar face area: {face.Area():.3f} mm^2 (expected {domain.area:.3f})")
             cad_record = {"face_area": face.Area()}
+        if cad_config is not None:
+            log.log(f"CAD parameters read from {cad_config}")
         exported = export_domain(domain, out_dir / "cad")
+        log.log("built by running the generated CadQuery script (shown in the report)")
+        descriptions = {
+            "script": "design domain, the CadQuery script that built it (runs in CQ-editor)",
+            "brep": "design domain, BREP format",
+            "step": "design domain, STEP format",
+        }
         for kind, path in exported.items():
-            log.artifact(path, f"design domain, {kind.upper()} format")
-        log.record(**cad_record, **domain.as_dict())
+            log.artifact(path, descriptions[kind])
+        log.record(
+            **cad_record,
+            **domain.as_dict(),
+            cad_script=domain.cadquery_script(),
+            cad_config=None if cad_config is None else str(cad_config),
+        )
 
     cells_word = "hexahedra" if three_d else "quadrilaterals"
     with log.step("meshing", f"2. Mesh with Gmsh (structured {cells_word})"):

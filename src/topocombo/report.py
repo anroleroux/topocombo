@@ -4,6 +4,8 @@ This is a downstream consumer of the artifacts written by
 :mod:`topocombo.pipeline` — it reads ``run.json`` and ``mesh.npz`` from disk and
 never imports the solver or the mesher.  The mesh figure is emitted as inline
 SVG so the published page needs no JavaScript, no CDN and no plotting library.
+The CAD pictures — the exported design domain and the optimized topology — are
+PNGs rendered next to the page by :mod:`topocombo.cadview`.
 """
 
 from __future__ import annotations
@@ -67,7 +69,19 @@ td.num, th.num { text-align: right; font-family: var(--mono); }
 .card .s { color: var(--muted); font-size: 0.8rem; }
 figure { margin: 0; background: var(--panel); border: 1px solid var(--border);
          border-radius: 10px; padding: 16px; }
-figure svg { width: 100%; height: auto; display: block; }
+figure svg, figure img { width: 100%; height: auto; display: block; }
+figure + figure { margin-top: 16px; }
+.cad { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 16px;
+       align-items: start; margin-bottom: 16px; }
+.cad table { margin: 0; }
+.cad td { overflow-wrap: anywhere; }
+pre code { padding: 0; background: none; font-size: inherit; }
+.script { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-bottom: 16px; }
+.script > .head { display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+                  background: var(--panel); border-bottom: 1px solid var(--border);
+                  font-size: 0.85rem; color: var(--muted); }
+.script > .head a { margin-left: auto; }
+@media (max-width: 760px) { .cad { grid-template-columns: minmax(0, 1fr); } }
 figcaption { color: var(--muted); font-size: 0.85rem; margin-top: 10px; }
 .step { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 14px; overflow: hidden; }
 .step > .head { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
@@ -804,6 +818,60 @@ def _artifacts_html(run: dict[str, Any], copied: dict[str, str]) -> str:
     )
 
 
+def _cad_section(
+    geometry: dict[str, Any], params: dict[str, Any], copied: dict[str, str],
+    cad_image: str | None,
+) -> str:
+    """The CadQuery input (parameters and the script that ran) and its output."""
+    script = geometry.get("cad_script")
+    if not script and cad_image is None:
+        return ""
+    domain = params.get("domain", {})
+    three_d = params.get("dim") == 3
+    rows: list[tuple[str, Any]] = [
+        ("dimension", "3D solid box" if three_d else "2D planar face"),
+        ("length L, along x (mm)", domain.get("length")),
+        ("height H, along y (mm)", domain.get("height")),
+    ]
+    if three_d:
+        rows.append(("width W, along z (mm)", domain.get("width")))
+        rows.append(("volume (mm\u00b3)", geometry.get("solid_volume", domain.get("volume"))))
+    else:
+        rows.append(("thickness, solver only (mm)", domain.get("thickness")))
+        rows.append(("area (mm\u00b2)", geometry.get("face_area", domain.get("area"))))
+    rows.append(("parameters from", geometry.get("cad_config") or "command-line flags / defaults"))
+
+    image = ""
+    if cad_image is not None:
+        shape = "box" if three_d else "planar face"
+        image = (
+            f"<figure><img src='{_e(cad_image)}' alt='Shaded view of the CadQuery design"
+            f" domain: a {_e(domain.get('length'))} by {_e(domain.get('height'))} mm {shape}'>"
+            "<figcaption>The CadQuery output, read back from <code>design_domain.brep</code> and"
+            " rendered by <code>topocombo.cadview</code> — the exact shape Gmsh meshed.</figcaption>"
+            "</figure>"
+        )
+    table = f"<div>{_kv_table(rows)}</div>"
+    code = ""
+    if script:
+        link = copied.get("design_domain.py")
+        code = (
+            "<div class='script'><div class='head'>"
+            "<span><code>design_domain.py</code> — the CadQuery input, exactly as it ran</span>"
+            + (f"<a href='{_e(link)}' download>download</a>" if link else "")
+            + f"</div><pre><code>{_e(script)}</code></pre></div>"
+        )
+    return (
+        "<h2>Geometry (CadQuery)</h2>"
+        "<p class='lede'>The design domain is built by running a generated CadQuery script, so"
+        " the input to CAD is explicit and reproducible: the parameters on the left are written"
+        " into the script below, which also opens as-is in CQ-editor. Set them with flags or a"
+        " <code>--cad-config</code> JSON / TOML file.</p>"
+        f"<div class='cad'>{table}{image}</div>"
+        + code
+    )
+
+
 def render_html(
     run: dict[str, Any],
     svg: str,
@@ -811,6 +879,8 @@ def render_html(
     solve_figure: tuple[str, list[float]] | None = None,
     density_figure: str | None = None,
     history: list[dict[str, float]] | None = None,
+    cad_image: str | None = None,
+    topology_image: str | None = None,
 ) -> str:
     params = run.get("params", {})
     domain = params.get("domain", {})
@@ -828,8 +898,11 @@ def render_html(
     summary: dict[str, Any] = {}
     solve: dict[str, Any] = {}
     optimization: dict[str, Any] = {}
+    geometry: dict[str, Any] = {}
     for step in run.get("steps", []):
-        if step.get("name") == "validation":
+        if step.get("name") == "geometry":
+            geometry = step.get("data", {})
+        elif step.get("name") == "validation":
             summary = step.get("data", {})
         elif step.get("name") == "solve":
             solve = step.get("data", {})
@@ -945,6 +1018,16 @@ def render_html(
                 "</figcaption>"
                 "</figure>"
             )
+        topology_fig = ""
+        if topology_image is not None:
+            topology_fig = (
+                f"<figure><img src='{_e(topology_image)}' alt='Shaded 3D view of the optimized"
+                " topology'>"
+                "<figcaption>The optimized design as a solid: every element at density"
+                " \u2265 0.5, read back from <code>topology.stl</code> — the file to take into"
+                " Blender or CAD. It is blocky by construction; each step is one element."
+                "</figcaption></figure>"
+            )
         optimization_section = (
             "<h2>Topology optimization</h2>"
             "<p class='lede'>SIMP compliance minimisation under a volume constraint:"
@@ -953,6 +1036,7 @@ def render_html(
             f" {_e(simp.get('move_limit', ''))} move limit.</p>"
             + _optimization_cards(optimization, solve)
             + density_fig
+            + topology_fig
             + charts
         )
 
@@ -983,6 +1067,8 @@ def render_html(
 
 <h2>Result</h2>
 {_stat_cards(summary, params)}
+
+{_cad_section(geometry, params, copied, cad_image)}
 
 <h2>Mesh</h2>
 <figure>
@@ -1064,8 +1150,22 @@ def build_site(run_dir: Path, site_dir: Path) -> Path:
     history_csv = run_dir / "optimization" / "log.csv"
     history = read_history(history_csv) if history_csv.exists() else None
 
+    from .cadview import render_brep, render_stl
+
+    cad_image = topology_image = None
+    brep = run_dir / "cad" / "design_domain.brep"
+    if brep.exists():
+        render_brep(brep, site_dir / "figures" / "cad_domain.png")
+        cad_image = "figures/cad_domain.png"
+    stl = run_dir / "optimization" / "topology.stl"
+    if stl.exists():
+        render_stl(stl, site_dir / "figures" / "topology.png")
+        topology_image = "figures/topology.png"
+
     index = site_dir / "index.html"
     index.write_text(
-        render_html(run, svg, copied, solve_figure, density_figure, history)
+        render_html(
+            run, svg, copied, solve_figure, density_figure, history, cad_image, topology_image
+        )
     )
     return index

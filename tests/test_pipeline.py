@@ -47,6 +47,7 @@ def test_cad_artifacts_written(coarse_run):
     cad = coarse_run["dir"] / "cad"
     assert (cad / "design_domain.brep").exists()
     assert (cad / "design_domain.step").exists()
+    assert (cad / "design_domain.py").read_text() == coarse_run["domain"].cadquery_script()
 
 
 def test_mesh_counts_match_spec(coarse_run):
@@ -1077,3 +1078,106 @@ def test_density_figure_adds_top_and_end_views_only_for_deep_meshes(tmp_path):
         np.savez(tmp_path / f"rho{nz}.npz", densities=np.linspace(0, 1, mesh.n_elements))
         svg = density_svg(tmp_path / f"mesh{nz}.npz", tmp_path / f"rho{nz}.npz")
         assert svg.count("<svg") == expected
+
+
+# --------------------------------------------------------------------------
+# CadQuery input control and CAD pictures in the report
+# --------------------------------------------------------------------------
+import html as html_lib  # noqa: E402
+
+from topocombo.cadview import _weld, feature_edges, render_triangles, shape_triangles  # noqa: E402
+from topocombo.geometry import load_cad_config, run_cadquery_script  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "domain", [BeamDomain(length=7.0, height=3.0), BeamDomain3D(length=7.0, height=3.0, width=2.0)]
+)
+def test_the_exported_script_rebuilds_the_domain(domain, tmp_path):
+    """The script is the CadQuery input: running it on its own gives the same shape."""
+    script = domain.cadquery_script()
+    assert "length = 7.0" in script and "height = 3.0" in script
+    shape = run_cadquery_script(script).val()
+    bb = shape.BoundingBox()
+    assert (bb.xmin, bb.ymin, bb.zmin) == pytest.approx((0.0, 0.0, 0.0))
+    assert (bb.xmax, bb.ymax) == pytest.approx((7.0, 3.0))
+    if isinstance(domain, BeamDomain3D):
+        assert bb.zmax == pytest.approx(2.0)
+        assert shape.Volume() == pytest.approx(domain.volume)
+    else:
+        assert shape.Area() == pytest.approx(domain.area)
+
+
+def test_a_script_without_a_result_is_rejected():
+    with pytest.raises(ValueError, match="result"):
+        run_cadquery_script("import cadquery as cq\nbox = cq.Workplane().box(1, 1, 1)\n")
+
+
+def test_cad_config_reads_json_and_toml(tmp_path):
+    (tmp_path / "a.json").write_text('{"cad": {"dim": 3, "length": 30, "width": 2.5}}')
+    (tmp_path / "b.toml").write_text("dim = 2\nheight = 8\nthickness = 0.5\n")
+    assert load_cad_config(tmp_path / "a.json") == {"dim": 3, "length": 30.0, "width": 2.5}
+    assert load_cad_config(tmp_path / "b.toml") == {"dim": 2, "height": 8.0, "thickness": 0.5}
+
+
+@pytest.mark.parametrize(
+    "text, message",
+    [
+        ('{"lenght": 30}', "unknown CAD parameter"),
+        ('{"length": -1}', "positive"),
+        ('{"height": "20"}', "number"),
+        ('{"dim": 4}', "dim"),
+        ("[1, 2]", "table"),
+    ],
+)
+def test_cad_config_rejects_bad_input(tmp_path, text, message):
+    path = tmp_path / "cad.json"
+    path.write_text(text)
+    with pytest.raises(ValueError, match=message):
+        load_cad_config(path)
+
+
+def test_cli_flags_override_the_cad_config(tmp_path, capsys):
+    config = tmp_path / "cad.toml"
+    config.write_text("[cad]\ndim = 3\nlength = 9\nheight = 3\nwidth = 2\n")
+    out = tmp_path / "cad"
+    assert cli_main(["cad", "--cad-config", str(config), "--width", "4", "--out", str(out)]) == 0
+    script = (out / "design_domain.py").read_text()
+    assert "length = 9.0" in script and "width = 4.0" in script
+    assert (out / "design_domain.png").read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    assert "cq.Workplane" in capsys.readouterr().out
+
+
+def test_cli_rejects_a_bad_cad_config(tmp_path):
+    config = tmp_path / "cad.json"
+    config.write_text('{"lenght": 9}')
+    with pytest.raises(SystemExit):
+        cli_main(["cad", "--cad-config", str(config), "--out", str(tmp_path / "cad")])
+
+
+def test_a_box_has_twelve_feature_edges():
+    points, triangles = shape_triangles(BeamDomain3D(length=3.0, height=2.0, width=1.0).solid())
+    points, triangles = _weld(points, triangles)
+    edges, sides = feature_edges(points, triangles)
+    assert edges.shape == (12, 2)
+    assert np.all(sides >= 0)  # a closed solid: every edge has two faces
+
+
+def test_render_writes_a_png(tmp_path):
+    points, triangles = shape_triangles(BeamDomain(length=3.0, height=2.0).face())
+    png = render_triangles(points, triangles, tmp_path / "face.png", two_sided=True)
+    assert png.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+@pytest.mark.parametrize("which", ["coarse_run", "coarse_run_3d"])
+def test_report_prints_the_cadquery_input_and_shows_the_cad_output(which, request, tmp_path):
+    run_info = request.getfixturevalue(which)
+    site = tmp_path / "site"
+    html = build_site(run_dir=run_info["dir"], site_dir=site).read_text()
+    assert "Geometry (CadQuery)" in html
+    script = html_lib.escape(run_info["domain"].cadquery_script())
+    assert script in html
+    assert "figures/cad_domain.png" in html and "figures/topology.png" in html
+    assert (site / "figures" / "cad_domain.png").stat().st_size > 0
+    assert (site / "figures" / "topology.png").stat().st_size > 0
+    assert (site / "artifacts" / "design_domain.py").exists()
+

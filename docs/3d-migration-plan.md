@@ -53,8 +53,8 @@ Each step is one PR with its own tests.
 - All existing tests pass unchanged in substance.
 
 ### 1. Geometry: `BeamDomain3D` — done
-- `length`, `height`, `width`; `cq.Workplane("XY").box(...)` with the corner at
-  the origin; BREP + STEP export.
+- `length`, `height`, `width`; `cq.Solid.makeBox(...)` with the corner at the
+  origin; BREP + STEP export through the same `export_domain`.
 - The load becomes a line load along the free end at mid-height, spread over the
   width (a point load in 3D gives a stress singularity; with `nelz = 1` it is
   simply split over the two tip nodes).
@@ -65,9 +65,9 @@ Each step is one PR with its own tests.
   `setTransfiniteVolume`, `generate(3)`.
 - Physical groups: `design_domain` (dim 3), `fixed` (face x = 0),
   `load_edge` (face x = L).
-- `MeshSpec` gains `nelz`, **default 1**.
+- A separate `MeshSpec3D` (`nelx`, `nely`, `nelz`), with `nelz` **default 1**.
 - Tests: counts, uniform grid, every face classified.
-- Implemented as `MeshSpec3D` / `generate_hex_mesh`; `load_edge` tags the whole
+- Implemented as `generate_hex_mesh`; `load_edge` tags the whole
   x = L face, and the load line (y = H/2) is picked from its nodes in step 4.
 
 ### 3. `mesh_io`: read and check hexes

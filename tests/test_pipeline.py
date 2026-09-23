@@ -1280,3 +1280,99 @@ def test_report_shows_the_cutout(holed_run_3d, tmp_path):
     html = build_site(run_dir=holed_run_3d["dir"], site_dir=tmp_path / "site").read_text()
     assert 'class="hole"' in html and "held void" in html
     assert "(8, 4, ⌀4)" in html
+
+
+# --------------------------------------------------------------------------
+# body-fitted meshing: the CAD profile, cutouts included
+# --------------------------------------------------------------------------
+from topocombo.mesh_io import check_mesh  # noqa: E402
+
+
+@pytest.fixture(scope="module", params=[2, 3], ids=["2d", "3d"])
+def fitted_run(request, tmp_path_factory):
+    out = tmp_path_factory.mktemp(f"fitted{request.param}d")
+    holes = [(8.0, 4.0, 4.0)]
+    if request.param == 3:
+        domain = BeamDomain3D(length=24.0, height=8.0, width=1.0, holes=holes)
+        spec = MeshSpec3D(nelx=24, nely=8, nelz=2, mode="body-fitted")
+    else:
+        domain = BeamDomain(length=24.0, height=8.0, holes=holes)
+        spec = MeshSpec(nelx=24, nely=8, mode="body-fitted")
+    _, summary = run(domain=domain, spec=spec, out_dir=out,
+                     simp=SimpParams(max_iterations=6), echo=False)
+    return {"dir": out, "domain": domain, "spec": spec, "summary": summary}
+
+
+def test_mesh_spec_rejects_an_unknown_mode_and_a_bad_size():
+    with pytest.raises(ValueError, match="mode"):
+        MeshSpec(mode="tetra")
+    with pytest.raises(ValueError, match="size"):
+        MeshSpec3D(mode="body-fitted", size=0.0)
+    assert MeshSpec(mode="body-fitted").n_elements is None
+    assert MeshSpec(nelx=30, nely=10, mode="body-fitted").element_size(BeamDomain()) == 2.0
+
+
+def test_fitted_mesh_follows_the_cad_boundary(fitted_run):
+    domain, summary = fitted_run["domain"], fitted_run["summary"]
+    assert summary["all_checks_passed"] and summary["mesh_mode"] == "body-fitted"
+    mesh = load_mesh(fitted_run["dir"] / "mesh" / "beam.msh")
+    cad = domain.material_volume if mesh.dim == 3 else domain.material_area
+    # straight chords over the arc: slightly more than the CAD, never less
+    assert cad < mesh.cell_measures().sum() < cad * (1 + 5e-3)
+    centroids = mesh.nodes[mesh.cells].mean(axis=1)
+    assert not domain.void_mask(centroids).any()  # nothing is meshed inside the hole
+    assert "passive" not in np.load(fitted_run["dir"] / "mesh" / "mesh.npz")
+    r = np.hypot(mesh.nodes[:, 0] - 8.0, mesh.nodes[:, 1] - 4.0)
+    assert r.min() == pytest.approx(2.0, abs=1e-6)  # nodes sit on the hole's edge
+
+
+def test_fitted_mesh_puts_the_load_on_real_nodes(fitted_run):
+    domain, summary = fitted_run["domain"], fitted_run["summary"]
+    mesh = load_mesh(fitted_run["dir"] / "mesh" / "beam.msh")
+    loaded = mesh.nodes[summary["load_nodes"]]
+    assert np.allclose(loaded[:, :2], domain.load_point[:2])
+    if mesh.dim == 3:
+        assert len(summary["load_nodes"]) == fitted_run["spec"].nelz + 1
+        assert mesh.cell_type == "hexahedron"
+    assert summary["solve"]["reaction_y"] == pytest.approx(1000.0, rel=1e-9)
+
+
+def test_fitted_run_optimizes_and_reports(fitted_run, tmp_path):
+    opt = fitted_run["summary"]["optimization"]
+    assert opt["iterations"] == 6
+    assert opt["volume_fraction"] == pytest.approx(0.5, abs=1e-6)
+    html = build_site(run_dir=fitted_run["dir"], site_dir=tmp_path / "site").read_text()
+    assert "body-fitted" in html and "real hole" in html
+
+
+def test_check_mesh_rejects_a_fitted_mesh_that_misses_the_cutout(coarse_run):
+    """The structured coarse mesh covers the hole, so as a body-fitted mesh of a
+    holed domain its area is too large."""
+    mesh = load_mesh(coarse_run["dir"] / "mesh" / "beam.msh")
+    holed = BeamDomain(length=12.0, height=4.0, holes=[(6.0, 2.0, 2.0)])
+    summary = check_mesh(mesh, holed, expected_elements=None)
+    assert not summary["checks"]["area_sum_matches_cad"]
+
+
+def test_filter_weighs_neighbours_by_size_only_on_non_uniform_meshes():
+    uniform = _brick_grid(3, 1, 1)
+    h, _ = build_filter(uniform, 1.5)
+    assert np.allclose(h.toarray(), h.toarray().T)
+    stretched = _brick_grid(3, 1, 1)
+    stretched.nodes[stretched.nodes[:, 0] == 3.0, 0] = 5.0  # last element twice as long
+    h, hs = build_filter(stretched, 1.5)
+    dense = h.toarray()
+    assert dense[1, 2] == pytest.approx(2 * dense[2, 1] * dense[1, 1] / dense[2, 2])
+
+
+def test_cli_runs_a_body_fitted_mesh(tmp_path):
+    out = tmp_path / "cli_fitted"
+    code = cli_main([
+        "run", "--dim", "3", "--length", "12", "--height", "4", "--hole", "4,2,2",
+        "--mesh", "body-fitted", "--mesh-size", "0.5", "--no-optimize", "--out", str(out),
+    ])
+    assert code == 0
+    run_json = json.loads((out / "run.json").read_text())
+    assert run_json["params"]["mesh"]["mode"] == "body-fitted"
+    assert run_json["params"]["mesh"]["size"] == 0.5
+    assert (out / "cad" / "design_profile.brep").exists()

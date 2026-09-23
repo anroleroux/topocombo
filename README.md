@@ -70,6 +70,10 @@ python -m topocombo.cli cad --cad-config examples/cantilever3d.toml --width 5 --
 # a 10 mm hole through z at x = 20, y = 10 (repeat --hole for more)
 python -m topocombo.cli all --dim 3 --hole 20,10,10 --out results/holed
 
+# the same part meshed body-fitted: the mesh follows the hole instead of holding
+# grid cells void (--mesh-size sets the element edge, default L/nelx)
+python -m topocombo.cli all --dim 3 --hole 20,10,10 --mesh body-fitted --out results/fitted
+
 # a shaded PNG of any exported BREP or STL, no OpenGL needed
 python -m topocombo.cadview results/cantilever3d/optimization/topology.stl
 
@@ -100,7 +104,34 @@ structured grid still covers the full L x H envelope (`design_envelope.brep`
 is what Gmsh meshes), and the elements whose centres fall inside a cutout are
 held at zero density by the optimizer: a passive, non-design region, the usual
 SIMP treatment. The volume fraction stays relative to the whole envelope, and
-the full-density solve already has the cutout void. The report prints the
+the full-density solve already has the cutout void.
+
+### Mesh modes
+
+`--mesh structured` (the default) is the transfinite grid above: uniform
+cells, one per design variable, over the L x H envelope. `--mesh body-fitted`
+meshes the real CAD profile instead, cutouts included. Gmsh splits the free
+edge at mid-height so the load lands on nodes, meshes the x-y face into
+unstructured quads (frontal-Delaunay triangles recombined to all-quad) at
+`--mesh-size` (default `min(L/nelx, H/nely)`), and in 3D extrudes them through
+the width into `--nelz` layers of hexahedra. The 3D profile is written to
+`cad/design_profile.brep`. Nothing is held void: the hole is simply not meshed.
+
+Validation changes with it. Instead of the grid count, the meshed area or
+volume must match the CAD shape (cutouts removed) to 0.5%; straight element
+edges on an arc give a chordal error of about 0.05% at 1 mm. No element may be
+stretched past an in-plane edge ratio of 4. The density filter weights
+neighbours by their size once the elements are unequal (on a uniform grid the
+factor is constant and skipped, so structured results are unchanged). The
+report draws the unstructured mesh and density field element by element; a 3D
+run gets the side view only, because the top and end projections need grid
+columns.
+
+The volume fraction is always relative to the meshed region. Structured, that
+is the envelope with the hole counted as void; body-fitted, it is the holed
+part. So at the same `--volfrac` the body-fitted design has 50% of 1121 mm³
+rather than 50% of 1200 mm³, and is a little more compliant (969 vs 909 N·mm
+for the published 3D case). The report prints the
 parameters and the script, and shows a shaded picture of the resulting CAD
 shape alongside one of the optimized topology.
 
@@ -196,7 +227,7 @@ on the CI runner.
 ```
 src/topocombo/
   geometry.py   parametric design domain as a generated CadQuery script; --cad-config loading
-  meshing.py    transfinite quad / hex meshing and physical groups (Gmsh)
+  meshing.py    structured (transfinite) or body-fitted (unstructured quad / extruded hex) meshing (Gmsh)
   mesh_io.py    .msh -> dimension-agnostic Mesh, quality checks, .npz/.vtu export
   fea.py        Q4 plane-stress / H8 solid solver: element stiffness, assembly, direct solve
   optimize.py   SIMP loop: neighbourhood filter, OC update, convergence, log.csv

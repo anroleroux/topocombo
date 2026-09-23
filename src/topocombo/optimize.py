@@ -91,7 +91,9 @@ def build_filter(mesh: Mesh, radius: float) -> tuple[sp.csr_matrix, np.ndarray]:
 
     Filtering couples neighbouring elements, which is what stops the
     checkerboard patterns that the element-wise density field would otherwise
-    converge to.
+    converge to.  On a mesh of unequal elements (body-fitted) each neighbour is
+    also weighted by its size, so a patch of small elements does not outvote a
+    large one; on a uniform grid that factor is constant and left out.
     """
     centroids = element_centroids(mesh)
     tree = cKDTree(centroids)
@@ -113,6 +115,9 @@ def build_filter(mesh: Mesh, radius: float) -> tuple[sp.csr_matrix, np.ndarray]:
         (np.concatenate(weights), (np.concatenate(rows), np.concatenate(cols))),
         shape=(mesh.n_elements, mesh.n_elements),
     ).tocsr()
+    measures = mesh.cell_measures()
+    if np.ptp(measures) > 1e-9 * measures.mean():
+        h = (h @ sp.diags(measures / measures.mean())).tocsr()
     hs = np.asarray(h.sum(axis=1)).ravel()
     return h, hs
 

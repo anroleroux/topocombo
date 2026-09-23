@@ -16,6 +16,14 @@ The 3D domain is meshed the same way into a structured hexahedral grid
 (:func:`generate_hex_mesh`); the groups keep their names but tag the volume and
 the clamped / loaded *faces* (x = 0 and x = L) instead of edges.  By default the
 grid is one element through the width, which keeps the CI run light.
+
+The *body-fitted* mode (:func:`generate_fitted_mesh`) meshes the real CAD
+profile, cutouts included: an unstructured all-quad mesh of the x-y face
+(frontal-Delaunay triangles recombined into quads), extruded through the width
+into hexahedra in 3D.  The right edge is split at mid-height first, so the tip
+load lands on real nodes.  The structured grid stays the default and the
+reference; the body-fitted one follows curved boundaries exactly (to within the
+chordal error of the element edges) at the cost of a non-uniform mesh.
 """
 
 from __future__ import annotations
@@ -36,30 +44,60 @@ PHYS_LOAD = "load_edge"
 
 _TOL = 1e-6
 
+#: ``structured``: a transfinite grid over the L x H envelope (cutouts held
+#: void by the optimizer); ``body-fitted``: an unstructured quad / extruded-hex
+#: mesh of the actual CAD profile, cutouts included.
+MESH_MODES = ("structured", "body-fitted")
+
+
+def _check_mode(mode: str, size: float | None) -> None:
+    if mode not in MESH_MODES:
+        raise ValueError(f"mesh mode must be one of {', '.join(MESH_MODES)}, not {mode!r}")
+    if size is not None and not size > 0:
+        raise ValueError(f"mesh size must be positive, not {size!r}")
+
 
 @dataclass(frozen=True)
 class MeshSpec:
-    """Discretisation of the design domain."""
+    """Discretisation of the design domain.
+
+    In body-fitted mode ``size`` is the target element edge length; left
+    unset, it is the structured grid's cell size, ``min(L / nelx, H / nely)``.
+    """
 
     nelx: int = 60
     nely: int = 20
+    mode: str = "structured"
+    size: float | None = None
 
     def __post_init__(self) -> None:
         if self.nelx < 1 or self.nely < 1:
             raise ValueError("nelx and nely must be >= 1")
+        _check_mode(self.mode, self.size)
 
     @property
-    def n_elements(self) -> int:
-        return self.nelx * self.nely
+    def structured(self) -> bool:
+        return self.mode == "structured"
 
     @property
-    def n_nodes(self) -> int:
-        return (self.nelx + 1) * (self.nely + 1)
+    def n_elements(self) -> int | None:
+        """Element count of the structured grid; None when body-fitted."""
+        return self.nelx * self.nely if self.structured else None
+
+    @property
+    def n_nodes(self) -> int | None:
+        return (self.nelx + 1) * (self.nely + 1) if self.structured else None
+
+    def element_size(self, domain: BeamDomain | BeamDomain3D) -> float:
+        """The target edge length of a body-fitted mesh."""
+        return self.size or min(domain.length / self.nelx, domain.height / self.nely)
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "mode": self.mode,
             "nelx": self.nelx,
             "nely": self.nely,
+            "size": self.size,
             "expected_elements": self.n_elements,
             "expected_nodes": self.n_nodes,
         }
@@ -72,24 +110,38 @@ class MeshSpec3D:
     nelx: int = 60
     nely: int = 20
     nelz: int = 1
+    mode: str = "structured"
+    size: float | None = None
 
     def __post_init__(self) -> None:
         if self.nelx < 1 or self.nely < 1 or self.nelz < 1:
             raise ValueError("nelx, nely and nelz must be >= 1")
+        _check_mode(self.mode, self.size)
 
     @property
-    def n_elements(self) -> int:
-        return self.nelx * self.nely * self.nelz
+    def structured(self) -> bool:
+        return self.mode == "structured"
 
     @property
-    def n_nodes(self) -> int:
-        return (self.nelx + 1) * (self.nely + 1) * (self.nelz + 1)
+    def n_elements(self) -> int | None:
+        """Element count of the structured grid; None when body-fitted."""
+        return self.nelx * self.nely * self.nelz if self.structured else None
+
+    @property
+    def n_nodes(self) -> int | None:
+        return (self.nelx + 1) * (self.nely + 1) * (self.nelz + 1) if self.structured else None
+
+    def element_size(self, domain: BeamDomain | BeamDomain3D) -> float:
+        """The target in-plane edge length of a body-fitted mesh (``nelz`` layers in z)."""
+        return self.size or min(domain.length / self.nelx, domain.height / self.nely)
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "mode": self.mode,
             "nelx": self.nelx,
             "nely": self.nely,
             "nelz": self.nelz,
+            "size": self.size,
             "expected_elements": self.n_elements,
             "expected_nodes": self.n_nodes,
         }
@@ -279,6 +331,92 @@ def generate_hex_mesh(
         gmsh.model.addPhysicalGroup(2, faces["xmax"], name=PHYS_LOAD)
 
         gmsh.model.mesh.generate(3)
+        gmsh.model.mesh.setOrder(1)
+        _write_msh(msh_path)
+
+    return msh_path, gmsh_log
+
+
+def _curves_at_x(x: float) -> list[int]:
+    """Curves lying in the plane x = const (the clamped or the loaded edge)."""
+    tags = []
+    for _, tag in gmsh.model.getEntities(1):
+        xmin, _, _, xmax, _, _ = gmsh.model.getBoundingBox(1, tag)
+        if abs(xmin - x) < _TOL and abs(xmax - x) < _TOL:
+            tags.append(tag)
+    return tags
+
+
+def _surfaces_at_x(x: float) -> list[int]:
+    tags = []
+    for _, tag in gmsh.model.getEntities(2):
+        xmin, _, _, xmax, _, _ = gmsh.model.getBoundingBox(2, tag)
+        if abs(xmin - x) < _TOL and abs(xmax - x) < _TOL:
+            tags.append(tag)
+    return tags
+
+
+def generate_fitted_mesh(
+    domain: BeamDomain | BeamDomain3D,
+    spec: MeshSpec | MeshSpec3D,
+    brep_path: Path,
+    out_dir: Path,
+    log: Any = None,
+) -> tuple[Path, list[str]]:
+    """Mesh the CAD profile in ``brep_path`` (a planar x-y face, cutouts and all)
+    into unstructured quads — or, for a 3D domain, extrude those quads through
+    the width into ``spec.nelz`` layers of hexahedra.  Returns (msh path, gmsh log).
+    """
+    three_d = isinstance(domain, BeamDomain3D)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    msh_path = out_dir / "beam.msh"
+    size = spec.element_size(domain)
+
+    with _gmsh_session("cantilever_beam_fitted", log) as gmsh_log:
+        surf_tag = _import_single(brep_path, 2)
+        # split the free edge at mid-height so the tip load has a node to act on
+        tip = gmsh.model.occ.addPoint(domain.length, domain.height / 2.0, 0.0)
+        gmsh.model.occ.fragment([(2, surf_tag)], [(0, tip)])
+        gmsh.model.occ.synchronize()
+        surf_tag = gmsh.model.getEntities(2)[0][1]
+        n_curves = len(gmsh.model.getEntities(1))
+        fixed, loaded = _curves_at_x(0.0), _curves_at_x(domain.length)
+        if not fixed or not loaded:  # pragma: no cover - defensive
+            raise RuntimeError("the profile has no edge at x = 0 or x = L")
+        if log is not None:
+            log.log(
+                f"imported {brep_path.name}: 1 surface, {n_curves} curves "
+                f"({n_curves - len(fixed) - len(loaded) - 2} on cutouts), free edge split at "
+                f"y = {domain.height / 2:g}"
+            )
+            log.log(
+                f"unstructured quads: target size {size:g} mm, frontal-Delaunay "
+                "triangles recombined to all-quad"
+                + (f", extruded into {spec.nelz} hex layer(s) through the width" if three_d else "")
+            )
+
+        gmsh.option.setNumber("Mesh.MeshSizeMin", size)
+        gmsh.option.setNumber("Mesh.MeshSizeMax", size)
+        gmsh.option.setNumber("Mesh.Algorithm", 8)  # frontal-Delaunay for quads
+        gmsh.option.setNumber("Mesh.RecombinationAlgorithm", 2)  # full-quad
+        gmsh.model.mesh.setRecombine(2, surf_tag)
+
+        if three_d:
+            extruded = gmsh.model.occ.extrude(
+                [(2, surf_tag)], 0.0, 0.0, domain.width, numElements=[spec.nelz], recombine=True
+            )
+            gmsh.model.occ.synchronize()
+            vol_tag = next(tag for dim, tag in extruded if dim == 3)
+            gmsh.model.addPhysicalGroup(3, [vol_tag], name=PHYS_DOMAIN)
+            gmsh.model.addPhysicalGroup(2, _surfaces_at_x(0.0), name=PHYS_FIXED)
+            gmsh.model.addPhysicalGroup(2, _surfaces_at_x(domain.length), name=PHYS_LOAD)
+            gmsh.model.mesh.generate(3)
+        else:
+            gmsh.model.addPhysicalGroup(2, [surf_tag], name=PHYS_DOMAIN)
+            gmsh.model.addPhysicalGroup(1, fixed, name=PHYS_FIXED)
+            gmsh.model.addPhysicalGroup(1, loaded, name=PHYS_LOAD)
+            gmsh.model.mesh.generate(2)
         gmsh.model.mesh.setOrder(1)
         _write_msh(msh_path)
 

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from .geometry import BeamDomain, BeamDomain3D, load_cad_config
-from .meshing import MeshSpec, MeshSpec3D
+from .meshing import MESH_MODES, MeshSpec, MeshSpec3D
 
 #: CadQuery inputs and their defaults.  The flags default to None so an
 #: explicit flag can be told apart from a value read from --cad-config:
@@ -101,6 +101,22 @@ def _add_model_args(p: argparse.ArgumentParser) -> None:
         help="3D only: elements through the width (default: 1, keeps runs light)",
     )
     p.add_argument(
+        "--mesh",
+        dest="mesh_mode",
+        choices=MESH_MODES,
+        default="structured",
+        help="structured: transfinite grid over the envelope, cutouts held void;"
+        " body-fitted: unstructured quads (extruded hexes in 3D) of the real CAD"
+        " profile, cutouts included (default: structured)",
+    )
+    p.add_argument(
+        "--mesh-size",
+        type=float,
+        default=None,
+        help="body-fitted only: target element edge in mm"
+        " (default: the structured cell size, min(L/nelx, H/nely))",
+    )
+    p.add_argument(
         "--youngs", type=float, default=210_000.0, help="Young's modulus in MPa (default: 210000)"
     )
     p.add_argument("--poisson", type=float, default=0.3, help="Poisson's ratio (default: 0.3)")
@@ -189,10 +205,14 @@ def main(argv: list[str] | None = None) -> int:
         from .pipeline import run
 
         domain = _domain(parser, args)
-        if args.dim == 3:
-            spec = MeshSpec3D(nelx=args.nelx, nely=args.nely, nelz=args.nelz)
-        else:
-            spec = MeshSpec(nelx=args.nelx, nely=args.nely)
+        mesh_opts = {"mode": args.mesh_mode, "size": args.mesh_size}
+        try:
+            if args.dim == 3:
+                spec = MeshSpec3D(nelx=args.nelx, nely=args.nely, nelz=args.nelz, **mesh_opts)
+            else:
+                spec = MeshSpec(nelx=args.nelx, nely=args.nely, **mesh_opts)
+        except ValueError as exc:
+            parser.error(str(exc))
         material = Material(youngs_modulus=args.youngs, poisson_ratio=args.poisson)
         simp = SimpParams(
             volume_fraction=args.volfrac,

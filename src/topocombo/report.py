@@ -466,6 +466,7 @@ def density_svg(
     pad: int = 46,
     n_steps: int = 7,
     max_height: int = 420,
+    structured: bool = True,
 ) -> str:
     """The optimized density field, one shading step per 1/7 of density.
 
@@ -473,6 +474,9 @@ def density_svg(
     the mean density through the width (side view), and, once the mesh is more
     than one element deep in a direction, the top and end views as well.  With
     one element through the width the side view is exactly the element field.
+    A body-fitted 3D mesh (unstructured in x-y, extruded in z) has no grid
+    columns across x or y, so it gets the side view only: each front element
+    shaded by the mean of the elements stacked behind it.
     """
     mesh_data = np.load(mesh_npz)
     nodes, cells = mesh_data["nodes"], mesh_data["cells"]
@@ -488,6 +492,20 @@ def density_svg(
             n_steps=n_steps,
             aria="Optimized density field of the cantilever beam",
             footer=footer,
+        )
+
+    if not structured:
+        xy, quads, front = _side_view(nodes, cells)
+        caption = PROJECTIONS["side"][3]
+        return _quad_field_svg(
+            nodes=xy,
+            quads=quads,
+            bins=_density_bins(_stack_means(nodes, cells, densities)[front], n_steps),
+            width=width,
+            pad=pad,
+            n_steps=n_steps,
+            aria=f"Optimized density, {caption}",
+            footer=f"{caption} — {footer}",
         )
 
     parts = []
@@ -512,6 +530,15 @@ def density_svg(
             )
         )
     return "\n".join(parts)
+
+
+def _stack_means(nodes: np.ndarray, cells: np.ndarray, field: np.ndarray) -> np.ndarray:
+    """Per element, the mean of ``field`` over the elements sharing its x-y
+    footprint — the stack through the width of an extruded hex mesh."""
+    keys = np.round(nodes[cells][:, :, :2].mean(axis=1), 6)
+    _, inverse = np.unique(keys, axis=0, return_inverse=True)
+    inverse = inverse.ravel()
+    return (np.bincount(inverse, weights=field) / np.bincount(inverse))[inverse]
 
 
 def _density_bins(values: np.ndarray, n_steps: int) -> np.ndarray:
@@ -763,7 +790,10 @@ def _stat_cards(summary: dict[str, Any], params: dict[str, Any]) -> str:
                 "Elements",
                 summary.get("n_elements", "-"),
                 f"{mesh.get('nelx', '?')} x {mesh.get('nely', '?')}"
-                + (f" x {mesh['nelz']} hexahedra" if "nelz" in mesh else " quads"),
+                + (f" x {mesh['nelz']} hexahedra" if "nelz" in mesh else " quads")
+                if mesh.get("mode", "structured") == "structured"
+                else "body-fitted "
+                + (f"hexahedra, {mesh['nelz']} layer(s) in z" if "nelz" in mesh else "quads"),
             ),
             (
                 "Nodes",
@@ -904,6 +934,13 @@ def _cad_section(
     )
 
 
+def _mesh_step_data(run: dict[str, Any]) -> dict[str, Any]:
+    for step in run.get("steps", []):
+        if step.get("name") == "meshing":
+            return step.get("data", {})
+    return {}
+
+
 def render_html(
     run: dict[str, Any],
     svg: str,
@@ -954,6 +991,13 @@ def render_html(
             f" (all {n_fixed} nodes, both DOFs); the tip load acts downwards at the"
             " mid-height node of the free edge."
         )
+    if summary.get("mesh_mode") == "body-fitted":
+        mesh_caption = mesh_caption.replace(
+            "every hexahedron", "every hexahedron of the body-fitted mesh"
+        ).replace("Every quad", "Every quad of the body-fitted mesh") + (
+            " The mesh follows the CAD boundary, so the dashed cutout is a real hole in it."
+            if params.get("domain", {}).get("holes") else ""
+        )
     if summary.get("passive_elements"):
         mesh_caption += (
             f" The {_e(summary['passive_elements'])} elements whose centres fall inside the"
@@ -970,8 +1014,13 @@ def render_html(
         ("beam height H (mm)", domain.get("height")),
         ("out-of-plane thickness (mm)", domain.get("thickness")),
         ("aspect ratio L/H", domain.get("aspect_ratio")),
-        ("elements along x (nelx)", mesh.get("nelx")),
-        ("elements along y (nely)", mesh.get("nely")),
+        ("mesh mode", mesh.get("mode", "structured")),
+        *(
+            [("elements along x (nelx)", mesh.get("nelx")),
+             ("elements along y (nely)", mesh.get("nely"))]
+            if mesh.get("mode", "structured") == "structured"
+            else [("target element size (mm)", _mesh_step_data(run).get("element_size"))]
+        ),
         ("load point (mm)", domain.get("load_point")),
         ("tip load node index", summary.get("load_node")),
         ("fixed node set size", summary.get("node_sets", {}).get("fixed")),
@@ -1183,7 +1232,10 @@ def build_site(run_dir: Path, site_dir: Path) -> Path:
     )
 
     density_npz = run_dir / "optimization" / "density.npz"
-    density_figure = density_svg(mesh_npz, density_npz) if density_npz.exists() else None
+    structured = run.get("params", {}).get("mesh", {}).get("mode", "structured") == "structured"
+    density_figure = (
+        density_svg(mesh_npz, density_npz, structured=structured) if density_npz.exists() else None
+    )
 
     history_csv = run_dir / "optimization" / "log.csv"
     history = read_history(history_csv) if history_csv.exists() else None

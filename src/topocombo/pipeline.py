@@ -34,6 +34,7 @@ from .meshing import (
     PHYS_LOAD,
     MeshSpec,
     MeshSpec3D,
+    generate_fitted_mesh,
     generate_hex_mesh,
     generate_quad_mesh,
 )
@@ -149,28 +150,46 @@ def run(
         )
 
     cells_word = "hexahedra" if three_d else "quadrilaterals"
-    with log.step("meshing", f"2. Mesh with Gmsh (structured {cells_word})"):
-        grid = f"{spec.nelx} x {spec.nely}" + (f" x {spec.nelz}" if three_d else "")
-        log.log(
-            f"transfinite grid: {grid} = {spec.n_elements} {cells_word}, "
-            f"{spec.n_nodes} nodes expected"
-        )
-        if domain.holes:
+    kind = "structured" if spec.structured else "body-fitted"
+    with log.step("meshing", f"2. Mesh with Gmsh ({kind} {cells_word})"):
+        if spec.structured:
+            grid = f"{spec.nelx} x {spec.nely}" + (f" x {spec.nelz}" if three_d else "")
             log.log(
-                "the structured grid covers the whole envelope; elements inside the "
-                "cutouts are held void by the optimizer"
+                f"transfinite grid: {grid} = {spec.n_elements} {cells_word}, "
+                f"{spec.n_nodes} nodes expected"
             )
-        mesher = generate_hex_mesh if three_d else generate_quad_mesh
+            if domain.holes:
+                log.log(
+                    "the structured grid covers the whole envelope; elements inside the "
+                    "cutouts are held void by the optimizer"
+                )
+            mesher = generate_hex_mesh if three_d else generate_quad_mesh
+            brep = exported.get("envelope", exported["brep"])
+        else:
+            mesher = generate_fitted_mesh
+            if three_d:  # the hexes are extruded from a mesh of the x-y profile
+                brep = out_dir / "cad" / "design_profile.brep"
+                BeamDomain(
+                    length=domain.length, height=domain.height, holes=domain.holes
+                ).face().exportBrep(str(brep))
+                log.artifact(brep, "x-y profile of the design domain, BREP — what Gmsh meshes")
+            else:
+                brep = exported["brep"]
+            log.log(
+                "body-fitted: the mesh follows the CAD boundary, cutouts included"
+                if domain.holes else "body-fitted: the mesh follows the CAD boundary"
+            )
         msh_path, _ = mesher(
             domain=domain,
             spec=spec,
-            brep_path=exported.get("envelope", exported["brep"]),
+            brep_path=brep,
             out_dir=out_dir / "mesh",
             log=log,
         )
         mesh_word = "hexahedral" if three_d else "quadrilateral"
         log.artifact(msh_path, f"{mesh_word} mesh with physical groups (Gmsh 2.2 ASCII)")
-        log.record(**spec.as_dict())
+        size = None if spec.structured else spec.element_size(domain)
+        log.record(**spec.as_dict(), element_size=size)
 
     with log.step("validation", "3. Load the mesh and check it"):
         mesh = load_mesh(msh_path)
@@ -183,11 +202,18 @@ def run(
         else:
             load_nodes = np.array([find_node(mesh, domain.load_point)])
         load_node = int(load_nodes[0])
+        miss = float(np.linalg.norm(mesh.nodes[load_node][:2] - np.asarray(domain.load_point[:2])))
+        if miss > 1e-6 * domain.length:
+            raise RuntimeError(f"no mesh node at the load point ({miss:.3g} mm away)")
         summary = check_mesh(mesh, domain, expected_elements=spec.n_elements)
+        summary["mesh_mode"] = spec.mode
         summary["load_node"] = load_node
         summary["load_nodes"] = [int(n) for n in load_nodes]
         summary["load_node_coords"] = [float(c) for c in mesh.nodes[load_node]]
-        passive = domain.void_mask(element_centroids(mesh))
+        if spec.structured:
+            passive = domain.void_mask(element_centroids(mesh))
+        else:  # the cutouts are not meshed at all
+            passive = np.zeros(mesh.n_elements, dtype=bool)
         if passive.any():
             measures = mesh.cell_measures()
             if three_d:
@@ -206,7 +232,8 @@ def run(
         )
         m, unit = mesh.measure_name, "mm^3" if three_d else "mm^2"
         log.log(
-            f"meshed {m} {summary[f'{m}_sum']:.6f} {unit} vs domain "
+            f"meshed {m} {summary[f'{m}_sum']:.6f} {unit} vs "
+            f"{'domain' if spec.structured else 'CAD (cutouts removed)'} "
             f"{summary[f'domain_{m}']:.6f} {unit}"
         )
         for name, count in summary["node_sets"].items():
@@ -290,7 +317,7 @@ def run(
             f"Timoshenko beam theory: {beam['total']:.6g} mm "
             f"(bending {beam['bending']:.4g} + shear {beam['shear']:.4g}) "
             f"-> {rel * 100:.2f}% difference"
-            + (" (beam theory ignores the cutouts)" if passive.any() else "")
+            + (" (beam theory ignores the cutouts)" if domain.holes else "")
         )
         log.log(
             f"equilibrium: ||KU - F|| on free DOFs = {result.equilibrium_residual:.3e}, "

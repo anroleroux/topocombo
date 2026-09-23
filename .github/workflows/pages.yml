@@ -43,11 +43,13 @@ jobs:
 
       # The published run is the 3D cantilever, one hexahedron through the width
       # to keep the job light; the 2D path is still covered by the tests.  The
-      # CadQuery inputs come from the example config, which the report prints.
+      # CadQuery inputs come from the example config, which the report prints,
+      # and the mesh is body-fitted: it follows the cutout rather than holding
+      # grid cells void (--mesh-size defaults to L/nelx = 1 mm).
       - name: Run the pipeline and render the report
         run: |
           python -m topocombo.cli all --cad-config examples/cantilever3d.toml \
-            --nelx 60 --nely 20 --nelz 1 \
+            --mesh body-fitted --nelx 60 --nely 20 --nelz 1 \
             --out results/cantilever --site site
 
       - name: Upload run artifacts

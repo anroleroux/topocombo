@@ -138,7 +138,8 @@ def run(
             "script": "design domain, the CadQuery script that built it (runs in CQ-editor)",
             "brep": "design domain, BREP format",
             "step": "design domain, STEP format",
-            "envelope": "design envelope without cutouts, BREP format — what Gmsh meshes",
+            "envelope": "design envelope without cutouts, BREP format"
+            + (" — what Gmsh meshes" if spec.structured else " (for the structured mesh mode)"),
         }
         for kind, path in exported.items():
             log.artifact(path, descriptions[kind])

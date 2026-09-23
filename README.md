@@ -60,9 +60,12 @@ python -m topocombo.cli all
 # the same cantilever as a 3D solid: hexahedra, one element through the width
 python -m topocombo.cli all --dim 3 --width 1 --nelz 1 --out results/cantilever3d
 
-# or take the CadQuery inputs from a file (this is what CI runs and publishes);
-# flags on the command line still override it
+# or take the CadQuery inputs from a file; flags on the command line still override it
 python -m topocombo.cli all --cad-config examples/cantilever3d.toml --out results/cantilever3d
+
+# what CI runs and publishes: those inputs (with the hole), meshed body-fitted
+python -m topocombo.cli all --cad-config examples/cantilever3d.toml --mesh body-fitted \
+    --nelx 60 --nely 20 --nelz 1 --out results/cantilever --site site
 
 # just the CAD stage: print the CadQuery script, write it with BREP, STEP and a PNG preview
 python -m topocombo.cli cad --cad-config examples/cantilever3d.toml --width 5 --out results/cad
@@ -94,7 +97,9 @@ the defaults, in that order of precedence.
 The config is validated before anything runs: unknown keys (a typo such as
 `lenght`), non-numbers, non-positive lengths and a `dim` other than 2 or 3 are
 rejected with a message naming the allowed keys, and a cutout must lie strictly
-inside the beam and clear of the others.
+inside the beam and clear of the others. The report prints the parameters and
+the script, and shows a shaded picture of the resulting CAD shape alongside
+one of the optimized topology.
 
 Cutouts are given as `--hole X,Y,D` (repeatable; replaces any holes from the
 config) or as `[[cad.holes]]` tables with `x`, `y` and `diameter`. The
@@ -108,7 +113,7 @@ the full-density solve already has the cutout void.
 
 ### Mesh modes
 
-`--mesh structured` (the default) is the transfinite grid above: uniform
+`--mesh structured` (the CLI default) is the transfinite grid above: uniform
 cells, one per design variable, over the L x H envelope. `--mesh body-fitted`
 meshes the real CAD profile instead, cutouts included. Gmsh splits the free
 edge at mid-height so the load lands on nodes, meshes the x-y face into
@@ -116,6 +121,8 @@ unstructured quads (frontal-Delaunay triangles recombined to all-quad) at
 `--mesh-size` (default `min(L/nelx, H/nely)`), and in 3D extrudes them through
 the width into `--nelz` layers of hexahedra. The 3D profile is written to
 `cad/design_profile.brep`. Nothing is held void: the hole is simply not meshed.
+This is the mode CI publishes; the structured grid stays the CLI default and
+the reference the exact 2D <-> 3D and beam-theory checks run on.
 
 Validation changes with it. Instead of the grid count, the meshed area or
 volume must match the CAD shape (cutouts removed) to 0.5%; straight element
@@ -131,9 +138,7 @@ The volume fraction is always relative to the meshed region. Structured, that
 is the envelope with the hole counted as void; body-fitted, it is the holed
 part. So at the same `--volfrac` the body-fitted design has 50% of 1121 mm³
 rather than 50% of 1200 mm³, and is a little more compliant (969 vs 909 N·mm
-for the published 3D case). The report prints the
-parameters and the script, and shows a shaded picture of the resulting CAD
-shape alongside one of the optimized topology.
+for the 3D case with the hole).
 
 With `--dim 3` the beam is a CadQuery box meshed into hexahedra, solved with
 the H8 solid element, and loaded along a line across the width at mid-height of

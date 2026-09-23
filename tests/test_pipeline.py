@@ -9,7 +9,7 @@ import pytest
 from scipy.spatial import cKDTree
 
 from topocombo.geometry import BeamDomain
-from topocombo.mesh_io import load_mesh
+from topocombo.mesh_io import Mesh, load_mesh
 from topocombo.meshing import PHYS_FIXED, PHYS_LOAD, MeshSpec
 from topocombo.pipeline import run
 from topocombo.report import build_site
@@ -61,7 +61,7 @@ def test_mesh_is_a_uniform_structured_grid(coarse_run):
     mesh = load_mesh(coarse_run["dir"] / "mesh" / "beam.msh")
     domain, spec = coarse_run["domain"], coarse_run["spec"]
 
-    areas = mesh.element_areas()
+    areas = mesh.cell_measures()
     assert np.all(areas > 0)  # counter-clockwise everywhere
     assert areas.sum() == pytest.approx(domain.area)
     expected_area = domain.area / spec.n_elements
@@ -92,10 +92,27 @@ def test_solver_facing_npz(coarse_run):
     data = np.load(coarse_run["dir"] / "mesh" / "mesh.npz")
     spec = coarse_run["spec"]
     assert data["nodes"].shape == (spec.n_nodes, 2)
-    assert data["quads"].shape == (spec.n_elements, 4)
+    assert data["cells"].shape == (spec.n_elements, 4)
+    assert str(data["cell_type"]) == "quad"
     assert f"set_{PHYS_FIXED}" in data
     assert int(data["load_node"][0]) in range(spec.n_nodes)
     assert (coarse_run["dir"] / "mesh" / "mesh.vtu").exists()
+
+
+def test_mesh_rejects_cells_of_the_wrong_arity():
+    nodes = np.zeros((4, 2))
+    with pytest.raises(ValueError):
+        Mesh(nodes=nodes, cells=np.array([[0, 1, 2]]), node_sets={}, cell_type="quad")
+    with pytest.raises(ValueError):
+        Mesh(nodes=nodes, cells=np.array([[0, 1, 2, 3]]), node_sets={}, cell_type="pentagon")
+
+
+def test_mesh_reports_its_dimension(coarse_run):
+    mesh = load_mesh(coarse_run["dir"] / "mesh" / "beam.msh")
+    assert mesh.dim == mesh.dofs_per_node == 2
+    assert mesh.n_dofs == 2 * mesh.n_nodes
+    lower, upper = mesh.bounding_box()
+    assert lower.shape == upper.shape == (2,)
 
 
 def test_run_log_written(coarse_run):
@@ -123,8 +140,10 @@ from topocombo.fea import (  # noqa: E402
     LoadCase,
     Material,
     assemble_stiffness,
+    element_dofs,
     element_stiffness,
     element_stiffnesses,
+    node_dofs,
     simp_scaling,
     solve,
     timoshenko_tip_deflection,
@@ -173,11 +192,30 @@ def test_stiffness_scales_with_youngs_modulus():
     assert np.allclose(stiff, 3.0 * soft)
 
 
+def test_element_dofs_are_node_major_for_any_dofs_per_node():
+    cells = np.array([[0, 1, 3, 2], [4, 5, 7, 6]])
+    assert element_dofs(cells, 2).tolist() == [
+        [0, 1, 2, 3, 6, 7, 4, 5],
+        [8, 9, 10, 11, 14, 15, 12, 13],
+    ]
+    assert element_dofs(cells[:1], 3).tolist() == [[0, 1, 2, 3, 4, 5, 9, 10, 11, 6, 7, 8]]
+    assert node_dofs(np.array([2, 0]), 3).tolist() == [0, 1, 2, 6, 7, 8]
+
+
+def test_load_case_components_follow_the_mesh_dimension():
+    load = LoadCase(node=0, fx=1.0, fy=-2.0, fz=3.0)
+    assert load.components(3).tolist() == [1.0, -2.0, 3.0]
+    assert load.magnitude == pytest.approx(np.sqrt(14.0))
+    assert LoadCase(node=0, fx=1.0, fy=-2.0).components(2).tolist() == [1.0, -2.0]
+    with pytest.raises(ValueError):
+        load.components(2)  # no out-of-plane load on a 2D mesh
+
+
 def test_global_stiffness_is_singular_before_boundary_conditions(coarse_run):
     mesh = load_mesh(coarse_run["dir"] / "mesh" / "beam.msh")
     ke_all = element_stiffnesses(mesh, Material(), thickness=1.0)
     k = assemble_stiffness(mesh, ke_all)
-    assert k.shape == (2 * mesh.n_nodes, 2 * mesh.n_nodes)
+    assert k.shape == (mesh.n_dofs, mesh.n_dofs) == (2 * mesh.n_nodes, 2 * mesh.n_nodes)
     assert abs((k - k.T)).max() < 1e-6 * abs(k).max()
     rigid = np.tile([1.0, 0.0], mesh.n_nodes)  # unconstrained translation
     assert np.abs(k @ rigid).max() < 1e-6 * abs(k).max()
@@ -194,8 +232,8 @@ def test_solution_satisfies_equilibrium(slender_beam):
     result, load = slender_beam["result"], slender_beam["load"]
     assert result.equilibrium_residual < 1e-6 * abs(load.fy)
     # the clamped edge carries exactly the applied load
-    assert result.reactions[1::2].sum() == pytest.approx(-load.fy, rel=1e-9)
-    assert result.reactions[0::2].sum() == pytest.approx(0.0, abs=1e-6 * abs(load.fy))
+    assert result.component(1, "reactions").sum() == pytest.approx(-load.fy, rel=1e-9)
+    assert result.component(0, "reactions").sum() == pytest.approx(0.0, abs=1e-6 * abs(load.fy))
 
 
 def test_compliance_equals_summed_element_compliance(slender_beam):
@@ -211,7 +249,7 @@ def test_tip_deflection_matches_beam_theory(slender_beam):
     theory = timoshenko_tip_deflection(
         domain.length, domain.height, domain.thickness, material, load.fy
     )
-    tip = abs(result.u[2 * load.node + 1])
+    tip = abs(result.component(1)[load.node])
     assert tip == pytest.approx(theory["total"], rel=0.05)
 
 

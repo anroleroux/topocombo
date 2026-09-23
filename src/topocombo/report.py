@@ -116,7 +116,7 @@ def mesh_svg(npz_path: Path, width: int = 900, pad: int = 46) -> str:
     """Inline SVG of the quad mesh with the supports and the tip load marked."""
     data = np.load(npz_path)
     nodes = data["nodes"]
-    quads = data["quads"]
+    quads = data["cells"]
     fixed = data["set_fixed"] if "set_fixed" in data else np.empty(0, dtype=int)
     load_node = int(data["load_node"][0]) if "load_node" in data else None
 
@@ -224,7 +224,7 @@ def solution_svg(
     mesh_data = np.load(mesh_npz)
     sol = np.load(solution_npz)
     nodes = mesh_data["nodes"]
-    quads = mesh_data["quads"]
+    quads = mesh_data["cells"]
     disp = sol["displacements"]
     field = np.asarray(sol["element_compliance"], dtype=float)
 
@@ -367,7 +367,7 @@ def density_svg(
     bins = np.clip((densities * n_steps).astype(int), 0, n_steps - 1)
     return _quad_field_svg(
         nodes=mesh_data["nodes"],
-        quads=mesh_data["quads"],
+        quads=mesh_data["cells"],
         bins=bins,
         width=width,
         pad=pad,

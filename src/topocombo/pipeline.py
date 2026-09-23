@@ -103,7 +103,7 @@ def run(
         summary["load_node"] = load_node
         summary["load_node_coords"] = [float(c) for c in mesh.nodes[load_node]]
 
-        log.log(f"{summary['n_nodes']} nodes, {summary['n_elements']} quads, {summary['n_dofs']} DOFs")
+        log.log(f"{summary['n_nodes']} nodes, {summary['n_elements']} {mesh.cell_type}s, {summary['n_dofs']} DOFs")
         log.log(
             "element edge lengths: "
             f"{summary['edge_length_min']:.4f} – {summary['edge_length_max']:.4f} mm, "
@@ -127,7 +127,7 @@ def run(
 
     with log.step("export", "4. Write mesh artifacts"):
         paths = save_mesh(mesh, out_dir / "mesh", load_node=load_node)
-        log.artifact(paths["npz"], "nodes, quad connectivity and boundary node sets (numpy)")
+        log.artifact(paths["npz"], f"nodes, {mesh.cell_type} connectivity and boundary node sets (numpy)")
         log.artifact(paths["vtu"], "mesh for PyVista / ParaView")
 
     with log.step("solve", "5. Assemble and solve (plane stress, full density)"):
@@ -138,11 +138,15 @@ def run(
         )
         log.log(
             f"boundary conditions: node set '{PHYS_FIXED}' clamped "
-            f"({2 * summary['node_sets'][PHYS_FIXED]} DOFs), "
+            f"({mesh.dofs_per_node * summary['node_sets'][PHYS_FIXED]} DOFs), "
             f"Fy = {load.fy:g} N at node {load.node}"
         )
         ke_all = element_stiffnesses(mesh, material, domain.thickness)
-        log.log(f"assembled {ke_all.shape[0]} element stiffness matrices (8x8, 2x2 Gauss)")
+        n_edof = ke_all.shape[1]
+        log.log(
+            f"assembled {ke_all.shape[0]} element stiffness matrices "
+            f"({n_edof}x{n_edof}, 2x2 Gauss)"
+        )
         result = fea_solve(
             mesh=mesh,
             material=material,
@@ -154,9 +158,9 @@ def run(
         beam = timoshenko_tip_deflection(
             domain.length, domain.height, domain.thickness, material, load.fy
         )
-        tip_uy = float(result.u[2 * load_node + 1])
+        tip_uy = float(result.component(1)[load_node])
         rel = abs(abs(tip_uy) - beam["total"]) / beam["total"]
-        reaction_y = float(result.reactions[1::2].sum())
+        reaction_y = float(result.component(1, "reactions").sum())
 
         log.log(f"solved {result.n_free_dofs} free DOFs (sparse direct)")
         log.log(f"compliance F.U = {result.compliance:.6g} N*mm")

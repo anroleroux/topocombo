@@ -77,7 +77,7 @@ load case demands.
 | `cad/design_domain.brep` | design domain, consumed by Gmsh's OCC importer |
 | `cad/design_domain.step` | same geometry for exchange with other CAD tools |
 | `mesh/beam.msh` | quad mesh with `design_domain`, `fixed` and `load_edge` physical groups |
-| `mesh/mesh.npz` | nodes, quad connectivity, boundary node sets, tip-load node — what the solver reads |
+| `mesh/mesh.npz` | nodes, cell connectivity (`cells`, `cell_type`), boundary node sets, tip-load node — what the solver reads |
 | `mesh/mesh.vtu` | the same mesh for PyVista / ParaView |
 | `solution/solution.npz` | displacements, per-element compliance and von Mises stress |
 | `solution/solution.vtu` | displacement and stress fields for PyVista / ParaView |
@@ -118,7 +118,7 @@ visualization paths, not part of the loop.
 src/topocombo/
   geometry.py   parametric design domain (CadQuery)
   meshing.py    transfinite quad meshing and physical groups (Gmsh)
-  mesh_io.py    .msh -> numpy arrays, mesh quality checks, .npz/.vtu export
+  mesh_io.py    .msh -> dimension-agnostic Mesh, quality checks, .npz/.vtu export
   fea.py        Q4 plane-stress solver: element stiffness, assembly, direct solve
   optimize.py   SIMP loop: neighbourhood filter, OC update, convergence, log.csv
   pipeline.py   the geometry -> mesh -> solve -> optimize run, terminal-driven
@@ -140,3 +140,8 @@ separately from those artifacts.
 Next, in rough order: the standalone PyVista script against the exported `.vtu`
 files, NLopt-MMA as an alternative to the OC update, and the CalculiX swap-in
 for the solver once the loop is trusted. Blender rendering stays optional.
+
+The pipeline is moving to 3D (hexahedral elements, one element through the
+width by default to keep CI light), alongside the 2D path; the step-by-step
+plan is in [`docs/3d-migration-plan.md`](docs/3d-migration-plan.md). Step 0 —
+dimension-agnostic mesh and DOF handling — is done.

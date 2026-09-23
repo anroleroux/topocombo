@@ -22,7 +22,7 @@ import scipy.sparse as sp
 from scipy.spatial import cKDTree
 
 from .fea import LoadCase, Material, element_stiffnesses, simp_scaling, solve
-from .mesh_io import QuadMesh
+from .mesh_io import Mesh, vtk_points
 
 
 @dataclass(frozen=True)
@@ -82,11 +82,11 @@ class OptResult:
         }
 
 
-def element_centroids(mesh: QuadMesh) -> np.ndarray:
-    return mesh.nodes[mesh.quads].mean(axis=1)
+def element_centroids(mesh: Mesh) -> np.ndarray:
+    return mesh.nodes[mesh.cells].mean(axis=1)
 
 
-def build_filter(mesh: QuadMesh, radius: float) -> tuple[sp.csr_matrix, np.ndarray]:
+def build_filter(mesh: Mesh, radius: float) -> tuple[sp.csr_matrix, np.ndarray]:
     """Cone-shaped neighbourhood weights ``H`` and their row sums ``Hs``.
 
     Filtering couples neighbouring elements, which is what stops the
@@ -142,7 +142,7 @@ def oc_update(
 
 
 def optimize(
-    mesh: QuadMesh,
+    mesh: Mesh,
     material: Material,
     thickness: float,
     load: LoadCase,
@@ -154,8 +154,8 @@ def optimize(
     params = params or SimpParams()
 
     ke_all = element_stiffnesses(mesh, material, thickness)
-    areas = mesh.element_areas()
-    area_fraction = areas / areas.sum()
+    measures = mesh.cell_measures()
+    measure_fraction = measures / measures.sum()
     h, hs = build_filter(mesh, params.filter_radius)
 
     x = np.full(mesh.n_elements, params.volume_fraction)
@@ -172,7 +172,7 @@ def optimize(
         return design
 
     def volume_of(design: np.ndarray) -> float:
-        return float(area_fraction @ physical(design))
+        return float(measure_fraction @ physical(design))
 
     while iteration < params.max_iterations:
         iteration += 1
@@ -198,7 +198,7 @@ def optimize(
             * (1.0 - params.e_min)
             * result.element_compliance_unscaled
         )
-        dv = area_fraction.copy()
+        dv = measure_fraction.copy()
 
         if params.filter_type == "density":
             dc = np.asarray(h @ (dc / hs)).ravel()
@@ -221,7 +221,7 @@ def optimize(
         record = {
             "iteration": iteration,
             "compliance": float(compliance),
-            "volume_fraction": float(area_fraction @ x_phys),
+            "volume_fraction": float(measure_fraction @ x_phys),
             "change": change,
             "measure_of_discreteness": float(np.mean(4.0 * x_phys * (1.0 - x_phys)) * 100.0),
             "seconds": time.perf_counter() - t0,
@@ -237,7 +237,7 @@ def optimize(
     return OptResult(
         densities=x_phys,
         compliance=float(compliance),
-        volume_fraction=float(area_fraction @ x_phys),
+        volume_fraction=float(measure_fraction @ x_phys),
         iterations=iteration,
         converged=converged,
         history=history,
@@ -257,23 +257,22 @@ def save_history(history: list[dict[str, float]], path: Path) -> Path:
     return path
 
 
-def save_density_field(mesh: QuadMesh, densities: np.ndarray, path: Path) -> Path:
+def save_density_field(mesh: Mesh, densities: np.ndarray, path: Path) -> Path:
     """Write one density field as a .vtu — used for the periodic snapshots."""
     import meshio
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    points3d = np.column_stack([mesh.nodes, np.zeros(mesh.n_nodes)])
     meshio.write_points_cells(
         str(path),
-        points3d,
-        [("quad", mesh.quads)],
+        vtk_points(mesh),
+        [(mesh.cell_type, mesh.cells)],
         cell_data={"density": [np.asarray(densities, dtype=float)]},
     )
     return path
 
 
-def save_design(mesh: QuadMesh, result: OptResult, out_dir: Path) -> dict[str, Path]:
+def save_design(mesh: Mesh, result: OptResult, out_dir: Path) -> dict[str, Path]:
     """Write the final density field for the solver side and for PyVista."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

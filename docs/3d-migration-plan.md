@@ -122,20 +122,34 @@ Each step is one PR with its own tests.
 - The report renders a 3D run as its side view (each hex's z-normal face) and
   its prose follows the run's dimension; step 9 replaces this with projections.
 
-### 8. Result artifacts
+### 8. Result artifacts — done
 - `density.vtu` with hex cells.
 - Iso-surface at rho = 0.5 -> `optimization/topology.stl` (for Blender).
 - The standalone PyVista script from the README roadmap.
+- Implemented: `topology.py` thresholds the density at 0.5 and keeps the solid
+  elements' faces that no other solid element shares — a blocky but always
+  closed, outward-facing surface with no new dependencies (a 2D run is extruded
+  by its thickness first). Its enclosed volume equals the solid elements'
+  volume exactly, which the pipeline logs and the tests check. `topocombo.viz`
+  renders the thresholded topology, the density and the warped von Mises field
+  with PyVista, off screen or with `--show`; PyVista stays an optional extra.
 
-### 9. Report
+### 9. Report — done
 - Replace per-element polygons with projected views (side x-y, top x-z, end
   y-z) of density, rendered with the existing `_quad_field_svg`. With
   `nelz = 1` the side view is exactly the current figure.
 - Optional later: an isometric PNG from off-screen PyVista (needs xvfb/OSMesa).
+- Implemented: `project_field` averages the density over the hidden axis per
+  column of the structured grid. The side view is always drawn; top and end
+  views are added once the mesh is at least two elements deep in both drawn
+  directions (at `nelz = 1` they would be 1 mm strips). The mesh and solution
+  figures draw the front layer of hexes. The isometric PNG stays out of CI.
 
-### 10. CI + docs
+### 10. CI + docs — done
 - Tests use a coarse 3D mesh (e.g. 12 x 4 x 1); Pages runs the 3D default.
 - README: artifacts table, benchmark numbers, layout, status.
+- Implemented: the Pages job runs `cli all --dim 3` on 60 x 20 x 1 (about 15 s);
+  the 2D path stays covered by the tests.
 
 ## Risks
 - **Run time** grows with `nelz`; the default of 1 keeps CI cost near today's.

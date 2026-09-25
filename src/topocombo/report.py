@@ -83,6 +83,23 @@ pre code { padding: 0; background: none; font-size: inherit; }
 .script > .head a { margin-left: auto; }
 @media (max-width: 760px) { .cad { grid-template-columns: minmax(0, 1fr); } }
 figcaption { color: var(--muted); font-size: 0.85rem; margin-top: 10px; }
+.inputs { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px;
+          margin-bottom: 16px; }
+.inputs fieldset { margin: 0; min-width: 0; background: var(--panel); border: 1px solid var(--border);
+                   border-radius: 10px; padding: 12px 16px 14px; }
+.inputs legend { padding: 0 6px; margin-left: -6px; font-weight: 600; font-size: 0.9rem; }
+.inputs .field { display: grid; grid-template-columns: minmax(0, 1fr) 7.5rem; gap: 2px 10px;
+                 align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.inputs .field:last-of-type { border-bottom: 0; }
+.inputs .field.wide { grid-template-columns: minmax(0, 1fr); }
+.inputs .field.wide input { text-align: left; }
+.inputs label { font-size: 0.85rem; }
+.inputs input { width: 100%; font-family: var(--mono); font-size: 0.85rem; text-align: right;
+                padding: 4px 8px; color: var(--text); background: var(--bg);
+                border: 1px solid var(--border); border-radius: 6px; }
+.inputs .hint { grid-column: 1 / -1; color: var(--muted); font-size: 0.75rem; }
+.inputs .hint code { font-size: 0.95em; }
+.inputs p { margin: 8px 0 0; color: var(--muted); font-size: 0.8rem; }
 .step { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 14px; overflow: hidden; }
 .step > .head { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
                 background: var(--panel); border-bottom: 1px solid var(--border); }
@@ -950,6 +967,121 @@ def _cad_section(
     )
 
 
+def _input_field(
+    name: str, label: str, value: Any, unit: str, control: str | None,
+    derived: str | None = None, wide: bool = False,
+) -> str:
+    """One read-only input: the value the run used and what sets it.
+
+    ``control`` is the CLI flag that sets it today; ``derived`` says what it
+    follows from instead; with neither, the value is fixed in the pipeline for
+    now.  The ``name`` is the key a future editable form would submit.
+    """
+    if control:
+        hint = f"set with <code>{_e(control)}</code>"
+    elif derived:
+        hint = f"follows from {derived}"
+    else:
+        hint = "fixed in the pipeline for now"
+    text = _fmt(value) if value is not None else "\u2014"
+    return (
+        f"<div class='field{' wide' if wide else ''}'><label for='in-{_e(name)}'>{_e(label)}"
+        + (f" ({_e(unit)})" if unit else "")
+        + f"</label><input id='in-{_e(name)}' name='{_e(name)}' value='{_e(text)}' readonly"
+        + f" data-control='{_e(control or '')}'>"
+        + f"<span class='hint'>{hint}</span></div>"
+    )
+
+
+def _mesh_inputs(params: dict[str, Any], summary: dict[str, Any], run: dict[str, Any]) -> str:
+    """The inputs of the mesh and the boundary value problem: element size,
+    forces and displacement constraints, as read-only form fields."""
+    mesh = params.get("mesh", {})
+    domain = params.get("domain", {})
+    three_d = params.get("dim") == 3
+    axes = "xyz"[: 3 if three_d else 2]
+    structured = mesh.get("mode", "structured") == "structured"
+
+    size = mesh.get("element_size")
+    if size is None:  # runs from before the size was recorded
+        fitted = _mesh_step_data(run).get("element_size")
+        size = [fitted] if fitted else None
+    fields = [_input_field("mesh", "mesh mode", mesh.get("mode", "structured"), "", "--mesh")]
+    if structured:
+        for axis in axes:
+            fields.append(_input_field(
+                f"nel{axis}", f"elements along {axis}", mesh.get(f"nel{axis}"), "", f"--nel{axis}"
+            ))
+        if size:
+            fields.append(_input_field(
+                "element_size", "element size " + " \u00d7 ".join(f"d{a}" for a in axes),
+                " \u00d7 ".join(f"{v:.4g}" for v in size), "mm", None,
+                derived="the part's extent / " + ", ".join(f"<code>--nel{a}</code>" for a in axes),
+            ))
+    else:
+        fields.append(_input_field(
+            "mesh_size", "target element edge", size[0] if size else None, "mm", "--mesh-size"
+        ))
+        if three_d:
+            fields.append(_input_field("nelz", "layers through the width", mesh.get("nelz"), "", "--nelz"))
+            if size and len(size) > 1:
+                fields.append(_input_field(
+                    "layer", "layer thickness dz", size[1], "mm", None,
+                    derived="the width / <code>--nelz</code>",
+                ))
+    counts = (
+        f"{_e(summary.get('n_elements', '?'))} elements, {_e(summary.get('n_nodes', '?'))} nodes"
+        + ("" if structured else " \u2014 the mesher's count for that size")
+    )
+    mesh_set = (
+        "<fieldset><legend>Mesh size</legend>" + "".join(fields) + f"<p>{counts}</p></fieldset>"
+    )
+
+    bcs = params.get("boundary_conditions") or {}
+    load = (bcs.get("loads") or [{}])[0]
+    force = load.get("force") or {"fx": 0.0, "fy": params.get("load", {}).get("fy")}
+    if three_d:
+        force.setdefault("fz", 0.0)
+    where = load.get("location") or f"point {_fmt(domain.get('load_point'))}"
+    n_load = len(summary.get("load_nodes") or [summary.get("load_node")])
+    force_fields = [_input_field(
+        "load_location", "applied at", where, "", None,
+        derived="the part: mid-height of its free end", wide=True,
+    )]
+    for axis in axes:
+        force_fields.append(_input_field(
+            f"f{axis}", f"F{axis}", force.get(f"f{axis}"), "N", "--load" if axis == "y" else None
+        ))
+    force_set = (
+        "<fieldset><legend>Force</legend>" + "".join(force_fields)
+        + f"<p>total, shared over {n_load} node{'s' if n_load != 1 else ''} of the "
+        "<code>load_edge</code> set</p></fieldset>"
+    )
+
+    constraint = (bcs.get("constraints") or [{}])[0]
+    fixed_where = constraint.get("location") or ("face x = 0" if three_d else "edge x = 0")
+    disp = constraint.get("displacements") or {f"u{a}": 0.0 for a in axes}
+    n_fixed = summary.get("node_sets", {}).get("fixed")
+    fix_fields = [_input_field(
+        "fixed_location", "constrained", fixed_where, "", None,
+        derived="the part: its boundary at x = 0", wide=True,
+    )]
+    for axis in axes:
+        fix_fields.append(_input_field(f"u{axis}", f"u{axis}", disp.get(f"u{axis}"), "mm", None))
+    fixed_set = (
+        "<fieldset><legend>Displacement constraints</legend>" + "".join(fix_fields)
+        + f"<p>{constraint.get('type', 'clamped')}: {_e(n_fixed if n_fixed is not None else '?')}"
+        f" nodes of the <code>fixed</code> set, {len(axes)} DOFs each</p></fieldset>"
+    )
+    return (
+        "<p class='lede'>The inputs that shape the mesh and the boundary value problem it"
+        " carries, as this run used them. They are read-only here: each says what sets it"
+        " today, a command-line flag or a value still fixed in the pipeline.</p>"
+        f"<form class='inputs' aria-label='Mesh and boundary condition inputs'"
+        f" onsubmit='return false'>{mesh_set}{force_set}{fixed_set}</form>"
+    )
+
+
 def _mesh_step_data(run: dict[str, Any]) -> dict[str, Any]:
     for step in run.get("steps", []):
         if step.get("name") == "meshing":
@@ -1174,6 +1306,7 @@ def render_html(
 {_cad_section(geometry, params, copied, cad_image)}
 
 <h2>Mesh</h2>
+{_mesh_inputs(params, summary, run)}
 <figure>
 {svg}
 <figcaption>

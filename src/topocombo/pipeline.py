@@ -51,6 +51,45 @@ from .runlog import RunLog
 from .topology import save_topology_stl
 
 
+def _element_size(domain: Domain, spec: MeshSpec | MeshSpec3D) -> list[float]:
+    """Element edge lengths in mm: the grid cell (dx, dy[, dz]) when structured;
+    the target in-plane edge (and the layer thickness in 3D) when body-fitted."""
+    if spec.structured:
+        size = [domain.length / spec.nelx, domain.height / spec.nely]
+    else:
+        size = [spec.element_size(domain)]
+    if domain.dim == 3:
+        size.append(domain.width / spec.nelz)
+    return size
+
+
+def _boundary_conditions(domain: Domain, load_fy: float) -> dict[str, Any]:
+    """The displacement constraints and forces the solve applies, as inputs."""
+    dofs = ["ux", "uy", "uz"][: domain.dim]
+    if domain.dim == 3:
+        (x0, y0, z0), (_, _, z1) = domain.load_line
+        where = f"line x = {x0:g}, y = {y0:g}, z = {z0:g} .. {z1:g}"
+    else:
+        where = "point x = {:g}, y = {:g}".format(*domain.load_point)
+    force = {"fx": 0.0, "fy": float(load_fy)}
+    if domain.dim == 3:
+        force["fz"] = 0.0
+    return {
+        "constraints": [{
+            "node_set": PHYS_FIXED,
+            "location": "face x = 0" if domain.dim == 3 else "edge x = 0",
+            "type": "clamped",
+            "displacements": {dof: 0.0 for dof in dofs},
+        }],
+        "loads": [{
+            "node_set": PHYS_LOAD,
+            "location": where,
+            "point": [float(c) for c in domain.load_point],
+            "force": force,
+        }],
+    }
+
+
 def run(
     domain: Domain,
     spec: MeshSpec | MeshSpec3D,
@@ -82,9 +121,10 @@ def run(
         "dim": 3 if three_d else 2,
         "element": "H8 hexahedron" if three_d else "Q4 quadrilateral",
         "domain": domain.as_dict(),
-        "mesh": spec.as_dict(),
+        "mesh": {**spec.as_dict(), "element_size": _element_size(domain, spec)},
         "material": material.as_dict(),
         "load": {"fy": load_fy},
+        "boundary_conditions": _boundary_conditions(domain, load_fy),
         "simp": simp.as_dict(),
     }
 

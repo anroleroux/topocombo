@@ -1425,3 +1425,30 @@ def test_cli_rejects_beam_flags_with_a_cad_script(tmp_path):
     with pytest.raises(SystemExit):
         cli_main(["cad", "--cad-script", str(EXAMPLE), "--length", "30",
                   "--out", str(tmp_path / "cad")])
+
+
+# --------------------------------------------------------------------------
+# mesh and boundary-condition inputs in the report
+# --------------------------------------------------------------------------
+def test_run_records_the_boundary_conditions_as_inputs(coarse_run):
+    params = json.loads((coarse_run["dir"] / "run.json").read_text())["params"]
+    bcs = params["boundary_conditions"]
+    assert bcs["constraints"][0]["displacements"] == {"ux": 0.0, "uy": 0.0}
+    assert bcs["loads"][0]["force"] == {"fx": 0.0, "fy": params["load"]["fy"]}
+    assert bcs["loads"][0]["point"] == pytest.approx(list(coarse_run["domain"].load_point))
+    domain, spec = coarse_run["domain"], coarse_run["spec"]
+    assert params["mesh"]["element_size"] == pytest.approx(
+        [domain.length / spec.nelx, domain.height / spec.nely]
+    )
+
+
+def test_report_shows_the_mesh_force_and_constraint_inputs(coarse_run, fitted_run, tmp_path):
+    html = build_site(run_dir=coarse_run["dir"], site_dir=tmp_path / "a").read_text()
+    for legend in ("Mesh size", "Force", "Displacement constraints"):
+        assert f"<legend>{legend}</legend>" in html
+    assert "name='fy' value='-1000' readonly data-control='--load'" in html
+    assert "name='ux' value='0' readonly" in html and "name='nelx'" in html
+    fitted = build_site(run_dir=fitted_run["dir"], site_dir=tmp_path / "b").read_text()
+    assert "data-control='--mesh-size'" in fitted
+    if fitted_run["summary"]["dim"] == 3:
+        assert "name='uz'" in fitted and "name='fz'" in fitted

@@ -41,19 +41,22 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
-      # The published run is the example study: examples/cantilever/part.py is
-      # the CadQuery part and its named regions, study.py the mesh, material,
-      # constraints, loads and optimizer.  The report prints both.
-      - name: Run the pipeline and render the report
+      # Two example studies, each a CadQuery part with named regions plus a
+      # study script; the reports print both.  The cantilever (hexahedra) is
+      # the main page; the bracket, which is not a prism and so is meshed with
+      # quadratic tetrahedra, is published at bracket/.
+      - name: Run the pipeline and render the reports
         run: |
           python -m topocombo.cli all --study examples/cantilever/study.py \
-            --out results/cantilever --site site
+            --out results/cantilever --site site --nav "bracket (tet10)=bracket/"
+          python -m topocombo.cli all --study examples/bracket/study.py \
+            --out results/bracket --site site/bracket --nav "cantilever (hex8)=../"
 
       - name: Upload run artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: cantilever-run
-          path: results/cantilever
+          name: example-runs
+          path: results
           if-no-files-found: error
 
       - name: Upload the site for Pages

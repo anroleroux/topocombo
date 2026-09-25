@@ -9,8 +9,8 @@ Explore topology optimization (SIMP-based compliance minimization) on a cantilev
 ## Components
 
 - **CAD (geometry)** — [CadQuery](https://github.com/CadQuery/cadquery): parametric definition of the design domain (beam dimensions, aspect ratio, load/support regions), scripted in Python.
-- **Mesher** — [Gmsh](https://gmsh.info/): structured (transfinite) quadrilateral or hexahedral meshing of the CAD geometry, driven via its Python API.
-- **FEA solver** — custom solver with Q4 plane-stress quads and H8 solid hexahedra (numpy/scipy: sparse stiffness assembly, direct solve), implemented in `src/topocombo/fea.py`. Chosen over an external solver initially so the optimizer has direct, in-memory access to element stiffness matrices and displacement fields for sensitivity analysis. [CalculiX](http://www.calculix.de/) is the planned later alternative for a verified, general-purpose solver.
+- **Mesher** — [Gmsh](https://gmsh.info/): structured (transfinite) or body-fitted quadrilateral / hexahedral meshing, and tetrahedral meshing of any solid, driven via its Python API.
+- **FEA solver** — custom solver with Q4 plane-stress quads, H8 solid hexahedra and T4 / T10 tetrahedra (numpy/scipy: sparse stiffness assembly, a direct solve or multigrid-preconditioned CG via [PyAMG](https://github.com/pyamg/pyamg)), implemented in `src/topocombo/fea.py` and `src/topocombo/elements.py`. Chosen over an external solver initially so the optimizer has direct, in-memory access to element stiffness matrices and displacement fields for sensitivity analysis. [CalculiX](http://www.calculix.de/) is the planned later alternative for a verified, general-purpose solver.
 - **Optimizer** — SIMP (Solid Isotropic Material with Penalization) loop, implemented in `src/topocombo/optimize.py`: density update via Optimality Criteria (with [NLopt](https://nlopt.readthedocs.io/)'s MMA as a planned alternative), with sensitivity or density filtering to avoid checkerboarding. The per-iteration coupling (FEA solve → compliance + sensitivity → filter → update) is custom code.
 - **Visualization (decoupled)**:
   - [PyVista](https://pyvista.org/) — scripted plotting of density fields and results, run as a separate process/script against exported data, not called from within the optimization loop.
@@ -20,9 +20,9 @@ Explore topology optimization (SIMP-based compliance minimization) on a cantilev
 
 ### Main optimization loop (terminal, headless)
 1. Define parametric geometry in CadQuery → export CAD file.
-2. Mesh with Gmsh → hexahedral (3D) or quadrilateral (2D) mesh.
+2. Mesh with Gmsh → quadrilateral (2D), hexahedral or tetrahedral (3D) mesh.
 3. Run the SIMP loop:
-   - Assemble stiffness matrix, solve FEA (custom H8 solid / Q4 plane-stress solver).
+   - Assemble stiffness matrix, solve FEA (custom Q4 plane-stress / H8 / T4 / T10 solid solver).
    - Compute compliance and sensitivities.
    - Apply density/sensitivity filter.
    - Update design variables (OC or NLopt-MMA).
@@ -130,20 +130,24 @@ an error (`--out`, `--site` and `--no-optimize` still apply).
 Nothing in the pipeline knows where a part is held or loaded. Each region
 becomes the node set of the mesh nodes lying on it (a distance test against
 the CAD shape, so it works the same for a structured grid, a body-fitted mesh
-and, later, tetrahedra); the body-fitted mesher embeds the regions' corners
-first, so a region that is not a whole CAD edge or face — the load line above
-— still lands on real nodes. A force is spread over its region by the
-region's dimension: all on one node (a vertex), by tributary length (edges),
-or by tributary area (faces). `Fix` clamps every displacement component for
+and tetrahedra); the body-fitted meshers make sure a region that is not a
+whole CAD edge or face — the load line above — still lands on real nodes (the
+extruded-hex mesher embeds the regions' corners in the profile, the tet mesher
+fuses the regions into the solid). A force is spread over its region by the
+region's dimension — all on one node (a vertex), by tributary length (edges),
+or by tributary area (faces) — split over each piece's nodes by the element's
+consistent weights: evenly for linear elements, 1/6-2/3-1/6 along a quadratic
+edge, all on the mid-nodes of a 6-node triangle. `Fix` clamps every displacement component for
 now; one `Force` per study.
 
 The part script is checked too, with a message naming the file: `result`
 must be one connected face or solid; its bounding box must start at the
-origin; a solid must be a prism along z (its z = 0 face swept through the
-width — the hex mesh is an extrusion of that profile); and regions must be
-vertices, edges or faces that select something. A face in the x-y plane is a
-2D plane-stress part (`Study.thickness` sets its out-of-plane size); a solid
-is 3D. The pipeline reads everything else it needs from the built shape: the
+origin; and regions must be vertices, edges or faces that select something.
+A face in the x-y plane is a 2D plane-stress part (`Study.thickness` sets its
+out-of-plane size); a solid is 3D. Any solid can be meshed with tetrahedra;
+hexahedra need a prism along z (its z = 0 face swept through the width — the
+hex mesh is an extrusion of that profile), and a part that is not one is
+refused with a message saying so and pointing at `Mesh(element="tet10")`. The pipeline reads everything else it needs from the built shape: the
 bounding box, the x-y profile Gmsh meshes, the material area or volume the
 mesh is checked against, and which grid cells lie outside the part.
 
@@ -299,11 +303,13 @@ src/topocombo/
   study.py      a design's study script: Study, Mesh, Fix, Force; load_study / run_study
   geometry.py   design domain: a part script with named regions (CadDomain), or the parametric beam
   regions.py    named regions -> mesh node sets, and how a force spreads over them
-  meshing.py    structured (transfinite) or body-fitted (unstructured quad / extruded hex) meshing (Gmsh)
+  meshing.py    structured (transfinite), body-fitted (unstructured quad / extruded hex) or
+                tetrahedral (any solid, regions fused in) meshing (Gmsh)
   mesh_io.py    .msh -> dimension-agnostic Mesh, quality checks, .npz/.vtu export
-  elements.py   the element registry (quad4, hex8): reference cell, shape functions, quadrature,
+  elements.py   the element registry (quad4, hex8, tet4, tet10): reference cell, shape functions, quadrature,
                 edges / facets; vectorised B matrices, stiffness and measures
-  fea.py        linear-elastic solve on any registered element: assembly, loads, direct solve
+  fea.py        linear-elastic solve on any registered element: cached assembly, loads,
+                direct or multigrid-CG solve
   optimize.py   SIMP loop: neighbourhood filter, OC update, convergence, log.csv
   pipeline.py   the geometry -> mesh -> solve -> optimize run, terminal-driven
   runlog.py     structured, timed logging of a run
@@ -321,16 +327,15 @@ examples/       designs as part.py + study.py (`--study`)
 
 The main optimization loop is implemented end to end, in 2D and 3D:
 parametric geometry, structured quad or hex meshing with validation, the
-custom Q4 plane-stress / H8 solid FEA solve, and SIMP compliance minimisation
+custom Q4 plane-stress / H8 / T4 / T10 solid FEA solve, and SIMP compliance minimisation
 (sensitivities, sensitivity or density filtering, Optimality Criteria update,
 convergence check) — all terminal-driven, writing result artifacts to a run
 directory. The published report, the PyVista views and the STL for Blender are
 built separately from those artifacts.
 
-The move to 3D followed [`docs/3d-migration-plan.md`](docs/3d-migration-plan.md);
-all steps but solver scaling (step 5) are done. Step 5 — an iterative solver
-for meshes many elements through the width — is only needed once `--nelz`
-grows well beyond the default of 1.
+The move to 3D followed [`docs/3d-migration-plan.md`](docs/3d-migration-plan.md),
+all five steps now done: step 5, solver scaling, arrived with the tetrahedra
+(below).
 
 Element code lives in one place: `elements.py` describes each element once
 (reference cell, shape-function derivatives, quadrature with weights, edges,
@@ -344,14 +349,57 @@ nullspace). Moving the Q4 and H8 code there changed no result beyond
 round-off (compliance within 3e-12 relative, densities within 1e-9, the same
 iteration counts on the published study and four parametric runs).
 
+### Tetrahedra
+
+`Mesh(element="tet10")` in a study (or `--element tet10` for the parametric
+beam) meshes any 3D part with quadratic tetrahedra; `tet4` gives linear ones,
+kept for testing. Gmsh meshes the solid itself — HXT volume meshing, then its
+own and Netgen's optimisers, which keep slivers out of thin parts — with
+mid-nodes placed on the CAD geometry, curved bores included. Mesh validation
+adds a shape-quality check (`6 sqrt(2) V / l_rms^3`, 1 for a regular tet) and
+fails below 0.1 with a hint: it trips when elements are larger than the part
+is thick (2 mm tets in the 1 mm plate give one sliver of quality 0.004;
+1.5 mm gives a worst of 0.31). T10 is CalculiX's C3D10, which keeps the
+solver swap open.
+
+Checks, besides the registry invariants every element meets:
+
+* a quadratic displacement field on a distorted T10 (linear on T4) gives its
+  exact strain at every quadrature point — shape functions and mid-node order;
+* on a 24 x 8 x 2 beam at 1 mm, T10 agrees with a 4x-refined hex mesh to 1.5%;
+  T4 of the same size is ~5% too stiff (shear locking), which is why T10 is
+  the one to use;
+* on the published notched cantilever, T10 at 1.5 mm gives 768.9 N·mm at full
+  density against H8's 761.3 (1% apart), and a tip-load line across the free
+  end is fused into the solid so it carries nodes (3 corners + 2 mid-nodes on
+  a 2 mm-wide beam at 1 mm, loaded 1/12-1/6-1/12 plus 1/3 per mid-node).
+
+`examples/bracket/` is a part hexahedra cannot mesh: a thick flange bolted to
+the wall and a narrower arm with a pin hole. The load (1 kN) hangs on the
+bore's cylindrical face, the flange's back face is clamped, and 30% of the
+material is kept. 2998 T10 at 2.5 mm (17k DOFs) converge in 64 iterations,
+about 75 s; the design keeps the flange's bolted corners, a truss in the arm
+and a ring round the pin. CI publishes it next to the cantilever, at
+`bracket/`, drawn by its front surface — a tet mesh has no layers to show, so
+each front-facing boundary facet takes its element's value — and in 3D as the
+thresholded STL.
+
+**Solvers.** `Study.solver` (or `--solver`) is `direct` (sparse LU), `cg`
+(conjugate gradients preconditioned by smoothed-aggregation algebraic
+multigrid, built on the rigid-body modes) or `auto`, the default: direct up
+to 30 000 free DOFs, CG above. CG starts each SIMP iteration from the previous
+displacements. On a T10 mesh of the published part at 1 mm (55k DOFs) it
+gives the same compliances as the direct solve at every iteration and takes
+~4 s per iteration against ~6.6 s. Reusing one multigrid hierarchy across
+iterations was tried and was slower: the stale preconditioner needs several
+times the CG iterations. Assembly is fast for any element: the sparsity
+pattern and the map from element entries into it are built once per mesh, so
+each iteration's assembly is one weighted `bincount` (0.08 s instead of 1.6 s
+at 55k DOFs).
+
 Next, in order:
 
-1. Tetrahedral elements — T10, with T4 for testing — meshed by Gmsh from any
-   3D part, lifting the prism-only restriction of the extruded hex mesh
-   (`Mesh(element="tet10")`), with iterative solves for the larger meshes
-   (step 5 of the migration plan). T10 is CalculiX's C3D10, which keeps the
-   solver swap open.
-2. More general boundary conditions: constraints on chosen components and
+1. More general boundary conditions: constraints on chosen components and
    prescribed displacements, several load cases, passive regions held solid,
    and a second example that is not a cantilever.
 

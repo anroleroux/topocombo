@@ -92,8 +92,11 @@ def region_nodes(nodes: np.ndarray, shape: cq.Shape, tol: float) -> np.ndarray:
 def node_shares(nodes: np.ndarray, cells: np.ndarray, cell_type: str,
                 selected: np.ndarray, dim: int, name: str) -> np.ndarray:
     """Each selected node's share of a total force spread uniformly over the
-    region: tributary length along edges, tributary area over faces (each
-    segment or facet split evenly between its nodes)."""
+    region: over facets of the mesh boundary (faces in 3D, edges in 2D) or
+    along element edges (a line in 3D).  Each piece takes its length or area,
+    split over its nodes by the element's load weights — evenly for linear
+    elements, the consistent 1/6-2/3-1/6 along a quadratic edge and all on
+    the mid-nodes of a 6-node triangle."""
     selected = np.asarray(selected, dtype=int)
     if selected.size == 0:
         raise ValueError(f"region '{name}' has no mesh nodes")
@@ -107,14 +110,20 @@ def node_shares(nodes: np.ndarray, cells: np.ndarray, cell_type: str,
     el = element(cell_type)
     if dim == mesh_dim - 1:  # boundary facets: edges of a 2D mesh, faces of a 3D one
         pieces = boundary_facets(el, cells)
+        weights = el.facet_load_weights
+        corners = el.n_facet_corners
     else:  # a line inside a face or along an edge of a 3D mesh: element edges
-        pieces = np.unique(np.sort(cells[:, np.array(el.edges)].reshape(-1, 2), axis=1), axis=0)
+        pieces = cells[:, np.array(el.line_pieces)].reshape(-1, len(el.line_pieces[0]))
+        _, first = np.unique(np.sort(pieces, axis=1), axis=0, return_index=True)
+        pieces = pieces[first]
+        weights = np.asarray(el.edge_weights)
+        corners = 2
     pieces = pieces[np.all(inside[pieces], axis=1)]
     if pieces.size == 0:
         raise ValueError(f"region '{name}': its nodes span no element edge or face")
     weight = np.zeros(nodes.shape[0])
     for piece in pieces:
-        np.add.at(weight, piece, _measure(nodes[piece]) / len(piece))
+        np.add.at(weight, piece, _measure(nodes[piece[:corners]]) * weights)
     shares = weight[selected]
     return shares / shares.sum()
 

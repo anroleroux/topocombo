@@ -161,12 +161,15 @@ def optimize(
     params: SimpParams | None = None,
     on_iteration: Callable[[dict[str, float], np.ndarray], None] | None = None,
     passive: np.ndarray | None = None,
+    solver: str = "auto",
 ) -> OptResult:
     """Minimise compliance subject to a volume constraint, returning the design.
 
     ``passive`` (a boolean mask) marks non-design elements held void — the
     cutouts of the CAD model.  The volume fraction stays relative to the whole
-    meshed envelope.
+    meshed envelope.  ``solver`` picks the linear solver (see
+    :func:`topocombo.fea.solve`); an iterative one starts each solve from the
+    previous iteration's displacements.
     """
     params = params or SimpParams()
     if passive is not None and not np.any(passive):
@@ -197,6 +200,7 @@ def optimize(
     def volume_of(design: np.ndarray) -> float:
         return float(measure_fraction @ physical(design))
 
+    u_prev = None
     while iteration < params.max_iterations:
         iteration += 1
         t0 = time.perf_counter()
@@ -211,7 +215,10 @@ def optimize(
             densities=x_phys,
             penal=params.penal,
             ke_all=ke_all,
+            solver=solver,
+            x0=u_prev,
         )
+        u_prev = result.u
         compliance = result.compliance
 
         # dc/dx_phys = -p x^(p-1) (1 - Emin) u_e^T k0 u_e
@@ -249,6 +256,7 @@ def optimize(
             "change": change,
             "measure_of_discreteness": float(np.mean(4.0 * x_phys * (1.0 - x_phys)) * 100.0),
             "seconds": time.perf_counter() - t0,
+            "solver_iterations": result.solver_iterations,
         }
         history.append(record)
         if on_iteration is not None:
@@ -273,10 +281,10 @@ def save_history(history: list[dict[str, float]], path: Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     columns = ["iteration", "compliance", "volume_fraction", "change",
-               "measure_of_discreteness", "seconds"]
+               "measure_of_discreteness", "seconds", "solver_iterations"]
     lines = [",".join(columns)]
     for row in history:
-        lines.append(",".join(f"{row[c]:.10g}" for c in columns))
+        lines.append(",".join(f"{row.get(c, 0):.10g}" for c in columns))
     path.write_text("\n".join(lines) + "\n")
     return path
 

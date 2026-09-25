@@ -38,7 +38,8 @@ and it opens as-is in CQ-editor.
 
 :class:`CadDomain` takes the CadQuery input as code: a part script that
 assigns the part to ``result`` — a planar face in the x-y plane (2D) or a
-solid prismatic along z (3D) — and names where it is held and loaded in
+solid (3D; a prism along z for hexahedra, anything for tetrahedra) — and
+names where it is held and loaded in
 ``regions``.  Nothing downstream reads parameters from it: the extent, the
 material area or volume, the profile Gmsh meshes, which grid cells lie outside
 the part and which nodes carry the boundary conditions all come from the
@@ -82,6 +83,7 @@ class BeamDomain:
         object.__setattr__(self, "holes", _check_holes(self.holes, self.length, self.height))
 
     dim = 2
+    is_prism = True
 
     @property
     def has_cutouts(self) -> bool:
@@ -176,6 +178,7 @@ class BeamDomain3D:
         object.__setattr__(self, "holes", _check_holes(self.holes, self.length, self.height))
 
     dim = 3
+    is_prism = True
 
     @property
     def has_cutouts(self) -> bool:
@@ -277,9 +280,9 @@ class CadDomain:
 
     The shape decides the dimension: a planar face in the x-y plane is a 2D
     plane-stress domain (``thickness`` is the solver's out-of-plane size), a
-    solid is a 3D domain, which must be a prism along z because the hex mesh
-    is an extrusion of its x-y profile.  The part's bounding box must start at
-    the origin.
+    solid is a 3D domain.  Tetrahedra mesh any solid; hexahedra are extruded
+    from the x-y profile, so they need a prism along z (:attr:`is_prism`).
+    The part's bounding box must start at the origin.
 
     ``length``, ``height`` and ``width`` are the bounding box; ``area`` /
     ``volume`` are the envelope's and ``material_area`` / ``material_volume``
@@ -291,6 +294,7 @@ class CadDomain:
     thickness: float = 1.0
     _shape: cq.Shape = field(init=False, repr=False, compare=False)
     _regions: dict = field(init=False, repr=False, compare=False)
+    _prism: str | None = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         from .regions import as_shape
@@ -311,15 +315,7 @@ class CadDomain:
         if isinstance(shape, cq.Face):
             if bb.zlen > _CAD_RTOL * size:
                 raise ValueError(f"{where}: a 2D part must be a face in the x-y plane (z = 0)")
-        profile = self.profile()
-        if isinstance(shape, cq.Solid):
-            prism = profile.Area() * bb.zlen
-            if abs(prism - shape.Volume()) > _CAD_RTOL * prism:
-                raise ValueError(
-                    f"{where}: a 3D part must be a prism along z (its z = 0 face swept "
-                    f"through the width): the profile gives {prism:.6g} mm^3, the solid "
-                    f"has {shape.Volume():.6g} mm^3"
-                )
+        object.__setattr__(self, "_prism", self._prism_check())
         raw = namespace.get("regions", {})
         if not isinstance(raw, dict) or not all(isinstance(k, str) for k in raw):
             raise ValueError(f"{where}: `regions` must be a dict of name -> CadQuery geometry")
@@ -328,6 +324,32 @@ class CadDomain:
         except ValueError as exc:
             raise ValueError(f"{where}: {exc}") from None
         object.__setattr__(self, "_regions", regions)
+
+    def _prism_check(self) -> str | None:
+        """None when the part is a prism along z (a 2D face always is);
+        otherwise why not — what an extruded hex mesh would get wrong."""
+        if isinstance(self._shape, cq.Face):
+            return None
+        tol = _CAD_RTOL * self._shape.BoundingBox().xlen
+        faces = [
+            f for f in self._shape.Faces()
+            if f.BoundingBox().zlen <= tol and abs(f.Center().z) <= tol
+        ]
+        if len(faces) != 1:
+            return f"it has {len(faces)} planar faces at z = 0, not one"
+        prism = faces[0].Area() * self._shape.BoundingBox().zlen
+        if abs(prism - self._shape.Volume()) > _CAD_RTOL * prism:
+            return (
+                f"its z = 0 face swept through the width gives {prism:.6g} mm^3, "
+                f"the solid has {self._shape.Volume():.6g} mm^3"
+            )
+        return None
+
+    @property
+    def is_prism(self) -> bool:
+        """True when the part is its z = 0 face swept through the width — what
+        extruded hexahedra need.  Tetrahedra mesh any solid."""
+        return self._prism is None
 
     @property
     def dim(self) -> int:
@@ -361,9 +383,9 @@ class CadDomain:
         return self.length * self.height
 
     @property
-    def material_area(self) -> float:
-        """Area of the part's x-y profile."""
-        return self.profile().Area()
+    def material_area(self) -> float | None:
+        """Area of the part's x-y profile; None for a 3D part that is no prism."""
+        return self.profile().Area() if self.is_prism else None
 
     @property
     def volume(self) -> float:
@@ -376,6 +398,8 @@ class CadDomain:
     @property
     def has_cutouts(self) -> bool:
         """True when the part does not fill its bounding box."""
+        if self.dim == 3:
+            return self.material_volume < self.volume * (1 - _CAD_RTOL)
         return self.material_area < self.area * (1 - _CAD_RTOL)
 
     def envelope(self) -> BeamDomain | BeamDomain3D:
@@ -403,6 +427,7 @@ class CadDomain:
             "material_area": self.material_area,
             "holes": [],
             "regions": sorted(self._regions),
+            "prism": self.is_prism,
         }
         if self.dim == 3:
             d.update(width=self.width, volume=self.volume, material_volume=self.material_volume)
@@ -427,20 +452,23 @@ class CadDomain:
         return self._shape
 
     def profile(self) -> cq.Face:
-        """The part's x-y cross-section at z = 0 (the face itself in 2D)."""
+        """The part's x-y cross-section at z = 0 (the face itself in 2D).
+
+        Only a prism along z has one; it is what hexahedra are extruded from.
+        """
         if isinstance(self._shape, cq.Face):
             return self._shape
+        if self._prism is not None:
+            raise ValueError(
+                f"{self.path or 'the CadQuery script'}: hexahedra need a prism along z, and "
+                f"this part is not one ({self._prism}); mesh it with tetrahedra "
+                "(Mesh(element='tet10'))"
+            )
         tol = _CAD_RTOL * self._shape.BoundingBox().xlen
-        faces = [
+        return next(
             f for f in self._shape.Faces()
             if f.BoundingBox().zlen <= tol and abs(f.Center().z) <= tol
-        ]
-        if len(faces) != 1:
-            raise ValueError(
-                f"{self.path or 'the CadQuery script'}: expected one planar face at z = 0, "
-                f"found {len(faces)}"
-            )
-        return faces[0]
+        )
 
     @classmethod
     def from_file(cls, path: Path, thickness: float = 1.0) -> CadDomain:

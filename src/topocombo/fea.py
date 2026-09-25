@@ -157,6 +157,8 @@ class FEResult:
     equilibrium_residual: float  # ||K U - F|| on the free DOFs
     n_free_dofs: int
     dofs_per_node: int = 2
+    solver: str = "direct"  # what solved it: "direct" or "amg-cg"
+    solver_iterations: int = 0  # CG iterations (0 for a direct solve)
 
     @property
     def displacement_magnitude(self) -> np.ndarray:
@@ -240,16 +242,37 @@ def assemble_stiffness(
     ke_all: np.ndarray,
     scale: np.ndarray | None = None,
 ) -> sp.csc_matrix:
-    """Assemble the global stiffness matrix from per-element matrices."""
+    """Assemble the global stiffness matrix from per-element matrices.
+
+    The sparsity pattern and the map from element entries to it depend only on
+    the mesh, so they are built once and cached on it; each assembly after that
+    — one per SIMP iteration — is a weighted ``bincount``.
+    """
+    indptr, indices, slot = _assembly_plan(mesh)
+    values = ke_all if scale is None else ke_all * np.asarray(scale)[:, None, None]
+    data = np.bincount(slot, weights=values.reshape(-1), minlength=indices.size)
+    n_dof = mesh.n_dofs
+    return sp.csc_matrix((data, indices, indptr), shape=(n_dof, n_dof))
+
+
+def _assembly_plan(mesh: Mesh) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(indptr, row indices, slot of every element-matrix entry) of the global
+    matrix in CSC form, cached on the mesh."""
+    plan = getattr(mesh, "_assembly_plan", None)
+    key = (mesh.n_nodes, mesh.cells.shape)
+    if plan is not None and plan[0] == key:
+        return plan[1]
     dofs = element_dofs(mesh.cells, mesh.dofs_per_node)
     n_edof = dofs.shape[1]
-    values = ke_all if scale is None else ke_all * np.asarray(scale)[:, None, None]
     rows = np.repeat(dofs, n_edof, axis=1).reshape(-1)
     cols = np.tile(dofs, (1, n_edof)).reshape(-1)
     n_dof = mesh.n_dofs
-    return sp.coo_matrix(
-        (values.reshape(-1), (rows, cols)), shape=(n_dof, n_dof)
-    ).tocsc()
+    keys, slot = np.unique(cols.astype(np.int64) * n_dof + rows, return_inverse=True)
+    indices = (keys % n_dof).astype(np.int32)
+    indptr = np.concatenate([[0], np.cumsum(np.bincount(keys // n_dof, minlength=n_dof))])
+    result = (indptr, indices, slot.reshape(-1))
+    mesh._assembly_plan = (key, result)
+    return result
 
 
 def load_vector(mesh: Mesh, load: LoadCase) -> np.ndarray:
@@ -304,10 +327,17 @@ def solve(
     densities: np.ndarray | None = None,
     penal: float = 3.0,
     ke_all: np.ndarray | None = None,
+    solver: str = "auto",
+    x0: np.ndarray | None = None,
 ) -> FEResult:
-    """Direct linear-elastic solve; ``densities`` (if given) applies SIMP scaling.
+    """Linear-elastic solve; ``densities`` (if given) applies SIMP scaling.
 
-    Plane stress on a quad mesh (with ``thickness``), full 3D on a hex mesh.
+    Plane stress on a 2D mesh (with ``thickness``), full 3D elasticity on a
+    3D one.  ``solver`` is ``"direct"`` (sparse LU), ``"cg"`` (conjugate
+    gradients preconditioned by smoothed-aggregation algebraic multigrid,
+    built on the rigid-body modes) or ``"auto"``: direct up to
+    :data:`DIRECT_MAX_DOFS` free DOFs, CG above.  ``x0`` warm-starts CG — the
+    SIMP loop passes the previous iteration's displacements.
     """
     if ke_all is None:
         ke_all = element_stiffnesses(mesh, material, thickness)
@@ -320,7 +350,17 @@ def solve(
     free = np.setdiff1d(np.arange(mesh.n_dofs), constrained, assume_unique=False)
 
     u = np.zeros(mesh.n_dofs)
-    u[free] = spla.spsolve(k[free][:, free].tocsc(), f[free])
+    k_ff = k[free][:, free]
+    used, iterations = _choose_solver(solver, free.size), 0
+    if used == "amg-cg":
+        start = None if x0 is None else np.asarray(x0)[free]
+        solution, iterations = _amg_cg(mesh, free, k_ff, f[free], start)
+        if solution is None:  # CG did not converge: fall back to the direct solve
+            used = "direct (after CG failed)"
+        else:
+            u[free] = solution
+    if used.startswith("direct"):
+        u[free] = spla.spsolve(k_ff.tocsc(), f[free])
 
     residual = k @ u - f
     dofs = element_dofs(mesh.cells, mesh.dofs_per_node)
@@ -338,7 +378,68 @@ def solve(
         equilibrium_residual=float(np.linalg.norm(residual[free])),
         n_free_dofs=int(free.size),
         dofs_per_node=mesh.dofs_per_node,
+        solver=used,
+        solver_iterations=iterations,
     )
+
+
+#: Above this many free DOFs, ``solver="auto"`` switches from the direct sparse
+#: LU to multigrid-preconditioned CG (a quadratic-tet mesh of the published
+#: part at 1 mm has ~55k: LU ~7 s per solve, warm-started CG a fraction).
+DIRECT_MAX_DOFS = 30_000
+SOLVERS = ("auto", "direct", "cg")
+#: CG stops at this relative residual; compliance is then good to ~1e-10.
+CG_RTOL = 1e-9
+
+
+def _choose_solver(solver: str, n_free: int) -> str:
+    if solver not in SOLVERS:
+        raise ValueError(f"solver must be one of {', '.join(SOLVERS)}, not {solver!r}")
+    if solver == "cg" or (solver == "auto" and n_free > DIRECT_MAX_DOFS):
+        try:
+            import pyamg  # noqa: F401
+        except ImportError:  # pragma: no cover - pyamg is a dependency
+            return "direct"
+        return "amg-cg"
+    return "direct"
+
+
+def rigid_body_modes(mesh: Mesh) -> np.ndarray:
+    """The rigid-body displacement fields of the mesh, (n_dofs, 3 in 2D or 6 in 3D):
+    translations and infinitesimal rotations — the near-null space multigrid
+    needs to coarsen an elasticity problem well."""
+    d, n = mesh.dofs_per_node, mesh.n_nodes
+    x = mesh.nodes - mesh.nodes.mean(axis=0)
+    modes = np.zeros((d * n, 3 if d == 2 else 6))
+    for i in range(d):
+        modes[i::d, i] = 1.0
+    if d == 2:
+        modes[0::2, 2], modes[1::2, 2] = -x[:, 1], x[:, 0]
+    else:
+        for col, (a, b) in zip((3, 4, 5), ((0, 1), (1, 2), (2, 0))):
+            modes[a::3, col], modes[b::3, col] = -x[:, b], x[:, a]
+    return modes
+
+
+def _amg_cg(mesh: Mesh, free: np.ndarray, k: sp.spmatrix, f: np.ndarray,
+            x0: np.ndarray | None) -> tuple[np.ndarray | None, int]:
+    """CG on ``k u = f`` preconditioned by smoothed-aggregation AMG built on
+    the rigid-body modes; (u, iterations), or (None, iterations) if it did not
+    converge.  The hierarchy is rebuilt for every solve: reusing one from an
+    earlier SIMP iteration was measured slower, the density changes making CG
+    need several times the iterations."""
+    import pyamg
+
+    k = k.tocsr()
+    ml = pyamg.smoothed_aggregation_solver(k, B=rigid_body_modes(mesh)[free], max_coarse=500)
+    count = [0]
+
+    def tick(_):
+        count[0] += 1
+
+    u, info = spla.cg(k, f, x0=x0, rtol=CG_RTOL, maxiter=2000,
+                      M=ml.aspreconditioner(), callback=tick)
+    return (u if info == 0 else None), count[0]
 
 
 def timoshenko_tip_deflection(

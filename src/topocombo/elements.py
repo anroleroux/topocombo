@@ -41,12 +41,36 @@ class Element:
     centre: np.ndarray  # reference coordinates of the cell centre
     edges: tuple[tuple[int, int], ...]
     facets: tuple[tuple[int, ...], ...]  # boundary facets, right-hand normal outward
-    facet_cell_type: str  # meshio type of a facet: "line", "quad", "triangle"
+    facet_cell_type: str  # meshio type of a facet: "line", "quad", "triangle", "triangle6"
     flip: tuple[int, ...]  # node permutation mirroring the cell
+    #: How a uniform load spreads over a facet's nodes (fractions of the facet's
+    #: share; the integral of each shape function over the facet): even for
+    #: linear facets, all on the mid-nodes of a 6-node triangle.  None: even.
+    facet_weights: tuple[float, ...] | None = None
+    #: Corner nodes per facet (listed first); they span its area.  None: all.
+    facet_corners: int | None = None
+    #: Nodes along each edge, ends first then any mid-node, and how a uniform
+    #: line load spreads over them.  None: ``edges`` with even weights.
+    load_edges: tuple[tuple[int, ...], ...] | None = None
+    edge_weights: tuple[float, ...] = (0.5, 0.5)
+    order: int = 1  # polynomial order of the shape functions
 
     @property
     def n_nodes(self) -> int:
         return int(self.reference_nodes.shape[0])
+
+    @property
+    def facet_load_weights(self) -> np.ndarray:
+        n = len(self.facets[0])
+        return np.full(n, 1.0 / n) if self.facet_weights is None else np.asarray(self.facet_weights)
+
+    @property
+    def n_facet_corners(self) -> int:
+        return self.facet_corners or len(self.facets[0])
+
+    @property
+    def line_pieces(self) -> tuple[tuple[int, ...], ...]:
+        return self.load_edges or self.edges
 
     @property
     def n_strains(self) -> int:
@@ -128,8 +152,98 @@ HEX8 = Element(
     flip=(0, 3, 2, 1, 4, 7, 6, 5),  # walk both faces backwards
 )
 
+# --------------------------------------------------------------------------
+# simplex elements: tet4 (linear), tet10 (quadratic)
+# --------------------------------------------------------------------------
+_TET_CORNERS = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+#: Mid-edge nodes of the quadratic tet in VTK / meshio order (Gmsh's own order
+#: swaps the last two; meshio reorders on reading).
+_TET10_MIDS = ((0, 1), (1, 2), (0, 2), (0, 3), (1, 3), (2, 3))
+_TET_EDGES = ((0, 1), (1, 2), (0, 2), (0, 3), (1, 3), (2, 3))
+#: Barycentric coordinates L = (1 - x - y - z, x, y, z) and their gradients.
+_DL = np.array([[-1.0, -1.0, -1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+
+
+def _barycentric(point: np.ndarray) -> np.ndarray:
+    x, y, z = np.asarray(point, dtype=float)
+    return np.array([1.0 - x - y - z, x, y, z])
+
+
+def _tet4_derivatives(point: np.ndarray) -> np.ndarray:
+    return _DL.copy()
+
+
+def _tet10_derivatives(point: np.ndarray) -> np.ndarray:
+    """Corners ``N_i = L_i (2 L_i - 1)``, mid-nodes ``N_ij = 4 L_i L_j``."""
+    L = _barycentric(point)
+    out = np.empty((10, 3))
+    for i in range(4):
+        out[i] = (4.0 * L[i] - 1.0) * _DL[i]
+    for k, (i, j) in enumerate(_TET10_MIDS):
+        out[4 + k] = 4.0 * (L[i] * _DL[j] + L[j] * _DL[i])
+    return out
+
+
+def _tet_rule_4() -> tuple[np.ndarray, np.ndarray]:
+    """The 4-point, degree-2 rule on the unit tetrahedron (weights sum to 1/6)."""
+    a, b = 0.5854101966249685, 0.1381966011250105
+    points = np.array([[b, b, b], [a, b, b], [b, a, b], [b, b, a]])
+    return points, np.full(4, 1.0 / 24.0)
+
+
+#: Faces opposite vertex 3, 2, 1, 0, corners ordered with the normal outward.
+_TET_FACES = ((0, 2, 1), (0, 1, 3), (0, 3, 2), (1, 2, 3))
+
+
+def _tet10_face(face: tuple[int, int, int]) -> tuple[int, ...]:
+    """A face's three corners, then its mid-nodes on (a, b), (b, c), (c, a)."""
+    a, b, c = face
+    mid = {frozenset(p): 4 + k for k, p in enumerate(_TET10_MIDS)}
+    return (a, b, c, mid[frozenset((a, b))], mid[frozenset((b, c))], mid[frozenset((c, a))])
+
+
+TET4 = Element(
+    name="tet4",
+    cell_type="tetra",
+    label="T4 tetrahedron",
+    plural="tetrahedra",
+    dim=3,
+    reference_nodes=_TET_CORNERS,
+    shape_derivatives=_tet4_derivatives,
+    quadrature=(np.array([[0.25, 0.25, 0.25]]), np.array([1.0 / 6.0])),
+    centre=np.full(3, 0.25),
+    edges=_TET_EDGES,
+    facets=_TET_FACES,
+    facet_cell_type="triangle",
+    flip=(0, 2, 1, 3),
+)
+
+TET10 = Element(
+    name="tet10",
+    cell_type="tetra10",
+    label="T10 tetrahedron",
+    plural="quadratic tetrahedra",
+    dim=3,
+    reference_nodes=np.vstack(
+        [_TET_CORNERS] + [(_TET_CORNERS[i] + _TET_CORNERS[j]) / 2.0 for i, j in _TET10_MIDS]
+    ),
+    shape_derivatives=_tet10_derivatives,
+    quadrature=_tet_rule_4(),
+    centre=np.full(3, 0.25),
+    edges=_TET_EDGES,
+    facets=tuple(_tet10_face(f) for f in _TET_FACES),
+    facet_cell_type="triangle6",
+    # swapping corners 1 and 2 also swaps mid-nodes (0,1)<->(0,2) and (1,3)<->(2,3)
+    flip=(0, 2, 1, 3, 6, 5, 4, 7, 9, 8),
+    facet_weights=(0.0, 0.0, 0.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0),
+    facet_corners=3,
+    load_edges=tuple((i, j, 4 + k) for k, (i, j) in enumerate(_TET10_MIDS)),
+    edge_weights=(1.0 / 6.0, 1.0 / 6.0, 2.0 / 3.0),
+    order=2,
+)
+
 #: Every supported element, by meshio cell type.
-ELEMENTS: dict[str, Element] = {e.cell_type: e for e in (QUAD4, HEX8)}
+ELEMENTS: dict[str, Element] = {e.cell_type: e for e in (QUAD4, HEX8, TET4, TET10)}
 
 #: The same, by study-facing name.
 BY_NAME: dict[str, Element] = {e.name: e for e in ELEMENTS.values()}
@@ -231,10 +345,13 @@ def boundary_facets(el: Element, cells: np.ndarray) -> np.ndarray:
 
 
 def triangulate(facets: np.ndarray) -> np.ndarray:
-    """Surface facets (triangles or quadrilaterals) as triangles, keeping
-    their orientation."""
+    """Surface facets (triangles, quadrilaterals or 6-node triangles) as
+    triangles, keeping their orientation."""
     if facets.shape[1] == 3:
         return facets
     if facets.shape[1] == 4:
         return np.vstack([facets[:, [0, 1, 2]], facets[:, [0, 2, 3]]])
+    if facets.shape[1] == 6:  # corners a b c, mids ab bc ca: four sub-triangles
+        return np.vstack([facets[:, [0, 3, 5]], facets[:, [3, 1, 4]],
+                          facets[:, [5, 4, 2]], facets[:, [3, 4, 5]]])
     raise ValueError(f"cannot triangulate {facets.shape[1]}-node facets")

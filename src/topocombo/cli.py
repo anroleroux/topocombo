@@ -16,6 +16,14 @@ CAD_DEFAULTS = {
 }
 
 
+def _nav(text: str) -> tuple[str, str]:
+    """``LABEL=URL`` -> (label, url)."""
+    label, sep, url = text.partition("=")
+    if not sep or not label or not url:
+        raise argparse.ArgumentTypeError(f"expected LABEL=URL, not {text!r}")
+    return label, url
+
+
 def _hole(text: str) -> tuple[float, float, float]:
     """``X,Y,D`` -> (x, y, diameter)."""
     try:
@@ -30,7 +38,7 @@ def _hole(text: str) -> tuple[float, float, float]:
 _STUDY_SETS = (
     "dim", "length", "height", "thickness", "width", "holes", "nelx", "nely", "nelz",
     "mesh_mode", "mesh_size", "youngs", "poisson", "load", "volfrac", "penal", "rmin",
-    "filter_type", "max_iter", "tol",
+    "filter_type", "max_iter", "tol", "element", "solver",
 )
 
 
@@ -121,6 +129,21 @@ def _add_model_args(p: argparse.ArgumentParser) -> None:
         help="3D only: elements through the width (default: 1, keeps runs light)",
     )
     p.add_argument(
+        "--solver",
+        choices=("auto", "direct", "cg"),
+        default="auto",
+        help="linear solver: direct sparse LU, multigrid-preconditioned CG, or auto"
+        " (direct up to 30k free DOFs) (default: auto)",
+    )
+    p.add_argument(
+        "--element",
+        choices=("hex8", "tet4", "tet10"),
+        default="hex8",
+        help="3D only: hex8 (structured or extruded hexahedra) or tetrahedra meshed from"
+        " the solid, body-fitted only: tet10 (quadratic) or tet4 (linear, stiff in"
+        " bending) (default: hex8)",
+    )
+    p.add_argument(
         "--mesh",
         dest="mesh_mode",
         choices=MESH_MODES,
@@ -199,10 +222,14 @@ def main(argv: list[str] | None = None) -> int:
     p_report = sub.add_parser("report", help="render an HTML report from a run directory")
     p_report.add_argument("--run", type=Path, default=Path("results/cantilever"))
     p_report.add_argument("--site", type=Path, default=Path("site"))
+    p_report.add_argument("--nav", type=_nav, action="append", default=None, metavar="LABEL=URL",
+                          help="link to another report from this one; repeatable")
 
     p_all = sub.add_parser("all", help="run the pipeline, then render the HTML report")
     _add_model_args(p_all)
     p_all.add_argument("--site", type=Path, default=Path("site"))
+    p_all.add_argument("--nav", type=_nav, action="append", default=None, metavar="LABEL=URL",
+                       help="link to another report from this one; repeatable")
 
     args = parser.parse_args(argv)
     subparsers = {"cad": p_cad, "run": p_run, "all": p_all}
@@ -244,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
             constraints=s.constraints,
             loads=s.loads,
             study=loaded,
+            solver=s.solver,
         )
     elif args.command in ("run", "all"):
         from .fea import Material
@@ -254,8 +282,15 @@ def main(argv: list[str] | None = None) -> int:
         mesh_opts = {"mode": args.mesh_mode, "size": args.mesh_size}
         try:
             if args.dim == 3:
-                spec = MeshSpec3D(nelx=args.nelx, nely=args.nely, nelz=args.nelz, **mesh_opts)
+                from .elements import BY_NAME
+
+                spec = MeshSpec3D(
+                    nelx=args.nelx, nely=args.nely, nelz=args.nelz,
+                    element=BY_NAME[args.element], **mesh_opts,
+                )
             else:
+                if args.element != "hex8":
+                    parser.error("--element picks a 3D element; a 2D run uses quad4")
                 spec = MeshSpec(nelx=args.nelx, nely=args.nely, **mesh_opts)
         except ValueError as exc:
             parser.error(str(exc))
@@ -276,13 +311,14 @@ def main(argv: list[str] | None = None) -> int:
             load_fy=args.load,
             simp=simp,
             optimize_design=not args.no_optimize,
+            solver=args.solver,
         )
 
     if args.command in ("report", "all"):
         from .report import build_site
 
         run_dir = args.run if args.command == "report" else args.out
-        index = build_site(run_dir=run_dir, site_dir=args.site)
+        index = build_site(run_dir=run_dir, site_dir=args.site, nav=args.nav)
         print(f"report: {index}")
 
     return 0

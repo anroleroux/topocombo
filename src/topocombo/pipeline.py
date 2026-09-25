@@ -30,6 +30,7 @@ from .meshing import (
     MeshSpec,
     MeshSpec3D,
     generate_fitted_mesh,
+    generate_tet_mesh,
     generate_hex_mesh,
     generate_quad_mesh,
 )
@@ -56,7 +57,7 @@ def _element_size(domain: Domain, spec: MeshSpec | MeshSpec3D) -> list[float]:
         size = [domain.length / spec.nelx, domain.height / spec.nely]
     else:
         size = [spec.element_size(domain)]
-    if domain.dim == 3:
+    if domain.dim == 3 and not getattr(spec, "tetrahedral", False):
         size.append(domain.width / spec.nelz)
     return size
 
@@ -110,6 +111,7 @@ def run(
     constraints: Sequence[Fix] | None = None,
     loads: Sequence[Force] | None = None,
     study: Any = None,
+    solver: str = "auto",
 ) -> tuple[RunLog, dict[str, Any]]:
     """Mesh the domain, solve it at full density, then run the SIMP loop.
 
@@ -140,6 +142,9 @@ def run(
     force = loads[0]
     if len(force.vector) != domain.dim:
         raise ValueError(f"a {domain.dim}D part takes a {domain.dim}-component force")
+    tetrahedral = getattr(spec, "tetrahedral", False)
+    if three_d and not tetrahedral and not domain.is_prism:
+        domain.profile()  # raises, saying why hexahedra cannot mesh this part
     out_dir = Path(out_dir)
     material = material or Material()
     simp = simp or SimpParams()
@@ -162,6 +167,7 @@ def run(
         "boundary_conditions": _boundary_conditions(domain, constraints, loads, regions),
         "regions": {name: _region_summary(shape) for name, shape in regions.items()},
         "simp": simp.as_dict(),
+        "solver": solver,
     }
     if study is not None:
         log.params["study"] = {"path": str(study.path), "part": study.study.part}
@@ -209,11 +215,16 @@ def run(
             cad_record = {"face_area": face.Area()}
         for x, y, d in domain.holes:
             log.log(f"cutout through z: diameter {d:g} mm at x = {x:g}, y = {y:g}")
-        if scripted:
+        if scripted and domain.is_prism:
             cut = domain.area - domain.material_area
             log.log(
                 f"x-y profile: {domain.material_area:.3f} of {domain.area:.3f} mm^2 envelope"
                 + (f" ({cut:.3f} mm^2 cut away)" if domain.has_cutouts else " (fills its bounding box)")
+            )
+        elif scripted:
+            log.log(
+                f"not a prism along z: {domain.material_volume:.3f} of {domain.volume:.3f} mm^3 "
+                "bounding box — meshed with tetrahedra"
             )
         for name, info in log.params["regions"].items():
             lo, hi = info["bbox"][:3], info["bbox"][3:]
@@ -264,6 +275,10 @@ def run(
                 )
             mesher = generate_hex_mesh if three_d else generate_quad_mesh
             brep = exported.get("envelope", exported["brep"])
+        elif tetrahedral:
+            mesher = generate_tet_mesh
+            brep = exported["brep"]
+            log.log("body-fitted tetrahedra of the solid itself: any 3D shape")
         else:
             mesher = generate_fitted_mesh
             if three_d:  # the hexes are extruded from a mesh of the x-y profile
@@ -277,9 +292,12 @@ def run(
                 if domain.has_cutouts else "body-fitted: the mesh follows the CAD boundary"
             )
         tol = 1e-6 * max(domain.length, domain.height, getattr(domain, "width", 0.0))
-        extra = {} if spec.structured else {
-            "points": embed_points(regions, domain.profile(), tol)
-        }
+        if spec.structured:
+            extra = {}
+        elif tetrahedral:
+            extra = {"regions": regions}
+        else:
+            extra = {"points": embed_points(regions, domain.profile(), tol)}
         msh_path, _ = mesher(
             domain=domain,
             spec=spec,
@@ -353,7 +371,14 @@ def run(
             log.log(f"  [{'PASS' if passed else 'FAIL'}] {name}")
         if not summary["all_checks_passed"]:
             failed = [n for n, ok in summary["checks"].items() if not ok]
-            raise RuntimeError(f"mesh validation failed: {', '.join(failed)}")
+            hint = ""
+            if any(n.startswith("tet_quality") for n in failed):
+                hint = (
+                    f" (worst tetrahedron quality {summary['tet_quality_min']:.3g}: elements"
+                    " larger than the part's thinnest feature make slivers — try a smaller"
+                    " Mesh.size)"
+                )
+            raise RuntimeError(f"mesh validation failed: {', '.join(failed)}{hint}")
         log.record(**summary)
 
     with log.step("export", "4. Write mesh artifacts"):
@@ -412,6 +437,7 @@ def run(
             fixed_node_set=fixed_sets,
             densities=np.where(passive, 0.0, 1.0) if passive.any() else None,
             ke_all=ke_all,
+            solver=solver,
         )
         tip_uy = float(result.component(1)[load.nodes].mean())
         reactions = [float(result.component(i, "reactions").sum()) for i in range(mesh.dim)]
@@ -422,7 +448,11 @@ def run(
         )
         rel = abs(abs(tip_uy) - beam["total"]) / beam["total"] if beam else None
 
-        log.log(f"solved {result.n_free_dofs} free DOFs (sparse direct)")
+        how = (
+            f"multigrid-preconditioned CG, {result.solver_iterations} iterations"
+            if result.solver == "amg-cg" else f"sparse {result.solver}"
+        )
+        log.log(f"solved {result.n_free_dofs} free DOFs ({how})")
         log.log(f"compliance F.U = {result.compliance:.6g} N*mm")
         log.log(
             f"uy at the load = {tip_uy:.6g} mm"
@@ -458,6 +488,8 @@ def run(
             "reaction_y": reaction_y,
             "reactions": reactions,
             "n_free_dofs": result.n_free_dofs,
+            "solver": result.solver,
+            "solver_iterations": result.solver_iterations,
             "von_mises_min": float(result.von_mises.min()),
             "von_mises_max": float(result.von_mises.max()),
             "element_compliance_sum": float(result.element_compliance.sum()),
@@ -509,6 +541,7 @@ def run(
                 params=simp,
                 on_iteration=on_iteration,
                 passive=passive,
+                solver=solver,
             )
             reduction = (design.compliance / result.compliance) if result.compliance else float("nan")
             log.log(

@@ -18,7 +18,7 @@ from typing import Any
 
 import numpy as np
 
-from .elements import ELEMENTS, HEX8
+from .elements import ELEMENTS, HEX8, TET4, TET10
 
 _CSS = """
 :root {
@@ -145,8 +145,10 @@ def _side_view(
     layer is the whole mesh; the returned indices pick each drawn element's
     values out of per-element fields.
     """
-    if cells.shape[1] != 8:
+    if nodes.shape[1] == 2:
         return nodes, cells, np.arange(cells.shape[0])
+    if cells.shape[1] in (4, 10):
+        return _tet_front_view(nodes, cells)
     faces = cells[:, _HEX_FACES]  # (m, 6, 4)
     z = nodes[faces, 2]
     # the face normal to z has no z extent; among the two, take the lower one
@@ -158,6 +160,41 @@ def _side_view(
     angle = np.arctan2(*(xy - xy.mean(axis=1, keepdims=True)).transpose(2, 0, 1)[::-1])
     quads = np.take_along_axis(quads, np.argsort(angle, axis=1), axis=1)
     return nodes[:, :2], quads, front
+
+
+def _tet_front_view(
+    nodes: np.ndarray, cells: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(x-y node coordinates, triangles, owning element of each) of a tet mesh
+    seen from the front: the boundary facets facing -z, by their corners,
+    ordered back to front so later ones paint over earlier ones.
+
+    A tetrahedral mesh has no layers or grid columns to draw; its front
+    surface is what a viewer at z = -inf sees of any part, so every per-element
+    field is shown on it, each facet in its element's value.
+    """
+    el = TET10 if cells.shape[1] == 10 else TET4
+    local = np.array([f[:3] for f in el.facets])  # corners, outward order
+    facets = cells[:, local].reshape(-1, 3)
+    owner = np.repeat(np.arange(cells.shape[0]), local.shape[0])
+    _, inverse, counts = np.unique(
+        np.sort(facets, axis=1), axis=0, return_inverse=True, return_counts=True
+    )
+    outer = counts[inverse.ravel()] == 1
+    facets, owner = facets[outer], owner[outer]
+    p = nodes[facets]
+    normal_z = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])[:, 2]
+    area = 0.5 * np.linalg.norm(np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), axis=1)
+    front = normal_z < -1e-9 * max(float(area.max()), 1e-30)
+    facets, owner = facets[front], owner[front]
+    order = np.argsort(-nodes[facets, 2].mean(axis=1), kind="stable")  # far to near
+    tris = facets[order]
+    # counter-clockwise in x-y, as the quad views are
+    xy = nodes[tris][:, :, :2]
+    a, b = xy[:, 1] - xy[:, 0], xy[:, 2] - xy[:, 0]
+    signed = a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+    tris[signed < 0] = tris[signed < 0][:, [0, 2, 1]]
+    return nodes[:, :2], tris, owner[order]
 
 
 #: Projections of a 3D field: view name -> (axis averaged over, horizontal axis,
@@ -208,6 +245,7 @@ def mesh_svg(
     """
     data = np.load(npz_path)
     nodes, quads, drawn = _side_view(data["nodes"], data["cells"])
+    n_cells = int(data["cells"].shape[0])
     passive = data["passive"][drawn] if "passive" in data else np.zeros(len(quads), dtype=bool)
     if "fixed_nodes" in data:
         fixed = data["fixed_nodes"]
@@ -309,7 +347,9 @@ def mesh_svg(
     # dimension labels
     parts.append(
         f'<text class="lbl" x="{width / 2:.2f}" y="{height - 12:.2f}" text-anchor="middle">'
-        f'L = {span_x:g} mm, {int(quads.shape[0])} elements</text>'
+        f'L = {span_x:g} mm, {n_cells} elements'
+        + (f' ({int(quads.shape[0])} front facets drawn)' if quads.shape[0] != n_cells else '')
+        + '</text>'
     )
     parts.append(
         f'<text class="lbl" x="{pad - 14:.2f}" y="{height / 2:.2f}" text-anchor="middle" '
@@ -513,6 +553,19 @@ def density_svg(
     nodes, cells = mesh_data["nodes"], mesh_data["cells"]
     densities = np.asarray(np.load(density_npz)["densities"], dtype=float)
     footer = f"{densities.size} design variables, one density per element"
+    if nodes.shape[1] == 3 and cells.shape[1] in (4, 10):  # tetrahedra: the front surface
+        xy, tris, owner = _side_view(nodes, cells)
+        caption = "front surface (z = min), each facet shaded by its element"
+        return _quad_field_svg(
+            nodes=xy,
+            quads=tris,
+            bins=_density_bins(densities[owner], n_steps),
+            width=width,
+            pad=pad,
+            n_steps=n_steps,
+            aria=f"Optimized density, {caption}",
+            footer=f"{caption} — {footer}",
+        )
     if cells.shape[1] != 8:
         return _quad_field_svg(
             nodes=nodes,
@@ -949,8 +1002,9 @@ def _cad_section(
             " rendered by <code>topocombo.cadview</code>"
             + (
                 ". The structured grid covers its envelope and holds the elements outside the"
-                " part void; the body-fitted mesh follows it exactly."
-                if cut_away else " — the exact shape Gmsh meshed."
+                " part void."
+                if cut_away and params.get("mesh", {}).get("mode") == "structured"
+                else " — the exact shape Gmsh meshed."
             )
             + "</figcaption>"
             "</figure>"
@@ -1098,6 +1152,7 @@ def render_html(
     history: list[dict[str, float]] | None = None,
     cad_image: str | None = None,
     topology_image: str | None = None,
+    nav: list[tuple[str, str]] | None = None,
 ) -> str:
     params = run.get("params", {})
     domain = params.get("domain", {})
@@ -1109,6 +1164,7 @@ def render_html(
     noun = label.split(" ", 1)[-1]
     plural = el.plural if el else noun + "s"
     fitted = mesh.get("mode", "structured") == "body-fitted"
+    tets = (el is not None and el.cell_type.startswith("tetra")) or "tetra" in label.lower()
     meshed_as = f"{'body-fitted' if fitted else 'structured'} {plural}"
     solved_as = "a 3D solid problem" if three_d else "a plane-stress problem"
     env = run.get("environment", {})
@@ -1245,11 +1301,14 @@ def render_html(
                 "<figure>"
                 + density_figure
                 + _ramp_legend([0.0, 1.0], "element density x (0 = void, 1 = solid)")
-                + "<figcaption>The optimizer keeps material where it carries load: flanges top"
-                " and bottom, a triangulated web, and members converging on the clamped edge and"
-                " the load point. Intermediate densities are the \u201cgrey\u201d that SIMP's penalty"
-                " pushes towards 0 or 1 — the Mnd figure above says how much of it is left."
-                "</figcaption>"
+                + "<figcaption>The optimizer keeps material where it carries load, in members"
+                " running from the load to the constrained region; for the cantilever that is"
+                " flanges top and bottom with a triangulated web. Intermediate densities are the"
+                " \u201cgrey\u201d that SIMP's penalty pushes towards 0 or 1 — the Mnd figure above"
+                " says how much of it is left."
+                + (" A tetrahedral mesh is shown by its front surface only; the solid below"
+                   " shows the design in 3D." if tets else "")
+                + "</figcaption>"
                 "</figure>"
             )
         topology_fig = ""
@@ -1299,6 +1358,7 @@ def render_html(
     Every number and figure below comes from the artifacts this run wrote to disk.
   </p>
   <div class="meta">{''.join(f"<span class='chip'>{_e(c)}</span>" for c in chips)}</div>
+  {("<nav class='meta' aria-label='Other runs'>" + "".join(f"<a class='chip' href='{_e(href)}'>{_e(label)}</a>" for label, href in nav) + "</nav>") if nav else ""}
 </header>
 
 <h2>Result</h2>
@@ -1349,8 +1409,11 @@ def render_html(
 """
 
 
-def build_site(run_dir: Path, site_dir: Path) -> Path:
-    """Render ``run_dir`` into a self-contained static site at ``site_dir``."""
+def build_site(run_dir: Path, site_dir: Path, nav: list[tuple[str, str]] | None = None) -> Path:
+    """Render ``run_dir`` into a self-contained static site at ``site_dir``.
+
+    ``nav`` adds links to other reports, as (label, relative URL) pairs.
+    """
     run_dir = Path(run_dir)
     site_dir = Path(site_dir)
     run = json.loads((run_dir / "run.json").read_text())
@@ -1405,7 +1468,8 @@ def build_site(run_dir: Path, site_dir: Path) -> Path:
     index = site_dir / "index.html"
     index.write_text(
         render_html(
-            run, svg, copied, solve_figure, density_figure, history, cad_image, topology_image
+            run, svg, copied, solve_figure, density_figure, history, cad_image, topology_image,
+            nav,
         )
     )
     return index

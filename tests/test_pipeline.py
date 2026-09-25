@@ -1410,8 +1410,6 @@ def test_a_part_face_is_a_2d_domain():
     "body, message",
     [
         ("result = cq.Workplane('XY').box(6, 2, 1)", "origin"),
-        ("result = cq.Workplane('XY').box(6, 2, 1, centered=False).edges('|X').fillet(0.2)",
-         "prism"),
         ("result = cq.Workplane('XY').box(2, 2, 1, centered=False)"
          ".add(cq.Workplane('XY').box(2, 2, 1, centered=False).translate((4, 0, 0)).val())",
          "one connected"),
@@ -1421,7 +1419,7 @@ def test_a_part_face_is_a_2d_domain():
         ("result = cq.Workplane('XY').box(6, 2, 1, centered=False)\n"
          "regions = {'none': result.faces('%SPHERE')}", "selects nothing"),
     ],
-    ids=["off-origin", "not-a-prism", "two-solids", "no-result", "solid-region", "empty-region"],
+    ids=["off-origin", "two-solids", "no-result", "solid-region", "empty-region"],
 )
 def test_a_part_the_pipeline_cannot_use_is_rejected(body, message):
     with pytest.raises(ValueError, match=message):
@@ -1624,3 +1622,185 @@ def test_an_inverted_element_is_refused():
     el = E.QUAD4
     with pytest.raises(ValueError, match="non-positive Jacobian"):
         E.stiffness(el, el.reference_nodes[list(el.flip)][None], Material().stiffness_matrix(2))
+
+
+@pytest.mark.parametrize("el, order", [(E.TET4, 1), (E.TET10, 2), (E.HEX8, 1), (E.QUAD4, 1)],
+                         ids=["tet4", "tet10", "hex8", "quad4"])
+def test_element_reproduces_complete_polynomial_fields(el, order):
+    """Nodal values of a polynomial field of the element's order give exactly its
+    strain at any point: this checks the shape functions and the mid-node order."""
+    rng = np.random.default_rng(3)
+    a = np.eye(el.dim) + 0.2 * rng.random((el.dim, el.dim))  # a distorted, straight element
+    coords = el.reference_nodes @ a.T
+    c1 = rng.random((el.dim, el.dim))  # u_i = c1_ij x_j + c2_ijk x_j x_k
+    c2 = rng.random((el.dim, el.dim, el.dim)) * (order == 2)
+    u = coords @ c1.T + np.einsum("ijk,nj,nk->ni", c2, coords, coords)
+    for point in el.quadrature[0]:
+        b, _ = E.strain_displacement(el, coords[None], point)
+        # the physical point: coords = reference @ A^T, so the map is x = A xi
+        x = point @ a.T
+        grad = c1 + np.einsum("ijk,k->ij", c2, x) + np.einsum("ijk,j->ik", c2, x)  # du_i/dx_j
+        strain = b[0] @ u.reshape(-1)
+        if el.dim == 3:
+            expect = [grad[0, 0], grad[1, 1], grad[2, 2], grad[0, 1] + grad[1, 0],
+                      grad[1, 2] + grad[2, 1], grad[2, 0] + grad[0, 2]]
+        else:
+            expect = [grad[0, 0], grad[1, 1], grad[0, 1] + grad[1, 0]]
+        assert strain == pytest.approx(expect, abs=1e-10)
+
+
+def test_tet10_face_and_edge_loads_are_consistent():
+    """A uniform load on one 6-node face goes wholly to its mid-nodes, a third
+    each; along a quadratic edge it splits 1/6, 1/6, 2/3."""
+    el = E.TET10
+    nodes, cells = el.reference_nodes, np.arange(10)[None]
+    face = np.array(el.facets[0])  # the z = 0 face
+    shares = node_shares(nodes, cells, "tetra10", face, 2, "base")
+    assert shares == pytest.approx([0, 0, 0, 1 / 3, 1 / 3, 1 / 3])
+    edge = np.array([0, 1, 4])  # corners 0, 1 and their mid-node
+    shares = node_shares(nodes, cells, "tetra10", edge, 1, "edge")
+    assert shares == pytest.approx([1 / 6, 1 / 6, 2 / 3])
+
+
+# --------------------------------------------------------------------------
+# tetrahedra: meshing any 3D part, T10 accuracy, solvers
+# --------------------------------------------------------------------------
+from topocombo.fea import SOLVERS, rigid_body_modes  # noqa: E402
+from topocombo.meshing import generate_tet_mesh  # noqa: E402
+
+BRACKET = Path(__file__).resolve().parents[1] / "examples" / "bracket"
+
+
+def _tet_beam_run(tmp, element, size=1.0, **kw):
+    domain = BeamDomain3D(length=24.0, height=8.0, width=2.0)
+    spec = MeshSpec3D(mode="body-fitted", size=size, element=E.BY_NAME[element])
+    return run(domain=domain, spec=spec, out_dir=tmp, optimize_design=False, echo=False, **kw)
+
+
+@pytest.fixture(scope="module")
+def tet_beams(tmp_path_factory):
+    out = {}
+    for element in ("tet10", "tet4"):
+        _, out[element] = _tet_beam_run(tmp_path_factory.mktemp(element), element)
+    hex_domain = BeamDomain3D(length=24.0, height=8.0, width=2.0)
+    _, out["hex8"] = run(domain=hex_domain, spec=MeshSpec3D(nelx=96, nely=32, nelz=4),
+                         out_dir=tmp_path_factory.mktemp("hexref"), optimize_design=False,
+                         echo=False)
+    return out
+
+
+def test_tet_meshes_pass_validation_and_balance_the_load(tet_beams):
+    for element in ("tet10", "tet4"):
+        summary = tet_beams[element]
+        assert summary["all_checks_passed"], summary["checks"]
+        assert summary["tet_quality_min"] > 0.1
+        assert summary["solve"]["reactions"] == pytest.approx([0.0, 1000.0, 0.0], abs=1e-6)
+
+
+def test_tet10_matches_a_fine_hex_mesh_and_tet4_is_stiffer(tet_beams):
+    """Quadratic tets at 1 mm agree with a 4x-refined hex mesh to ~1%; linear
+    tets of the same size are too stiff in bending (shear locking; ~5% here)."""
+    c10 = tet_beams["tet10"]["solve"]["compliance"]
+    c8 = tet_beams["hex8"]["solve"]["compliance"]
+    c4 = tet_beams["tet4"]["solve"]["compliance"]
+    assert c10 == pytest.approx(c8, rel=0.015)
+    assert c4 < 0.97 * c10
+
+
+def test_tet_mesher_imprints_a_load_line_across_a_face(tet_beams):
+    """The beam's load region is a line across the free end, not a CAD edge;
+    fused into the solid it carries corner and mid-edge nodes (width 2 at 1 mm:
+    3 corners, 2 mid-nodes), shared 1/6-2/3-1/6 per segment."""
+    summary = tet_beams["tet10"]
+    assert len(summary["load_nodes"]) == 5
+    shares = sorted(summary["solve"]["load"]["shares"])
+    assert shares == pytest.approx([1 / 12, 1 / 12, 1 / 6, 1 / 3, 1 / 3])
+
+
+def test_hex8_refuses_a_part_that_is_not_a_prism_and_tet10_meshes_it(tmp_path):
+    loaded = load_study(BRACKET / "study.py")
+    assert loaded.domain.dim == 3 and not loaded.domain.is_prism
+    with pytest.raises(ValueError, match="tet10"):
+        run(domain=loaded.domain, spec=StudyMesh(mode="body-fitted").spec(3),
+            out_dir=tmp_path / "hex", constraints=loaded.study.constraints,
+            loads=loaded.study.loads, echo=False)
+    _, summary = run(
+        domain=loaded.domain, spec=StudyMesh(element="tet10", size=4.0).spec(3),
+        out_dir=tmp_path / "tet", constraints=loaded.study.constraints,
+        loads=loaded.study.loads, simp=SimpParams(volume_fraction=0.3, max_iterations=4,
+                                                  filter_radius=6.0),
+        echo=False,
+    )
+    assert summary["all_checks_passed"]
+    assert summary["solve"]["reactions"][1] == pytest.approx(1000.0, rel=1e-9)
+    # the load hangs on the pin's bore: every loaded node is on the hole's radius
+    nodes = np.load(tmp_path / "tet" / "mesh" / "mesh.npz")["nodes"]
+    r = np.hypot(nodes[summary["load_nodes"], 0] - 52.0, nodes[summary["load_nodes"], 1] - 15.0)
+    assert np.allclose(r, 3.0, atol=1e-6)
+    assert summary["optimization"]["volume_fraction"] == pytest.approx(0.3, abs=1e-6)
+    # the STL is closed: every triangle edge is shared by an even number of
+    # triangles — two, or four where two solid elements touch along an edge only
+    # (its volume differs slightly from the elements': mid-nodes on the curved
+    # bore make those elements curved, the STL flattens them into sub-triangles)
+    tri = meshio.read(str(tmp_path / "tet" / "optimization" / "topology.stl"))
+    points, triangles = _weld(tri.points, tri.cells_dict["triangle"])
+    edges = np.sort(triangles[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+    _, counts = np.unique(edges, axis=0, return_counts=True)
+    assert np.all(counts % 2 == 0) and np.mean(counts == 2) > 0.9
+
+
+def test_mesh_specs_reject_tets_on_a_grid_or_in_2d():
+    with pytest.raises(ValueError, match="body-fitted"):
+        MeshSpec3D(element=E.TET10)  # structured by default
+    with pytest.raises(ValueError, match="3D elements"):
+        MeshSpec3D(mode="body-fitted", element=E.QUAD4)
+    with pytest.raises(SystemExit):
+        cli_main(["run", "--dim", "2", "--element", "tet10", "--out", "unused"])
+
+
+def test_cg_and_direct_solves_agree(tmp_path):
+    _, direct = _tet_beam_run(tmp_path / "d", "tet10", size=2.0, solver="direct")
+    _, cg = _tet_beam_run(tmp_path / "c", "tet10", size=2.0, solver="cg")
+    assert direct["solve"]["solver"] == "direct" and cg["solve"]["solver"] == "amg-cg"
+    assert cg["solve"]["solver_iterations"] > 0
+    assert cg["solve"]["compliance"] == pytest.approx(direct["solve"]["compliance"], rel=1e-8)
+    assert "auto" in SOLVERS
+
+
+def test_rigid_body_modes_are_the_stiffness_nullspace():
+    for el in ALL_ELEMENTS:
+        mesh = Mesh(_distorted(el), np.arange(el.n_nodes)[None], {}, el.cell_type)
+        k = element_stiffnesses(mesh, Material(), 1.0)[0]
+        assert np.abs(k @ rigid_body_modes(mesh)).max() < 1e-9 * np.abs(k).max()
+
+
+def test_cached_assembly_equals_a_fresh_coo_assembly(coarse_run):
+    import scipy.sparse as sp
+
+    mesh = load_mesh(coarse_run["dir"] / "mesh" / "beam.msh")
+    ke = element_stiffnesses(mesh, Material(), 1.0)
+    scale = np.linspace(0.1, 1.0, mesh.n_elements)
+    k1 = assemble_stiffness(mesh, ke, scale)
+    k2 = assemble_stiffness(mesh, ke, scale)  # from the cached plan
+    dofs = element_dofs(mesh.cells, 2)
+    n = dofs.shape[1]
+    ref = sp.coo_matrix(
+        ((ke * scale[:, None, None]).reshape(-1),
+         (np.repeat(dofs, n, axis=1).reshape(-1), np.tile(dofs, (1, n)).reshape(-1))),
+        shape=k1.shape,
+    ).tocsc()
+    assert abs(k1 - ref).max() < 1e-12 * abs(ref).max()
+    assert abs(k2 - ref).max() < 1e-12 * abs(ref).max()
+
+
+def test_report_draws_a_tet_run_by_its_front_surface(tmp_path):
+    _tet_beam_run(tmp_path / "run", "tet10", size=2.0)
+    html = build_site(run_dir=tmp_path / "run", site_dir=tmp_path / "site").read_text()
+    assert "front facets drawn" in html and "T10 tetrahedron" in html
+    assert "body-fitted quadratic tetrahedra" in html
+
+
+def test_reports_link_to_each_other(coarse_run, tmp_path):
+    html = build_site(run_dir=coarse_run["dir"], site_dir=tmp_path / "site",
+                      nav=[("bracket (tet10)", "bracket/")]).read_text()
+    assert "<a class='chip' href='bracket/'>bracket (tet10)</a>" in html

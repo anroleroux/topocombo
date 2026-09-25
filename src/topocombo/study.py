@@ -20,8 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .elements import ELEMENTS as _REGISTRY
-from .fea import Material
+from .elements import BY_NAME as _BY_NAME, ELEMENTS as _REGISTRY
+from .fea import SOLVERS, Material
 from .geometry import CadDomain
 from .meshing import MESH_MODES, MeshSpec, MeshSpec3D
 from .optimize import SimpParams
@@ -43,8 +43,10 @@ class Mesh:
     ``body-fitted`` (the default) meshes the real profile at element edge
     ``size`` (default ``min(L / nelx, H / nely)``); ``structured`` lays an
     ``nelx`` x ``nely`` grid over the bounding box and holds the cells outside
-    the part void.  In 3D, ``layers`` hexahedra go through the width.
-    ``element`` defaults to ``quad4`` in 2D and ``hex8`` in 3D.
+    the part void.  ``element`` defaults to ``quad4`` in 2D and ``hex8`` in
+    3D, where ``layers`` hexahedra go through the width of a prismatic part.
+    ``tet10`` (quadratic, recommended) or ``tet4`` (linear, stiff in bending)
+    mesh any 3D part with tetrahedra of edge ``size``, body-fitted only.
     """
 
     mode: str = "body-fitted"
@@ -71,10 +73,9 @@ class Mesh:
         if element not in ELEMENTS[dim]:
             raise ValueError(f"a {dim}D part takes {', '.join(ELEMENTS[dim])} elements, not {element}")
         common = {"nelx": self.nelx, "nely": self.nely, "mode": self.mode, "size": self.size}
-        spec = MeshSpec3D(nelz=self.layers, **common) if dim == 3 else MeshSpec(**common)
-        if spec.element.name != element:  # pragma: no cover - one element per dimension today
-            raise ValueError(f"no mesher for {element} elements yet")
-        return spec
+        if dim == 3:
+            return MeshSpec3D(nelz=self.layers, element=_BY_NAME[element], **common)
+        return MeshSpec(**common)
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,9 @@ class Study:
     material: Material = field(default_factory=Material)
     optimize: SimpParams | None = field(default_factory=SimpParams)
     thickness: float = 1.0  # 2D only: plane-stress out-of-plane size, mm
+    #: linear solver: "auto" (direct up to 30k free DOFs, multigrid CG above),
+    #: "direct" or "cg"
+    solver: str = "auto"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "constraints", tuple(self.constraints))
@@ -140,6 +144,8 @@ class Study:
             raise ValueError("Study.optimize must be a SimpParams(...) or None")
         if not self.thickness > 0:
             raise ValueError("Study.thickness must be positive")
+        if self.solver not in SOLVERS:
+            raise ValueError(f"Study.solver must be one of {', '.join(SOLVERS)}")
 
     @property
     def regions_used(self) -> list[str]:
@@ -206,4 +212,5 @@ def run_study(path: Path, out_dir: Path, echo: bool = True) -> tuple[Any, dict[s
         loads=s.loads,
         study=loaded,
         echo=echo,
+        solver=s.solver,
     )

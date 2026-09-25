@@ -234,6 +234,22 @@ def _in_plane_edge_ratio(mesh: Mesh) -> np.ndarray:
     return np.nanmax(lengths, axis=1) / np.nanmin(lengths, axis=1)
 
 
+#: Tetrahedra: the lowest acceptable shape quality ``6 sqrt(2) V / l_rms^3``
+#: (1 for a regular tetrahedron, 0 for a flat one); Gmsh's optimised meshes
+#: stay well above it.
+TET_QUALITY_MIN = 0.1
+
+
+def tet_quality(mesh: Mesh) -> np.ndarray:
+    """Shape quality of every tetrahedron from its corners: ``6 sqrt(2) V /
+    l_rms^3``, 1 for a regular one and 0 for a flat one."""
+    p = mesh.nodes[mesh.cells[:, :4]]
+    vol = np.einsum("ij,ij->i", np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), p[:, 3] - p[:, 0]) / 6
+    a, b = np.array(mesh.element.edges).T
+    l_rms = np.sqrt((np.linalg.norm(p[:, b] - p[:, a], axis=2) ** 2).mean(axis=1))
+    return 6.0 * np.sqrt(2.0) * vol / l_rms**3
+
+
 #: Body-fitted checks: the meshed measure may differ from the CAD one by the
 #: chordal error of straight element edges on curved boundaries, and no element
 #: may be stretched past this edge-length ratio in the x-y plane (extruded
@@ -270,7 +286,11 @@ def check_mesh(
 
     rtol = FITTED_MEASURE_RTOL if fitted else 1e-6
     checks = {}
-    if fitted:
+    tets = mesh.cell_type.startswith("tetra")
+    quality = tet_quality(mesh) if tets else None
+    if tets:
+        checks[f"tet_quality_above_{TET_QUALITY_MIN:g}"] = bool(quality.min() > TET_QUALITY_MIN)
+    elif fitted:
         checks[f"edge_ratio_below_{FITTED_EDGE_RATIO_MAX:g}"] = bool(
             _in_plane_edge_ratio(mesh).max() < FITTED_EDGE_RATIO_MAX
         )
@@ -302,6 +322,8 @@ def check_mesh(
         "edge_length_min": float(edges.min()),
         "edge_length_max": float(edges.max()),
         "aspect_ratio_max": float(aspect.max()),
+        **({"tet_quality_min": float(quality.min()), "tet_quality_mean": float(quality.mean())}
+           if tets else {}),
         "bounding_box": [float(v) for v in (*lower, *upper)],
         "node_sets": {name: int(idx.size) for name, idx in mesh.node_sets.items()},
         "checks": checks,

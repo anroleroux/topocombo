@@ -30,10 +30,13 @@ jobs:
           cache: pip
 
       # gmsh ships a shared library that links against GLU even in headless use.
-      - name: Install system libraries for gmsh
+      # CalculiX (ccx): the cantilever runs its SIMP loop on it, and every
+      # example cross-checks against it.
+      - name: Install system libraries for gmsh, and CalculiX
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libglu1-mesa libxrender1 libxcursor1 libxft2 libxinerama1
+          sudo apt-get install -y -qq libglu1-mesa libxrender1 libxcursor1 libxft2 libxinerama1 \
+            calculix-ccx
 
       - name: Install topocombo
         run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
@@ -41,22 +44,43 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
-      # The published run is the 3D cantilever, one hexahedron through the width
-      # to keep the job light; the 2D path is still covered by the tests.  The
-      # CadQuery inputs come from the example config, which the report prints,
-      # and the mesh is body-fitted: it follows the cutout rather than holding
-      # grid cells void (--mesh-size defaults to L/nelx = 1 mm).
-      - name: Run the pipeline and render the report
+      # Five example studies, each a CadQuery part with named regions plus a
+      # study script; the reports print both, and each cross-checks against
+      # CalculiX.  The cantilever (hexahedra, clamped, solved by CalculiX) is
+      # the main page; the bracket (not a prism: quadratic tetrahedra, two
+      # load cases, passive solid rings) is at bracket/; the
+      # half MBB beam (symmetry and roller supports) is at mbb/; the L-bracket
+      # (the lightest design within a stress limit, by MMA) at lbracket/; the
+      # bridge (a pier that settles in one load case, MMA with Heaviside
+      # projection) at bridge/.
+      - name: Run the pipeline and render the reports
         run: |
-          python -m topocombo.cli all --cad-config examples/cantilever3d.toml \
-            --mesh body-fitted --nelx 60 --nely 20 --nelz 1 \
-            --out results/cantilever --site site
+          python -m topocombo.cli all --study examples/cantilever/study.py \
+            --out results/cantilever --site site \
+            --nav "bracket (tet10)=bracket/" --nav "MBB beam (symmetry)=mbb/" \
+            --nav "L-bracket (stress, MMA)=lbracket/" --nav "bridge (settling pier)=bridge/"
+          python -m topocombo.cli all --study examples/bracket/study.py \
+            --out results/bracket --site site/bracket \
+            --nav "cantilever (hex8)=../" --nav "MBB beam (symmetry)=../mbb/" \
+            --nav "L-bracket (stress, MMA)=../lbracket/" --nav "bridge (settling pier)=../bridge/"
+          python -m topocombo.cli all --study examples/mbb/study.py \
+            --out results/mbb --site site/mbb \
+            --nav "cantilever (hex8)=../" --nav "bracket (tet10)=../bracket/" \
+            --nav "L-bracket (stress, MMA)=../lbracket/" --nav "bridge (settling pier)=../bridge/"
+          python -m topocombo.cli all --study examples/lbracket/study.py \
+            --out results/lbracket --site site/lbracket \
+            --nav "cantilever (hex8)=../" --nav "bracket (tet10)=../bracket/" \
+            --nav "MBB beam (symmetry)=../mbb/" --nav "bridge (settling pier)=../bridge/"
+          python -m topocombo.cli all --study examples/bridge/study.py \
+            --out results/bridge --site site/bridge \
+            --nav "cantilever (hex8)=../" --nav "bracket (tet10)=../bracket/" \
+            --nav "MBB beam (symmetry)=../mbb/" --nav "L-bracket (stress, MMA)=../lbracket/"
 
       - name: Upload run artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: cantilever-run
-          path: results/cantilever
+          name: example-runs
+          path: results
           if-no-files-found: error
 
       - name: Upload the site for Pages

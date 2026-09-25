@@ -34,13 +34,21 @@ The CadQuery input is explicit: each domain writes itself out as a standalone
 CadQuery script (:meth:`BeamDomain.cadquery_script`), and the shape is built by
 running exactly that script.  The script is exported next to the BREP/STEP
 files and shown in the report, so what went into CadQuery is never implicit —
-and it opens as-is in CQ-editor.  :func:`load_cad_config` reads the domain
-parameters from a JSON or TOML file, rejecting any key it does not know.
+and it opens as-is in CQ-editor.
+
+:class:`CadDomain` takes the CadQuery input as code: a part script that
+assigns the part to ``result`` — a planar face in the x-y plane (2D) or a
+solid (3D; a prism along z for hexahedra, anything for tetrahedra) — and
+names where it is held and loaded in
+``regions``.  Nothing downstream reads parameters from it: the extent, the
+material area or volume, the profile Gmsh meshes, which grid cells lie outside
+the part and which nodes carry the boundary conditions all come from the
+shapes the script built.  The parametric beams bring their own regions:
+``fixed`` (the x = 0 edge or face) and ``load`` (the tip-load point or line).
 """
 
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass, asdict, field, replace
 from pathlib import Path
@@ -49,6 +57,11 @@ from typing import Any
 import numpy as np
 
 import cadquery as cq
+
+
+#: Region names of the parametric beam: its clamp and its tip load.
+BEAM_FIXED = "fixed"
+BEAM_LOAD = "load"
 
 
 @dataclass(frozen=True)
@@ -68,6 +81,13 @@ class BeamDomain:
         if self.length <= 0 or self.height <= 0 or self.thickness <= 0:
             raise ValueError("length, height and thickness must be positive")
         object.__setattr__(self, "holes", _check_holes(self.holes, self.length, self.height))
+
+    dim = 2
+    is_prism = True
+
+    @property
+    def has_cutouts(self) -> bool:
+        return bool(self.holes)
 
     @property
     def aspect_ratio(self) -> float:
@@ -124,6 +144,17 @@ class BeamDomain:
         """The domain as built by running :meth:`cadquery_script`."""
         return run_cadquery_script(self.cadquery_script())
 
+    def regions(self) -> dict[str, cq.Shape]:
+        """The cantilever's regions: the clamped edge x = 0 (``fixed``) and the
+        tip-load point at mid-height of the free edge (``load``)."""
+        return {
+            BEAM_FIXED: cq.Workplane("XY").add(self.face()).edges("<X").val(),
+            BEAM_LOAD: cq.Vertex.makeVertex(*self.load_point, 0.0),
+        }
+
+    def profile(self) -> cq.Face:
+        return self.face()
+
     def face(self) -> cq.Face:
         """The planar face representing the design domain."""
         face = self.workplane().val()
@@ -145,6 +176,13 @@ class BeamDomain3D:
         if self.length <= 0 or self.height <= 0 or self.width <= 0:
             raise ValueError("length, height and width must be positive")
         object.__setattr__(self, "holes", _check_holes(self.holes, self.length, self.height))
+
+    dim = 3
+    is_prism = True
+
+    @property
+    def has_cutouts(self) -> bool:
+        return bool(self.holes)
 
     @property
     def aspect_ratio(self) -> float:
@@ -210,6 +248,263 @@ class BeamDomain3D:
         if not isinstance(solid, cq.Solid):  # pragma: no cover - script invariant
             raise TypeError(f"the 3D CadQuery script built a {type(solid).__name__}, not a Solid")
         return solid
+
+    def profile(self) -> cq.Face:
+        """The x-y cross-section at z = 0 — what the body-fitted mesh extrudes."""
+        return BeamDomain(length=self.length, height=self.height, holes=self.holes).face()
+
+    def regions(self) -> dict[str, cq.Shape]:
+        """The cantilever's regions: the clamped face x = 0 (``fixed``) and the
+        tip-load line at mid-height of the free end, across the width (``load``)."""
+        start, end = self.load_line
+        return {
+            BEAM_FIXED: cq.Workplane("XY").add(self.solid()).faces("<X").val(),
+            BEAM_LOAD: cq.Edge.makeLine(cq.Vector(*start), cq.Vector(*end)),
+        }
+
+
+#: Relative tolerance on the part's placement and on the prism check.
+_CAD_RTOL = 1e-6
+
+
+@dataclass(frozen=True)
+class CadDomain:
+    """A design domain given as code: a CadQuery part script.
+
+    The script assigns the part to ``result`` and names the places where
+    constraints and loads will act in a ``regions`` dict — vertices, edges or
+    faces, picked from the part with selectors or built on their own::
+
+        result = cq.Workplane("XY").box(60, 20, 1, centered=False)
+        regions = {"mount": result.faces("<X"), "tip": result.faces(">X")}
+
+    The shape decides the dimension: a planar face in the x-y plane is a 2D
+    plane-stress domain (``thickness`` is the solver's out-of-plane size), a
+    solid is a 3D domain.  Tetrahedra mesh any solid; hexahedra are extruded
+    from the x-y profile, so they need a prism along z (:attr:`is_prism`).
+    The part's bounding box must start at the origin.
+
+    ``length``, ``height`` and ``width`` are the bounding box; ``area`` /
+    ``volume`` are the envelope's and ``material_area`` / ``material_volume``
+    the shape's own, so whatever the script cut away counts as a cutout.
+    """
+
+    source: str
+    path: str | None = None
+    thickness: float = 1.0
+    _shape: cq.Shape = field(init=False, repr=False, compare=False)
+    _regions: dict = field(init=False, repr=False, compare=False)
+    _prism: str | None = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        from .regions import as_shape
+
+        if not self.thickness > 0:
+            raise ValueError("thickness must be positive")
+        where = self.path or "the CadQuery script"
+        namespace = _exec_script(self.source, self.path or "design_domain.py")
+        shape = _single_shape(_result(namespace), where)
+        bb = shape.BoundingBox()
+        size = max(bb.xlen, bb.ylen, bb.zlen)
+        if max(abs(bb.xmin), abs(bb.ymin), abs(bb.zmin)) > _CAD_RTOL * size:
+            raise ValueError(
+                f"{where}: the part's bounding box must start at the origin, not at "
+                f"({bb.xmin:g}, {bb.ymin:g}, {bb.zmin:g}); move it with .translate()"
+            )
+        object.__setattr__(self, "_shape", shape)
+        if isinstance(shape, cq.Face):
+            if bb.zlen > _CAD_RTOL * size:
+                raise ValueError(f"{where}: a 2D part must be a face in the x-y plane (z = 0)")
+        object.__setattr__(self, "_prism", self._prism_check())
+        raw = namespace.get("regions", {})
+        if not isinstance(raw, dict) or not all(isinstance(k, str) for k in raw):
+            raise ValueError(f"{where}: `regions` must be a dict of name -> CadQuery geometry")
+        try:
+            regions = {name: as_shape(value, name) for name, value in raw.items()}
+        except ValueError as exc:
+            raise ValueError(f"{where}: {exc}") from None
+        object.__setattr__(self, "_regions", regions)
+
+    def _prism_check(self) -> str | None:
+        """None when the part is a prism along z (a 2D face always is);
+        otherwise why not — what an extruded hex mesh would get wrong."""
+        if isinstance(self._shape, cq.Face):
+            return None
+        tol = _CAD_RTOL * self._shape.BoundingBox().xlen
+        faces = [
+            f for f in self._shape.Faces()
+            if f.BoundingBox().zlen <= tol and abs(f.Center().z) <= tol
+        ]
+        if len(faces) != 1:
+            return f"it has {len(faces)} planar faces at z = 0, not one"
+        prism = faces[0].Area() * self._shape.BoundingBox().zlen
+        if abs(prism - self._shape.Volume()) > _CAD_RTOL * prism:
+            return (
+                f"its z = 0 face swept through the width gives {prism:.6g} mm^3, "
+                f"the solid has {self._shape.Volume():.6g} mm^3"
+            )
+        return None
+
+    @property
+    def is_prism(self) -> bool:
+        """True when the part is its z = 0 face swept through the width — what
+        extruded hexahedra need.  Tetrahedra mesh any solid."""
+        return self._prism is None
+
+    @property
+    def dim(self) -> int:
+        return 3 if isinstance(self._shape, cq.Solid) else 2
+
+    @property
+    def length(self) -> float:
+        return self._shape.BoundingBox().xlen
+
+    @property
+    def height(self) -> float:
+        return self._shape.BoundingBox().ylen
+
+    @property
+    def width(self) -> float:
+        """Extent along z; 0 for a 2D part."""
+        return self._shape.BoundingBox().zlen if self.dim == 3 else 0.0
+
+    @property
+    def holes(self) -> tuple[tuple[float, float, float], ...]:
+        """No parametric cutouts: whatever the script removed is in the shape."""
+        return ()
+
+    @property
+    def aspect_ratio(self) -> float:
+        return self.length / self.height
+
+    @property
+    def area(self) -> float:
+        """Area of the L x H envelope."""
+        return self.length * self.height
+
+    @property
+    def material_area(self) -> float | None:
+        """Area of the part's x-y profile; None for a 3D part that is no prism."""
+        return self.profile().Area() if self.is_prism else None
+
+    @property
+    def volume(self) -> float:
+        return self.area * self.width
+
+    @property
+    def material_volume(self) -> float:
+        return self._shape.Volume() if self.dim == 3 else 0.0
+
+    @property
+    def has_cutouts(self) -> bool:
+        """True when the part does not fill its bounding box."""
+        if self.dim == 3:
+            return self.material_volume < self.volume * (1 - _CAD_RTOL)
+        return self.material_area < self.area * (1 - _CAD_RTOL)
+
+    def envelope(self) -> BeamDomain | BeamDomain3D:
+        """The bounding box as a plain beam: what the structured grid covers."""
+        if self.dim == 3:
+            return BeamDomain3D(length=self.length, height=self.height, width=self.width)
+        return BeamDomain(length=self.length, height=self.height, thickness=self.thickness)
+
+    def void_mask(self, centroids: np.ndarray) -> np.ndarray:
+        """True for elements whose centroid lies outside the part's x-y profile."""
+        return ~_in_face(self.profile(), centroids)
+
+    def regions(self) -> dict[str, cq.Shape]:
+        """The named regions of the part script, as shapes."""
+        return dict(self._regions)
+
+    def as_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "source": "script",
+            "script_path": self.path,
+            "length": self.length,
+            "height": self.height,
+            "aspect_ratio": self.aspect_ratio,
+            "area": self.area,
+            "material_area": self.material_area,
+            "holes": [],
+            "regions": sorted(self._regions),
+            "prism": self.is_prism,
+        }
+        if self.dim == 3:
+            d.update(width=self.width, volume=self.volume, material_volume=self.material_volume)
+        else:
+            d["thickness"] = self.thickness
+        return d
+
+    def cadquery_script(self) -> str:
+        return self.source
+
+    def workplane(self) -> cq.Workplane:
+        return cq.Workplane("XY").add(self._shape)
+
+    def face(self) -> cq.Face:
+        if self.dim != 2:
+            raise TypeError("a 3D part has no face(); use solid() or profile()")
+        return self._shape
+
+    def solid(self) -> cq.Solid:
+        if self.dim != 3:
+            raise TypeError("a 2D part has no solid(); use face()")
+        return self._shape
+
+    def profile(self) -> cq.Face:
+        """The part's x-y cross-section at z = 0 (the face itself in 2D).
+
+        Only a prism along z has one; it is what hexahedra are extruded from.
+        """
+        if isinstance(self._shape, cq.Face):
+            return self._shape
+        if self._prism is not None:
+            raise ValueError(
+                f"{self.path or 'the CadQuery script'}: hexahedra need a prism along z, and "
+                f"this part is not one ({self._prism}); mesh it with tetrahedra "
+                "(Mesh(element='tet10'))"
+            )
+        tol = _CAD_RTOL * self._shape.BoundingBox().xlen
+        return next(
+            f for f in self._shape.Faces()
+            if f.BoundingBox().zlen <= tol and abs(f.Center().z) <= tol
+        )
+
+    @classmethod
+    def from_file(cls, path: Path, thickness: float = 1.0) -> CadDomain:
+        path = Path(path)
+        return cls(source=path.read_text(), path=str(path), thickness=thickness)
+
+
+def _single_shape(result: cq.Workplane, where: str) -> cq.Face | cq.Solid:
+    """The one face or solid a script built, unwrapped from any compound."""
+    shapes: list[cq.Shape] = []
+    for obj in result.vals():
+        if isinstance(obj, cq.Compound):
+            shapes.extend(obj.Solids() or obj.Faces())
+        elif isinstance(obj, cq.Shape):
+            shapes.append(obj)
+    if len(shapes) != 1 or not isinstance(shapes[0], (cq.Face, cq.Solid)):
+        kinds = ", ".join(type(s).__name__ for s in shapes) or "nothing"
+        raise ValueError(
+            f"{where}: `result` must be one connected face (2D) or solid (3D), not {kinds}"
+        )
+    return shapes[0]
+
+
+def _in_face(face: cq.Face, points: np.ndarray) -> np.ndarray:
+    """True for the (x, y[, z]) points whose x-y position lies inside ``face``."""
+    from OCP.BRepClass import BRepClass_FaceClassifier
+    from OCP.gp import gp_Pnt
+    from OCP.TopAbs import TopAbs_IN
+
+    points = np.asarray(points, dtype=float)
+    classifier = BRepClass_FaceClassifier()
+    inside = np.zeros(points.shape[0], dtype=bool)
+    for i, (x, y) in enumerate(points[:, :2]):
+        classifier.Perform(face.wrapped, gp_Pnt(float(x), float(y), 0.0), 1e-9)
+        inside[i] = classifier.State() == TopAbs_IN
+    return inside
 
 
 _SCRIPT_2D = '''"""Design domain of a 2D cantilever beam (plane stress), written by topocombo.
@@ -322,17 +617,33 @@ def _in_holes(holes: tuple[tuple[float, float, float], ...], centroids: np.ndarr
     return mask
 
 
-def run_cadquery_script(source: str) -> cq.Workplane:
-    """Execute a CadQuery script and return the ``result`` it defines."""
+def _exec_script(source: str, filename: str = "design_domain.py") -> dict[str, Any]:
+    """Execute a CadQuery script; return its namespace."""
     namespace: dict[str, Any] = {"__name__": "__cadquery_script__"}
-    exec(compile(source, "design_domain.py", "exec"), namespace)
+    exec(compile(source, filename, "exec"), namespace)
+    return namespace
+
+
+def _result(namespace: dict[str, Any]) -> cq.Workplane:
     result = namespace.get("result")
+    if isinstance(result, cq.Shape):
+        result = cq.Workplane("XY").add(result)
     if not isinstance(result, cq.Workplane):
-        raise ValueError("a CadQuery script must assign a cq.Workplane to `result`")
+        raise ValueError("a CadQuery script must assign a cq.Workplane or cq.Shape to `result`")
     return result
 
 
-def export_domain(domain: BeamDomain | BeamDomain3D, out_dir: Path) -> dict[str, Path]:
+def run_cadquery_script(source: str, filename: str = "design_domain.py") -> cq.Workplane:
+    """Execute a CadQuery script and return the ``result`` it defines (a
+    ``cq.Shape`` is wrapped in a workplane)."""
+    return _result(_exec_script(source, filename))
+
+
+#: Anything the pipeline can mesh.
+Domain = BeamDomain | BeamDomain3D | CadDomain
+
+
+def export_domain(domain: Domain, out_dir: Path) -> dict[str, Path]:
     """Export the design domain as its CadQuery script, BREP and STEP.
 
     With cutouts, the envelope Gmsh meshes is written too, as
@@ -352,90 +663,8 @@ def export_domain(domain: BeamDomain | BeamDomain3D, out_dir: Path) -> dict[str,
     cq.exporters.export(workplane, str(step))
 
     exported = {"script": script, "brep": brep, "step": step}
-    if domain.holes:
+    if domain.has_cutouts:
         envelope = out_dir / "design_envelope.brep"
         domain.envelope().workplane().val().exportBrep(str(envelope))
         exported["envelope"] = envelope
     return exported
-
-
-# --------------------------------------------------------------------------
-# CAD parameters from a file
-# --------------------------------------------------------------------------
-#: Keys a CAD config file may set; everything else is rejected so a typo never
-#: silently falls back to a default.
-CAD_CONFIG_KEYS = ("dim", "length", "height", "thickness", "width", "holes")
-
-
-def load_cad_config(path: Path) -> dict[str, Any]:
-    """Read CadQuery domain parameters from a ``.json`` or ``.toml`` file.
-
-    The file is flat, or keeps the parameters under a ``[cad]`` table /
-    ``"cad"`` object.  Lengths must be positive numbers and ``dim`` 2 or 3;
-    unknown keys raise :class:`ValueError`, naming the ones that are allowed.
-    ``holes`` is a list of ``{x, y, diameter}`` tables (``[[cad.holes]]`` in
-    TOML) or ``[x, y, diameter]`` triples; whether they fit is checked when the
-    domain is built.
-    """
-    path = Path(path)
-    text = path.read_text()
-    if path.suffix.lower() == ".toml":
-        try:
-            import tomllib
-        except ModuleNotFoundError:  # pragma: no cover - Python 3.10
-            raise ValueError(f"{path}: TOML needs Python 3.11+; use a .json file") from None
-        data = tomllib.loads(text)
-    elif path.suffix.lower() == ".json":
-        data = json.loads(text)
-    else:
-        raise ValueError(f"{path}: CAD config must be a .json or .toml file")
-    if isinstance(data, dict) and isinstance(data.get("cad"), dict):
-        data = data["cad"]
-    if not isinstance(data, dict):
-        raise ValueError(f"{path}: expected a table of CAD parameters")
-
-    unknown = sorted(set(data) - set(CAD_CONFIG_KEYS))
-    if unknown:
-        raise ValueError(
-            f"{path}: unknown CAD parameter(s) {', '.join(unknown)}; "
-            f"allowed: {', '.join(CAD_CONFIG_KEYS)}"
-        )
-    config: dict[str, Any] = {}
-    for key, value in data.items():
-        if key == "holes":
-            config[key] = _config_holes(path, value)
-            continue
-        if key == "dim":
-            if value not in (2, 3) or isinstance(value, bool):
-                raise ValueError(f"{path}: dim must be 2 or 3, not {value!r}")
-            config[key] = int(value)
-            continue
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError(f"{path}: {key} must be a number, not {value!r}")
-        if not value > 0:
-            raise ValueError(f"{path}: {key} must be positive, not {value!r}")
-        config[key] = float(value)
-    return config
-
-
-def _config_holes(path: Path, value: Any) -> tuple[tuple[float, float, float], ...]:
-    if not isinstance(value, list):
-        raise ValueError(f"{path}: holes must be a list, not {value!r}")
-    holes = []
-    for item in value:
-        if isinstance(item, dict):
-            unknown = sorted(set(item) - {"x", "y", "diameter"})
-            missing = sorted({"x", "y", "diameter"} - set(item))
-            if unknown or missing:
-                raise ValueError(
-                    f"{path}: a hole takes x, y and diameter"
-                    + (f"; unknown: {', '.join(unknown)}" if unknown else "")
-                    + (f"; missing: {', '.join(missing)}" if missing else "")
-                )
-            item = [item["x"], item["y"], item["diameter"]]
-        if not isinstance(item, (list, tuple)) or len(item) != 3:
-            raise ValueError(f"{path}: a hole is {{x, y, diameter}} or [x, y, diameter], not {item!r}")
-        if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in item):
-            raise ValueError(f"{path}: hole values must be numbers, not {item!r}")
-        holes.append(tuple(float(v) for v in item))
-    return tuple(holes)

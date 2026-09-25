@@ -2430,3 +2430,135 @@ def test_the_bridge_example_settles_its_pier_in_one_case(tmp_path):
     html = build_site(run_dir=tmp_path, site_dir=tmp_path / "site").read_text()
     assert "Heaviside projection" in html
     assert "case &#x27;settled&#x27; only: &#x27;middle&#x27;" in html
+
+
+# --------------------------------------------------------------------------
+# CalculiX
+# --------------------------------------------------------------------------
+from topocombo import calculix  # noqa: E402
+
+needs_ccx = pytest.mark.skipif(not calculix.available(), reason="CalculiX (ccx) not installed")
+
+
+def test_numbers_fit_calculix_fields():
+    """CalculiX reads 20 characters per number: a full-precision -7.85e-14
+    (21) was read as -0.785 and bent one element of the cantilever."""
+    for v in (-7.85196730485993e-14, 1234567.891011, -0.1, 1e-300, 210000.0 * 1e-9):
+        text = calculix._num(v)
+        assert len(text) <= 20 and float(text) == pytest.approx(v, rel=1e-12)
+
+
+def test_calculix_results_are_read_per_step():
+    dat = """
+                        S T E P       1
+
+ displacements (vx,vy,vz) for set NALL and time  0.1000000E+01
+
+         1  1.000000E+00 -2.000000E+00  0.000000E+00
+         3  3.000000E-01  4.000000E-01  0.000000E+00
+
+ forces (fx,fy,fz) for set NALL and time  0.1000000E+01
+
+         2 -5.000000E+00  6.000000E+00  0.000000E+00
+
+                        S T E P       2
+
+ displacements (vx,vy,vz) for set NALL and time  0.2000000E+01
+
+         2  7.000000E+00  8.000000E+00  0.000000E+00
+
+ forces (fx,fy,fz) for set NALL and time  0.2000000E+01
+
+         1  9.000000E+00  1.000000E+01  0.000000E+00
+"""
+    (u1, r1), (u2, r2) = calculix.read_dat(dat, 3, 2, 2)
+    assert u1.tolist() == [1.0, -2.0, 0.0, 0.0, 0.3, 0.4]
+    assert r1.tolist() == [0.0, 0.0, -5.0, 6.0, 0.0, 0.0]
+    assert u2.tolist() == [0.0, 0.0, 7.0, 8.0, 0.0, 0.0]
+    assert r2.tolist() == [9.0, 10.0, 0.0, 0.0, 0.0, 0.0]
+    with pytest.raises(RuntimeError, match="3 load cases"):
+        calculix.read_dat(dat, 3, 2, 3)
+
+
+@needs_ccx
+@pytest.mark.parametrize("element", ["tet4", "tet10"])
+def test_calculix_matches_the_built_in_solver_on_tetrahedra(tmp_path, element):
+    """The same element formulation: the pipeline's cross-check agrees to
+    CalculiX's seven printed digits."""
+    _, s = _tet_beam_run(tmp_path, element, size=2.0, crosscheck=True)
+    check = s["solve"]["crosscheck"]
+    assert check["other"] == "calculix" and check["u_rel_diff"] < 1e-5
+    assert check["compliance_rel_diff"] < 1e-5
+
+
+@needs_ccx
+def test_calculix_solves_cases_with_their_own_supports_and_its_adjoints_agree():
+    """Hexahedra, SIMP densities, a prescribed pull in one case and a prop in
+    another: displacements, compliances, reactions and an adjoint gradient
+    all match the built-in direct solver."""
+    mesh = _brick_grid(6, 2, 2)
+    left = np.flatnonzero(mesh.nodes[:, 0] == 0.0)
+    right = np.flatnonzero(mesh.nodes[:, 0] == 6.0)
+    clamp = {int(d): 0.0 for d in node_dofs(left, 3)}
+    maps = [clamp, {**clamp, **{3 * int(n): 0.01 for n in right}},
+            {**clamp, **{3 * int(n) + 1: 0.0 for n in right[:2]}}]
+    tip = int(right[np.argmax(mesh.nodes[right, 1])])
+    loads = [LoadCase(node=tip, fy=-50.0, fz=10.0)] * 3
+    rho = np.random.default_rng(5).uniform(0.2, 1.0, mesh.n_elements)
+    ke = element_stiffnesses(mesh, Material(), 1.0)
+    out = {}
+    for solver in ("direct", "calculix"):
+        res, systems = solve_cases(mesh, Material(), 1.0, loads, None, densities=rho, ke_all=ke,
+                                   prescribed=maps, solver=solver, return_system=True)
+        sel = R.displacement_selector(mesh, right, 1)
+        grads = [R.displacement(mesh, sy, r, ke, sel, rho, 3.0)[1] for sy, r in zip(systems, res)]
+        out[solver] = (res, grads, systems)
+    (a, ga, _), (b, gb, sb) = out["direct"], out["calculix"]
+    assert sb[0] is not sb[1] and all(r.solver == "calculix" for r in b)
+    for ra, rb, g1, g2 in zip(a, b, ga, gb):
+        assert np.abs(rb.u - ra.u).max() < 1e-6 * np.abs(ra.u).max()
+        assert rb.compliance == pytest.approx(ra.compliance, rel=1e-6)
+        fixed = np.flatnonzero(ra.reactions)
+        assert rb.reactions[fixed] == pytest.approx(ra.reactions[fixed], rel=1e-5, abs=1e-4)
+        assert rb.equilibrium_residual < 1e-3  # CalculiX's nodal forces balance
+        assert np.abs(g2 - g1).max() < 1e-5 * np.abs(g1).max()
+
+
+@needs_ccx
+def test_the_simp_loop_runs_on_calculix(tmp_path):
+    """Swap the solver: the same design, to CalculiX's printed digits."""
+    domain = BeamDomain3D(length=12.0, height=4.0, width=1.0)
+    spec = MeshSpec3D(nelx=12, nely=4, nelz=1)
+    simp = SimpParams(max_iterations=8)
+    _, built_in = run(domain=domain, spec=spec, out_dir=tmp_path / "a", simp=simp, echo=False)
+    _, ccx = run(domain=domain, spec=spec, out_dir=tmp_path / "b", simp=simp, echo=False,
+                 solver="calculix", crosscheck=True)
+    assert ccx["solve"]["solver"] == "calculix"
+    assert ccx["optimization"]["compliance"] == pytest.approx(
+        built_in["optimization"]["compliance"], rel=1e-5)
+    a = np.load(tmp_path / "a" / "optimization" / "density.npz")["densities"]
+    b = np.load(tmp_path / "b" / "optimization" / "density.npz")["densities"]
+    assert np.abs(a - b).max() < 1e-4
+    check = ccx["optimization"]["crosscheck"]
+    assert check["other"] == "direct" and check["u_rel_diff"] < 1e-5
+    html = build_site(run_dir=tmp_path / "b", site_dir=tmp_path / "site").read_text()
+    assert "Solved by CalculiX" in html and "Cross-check at the optimized design" in html
+
+
+@needs_ccx
+def test_calculix_plane_stress_is_a_different_element(coarse_run, tmp_path):
+    """CalculiX expands CPS4 into 3D bricks: close to the built-in Q4, not
+    equal — the report says so rather than claiming round-off agreement."""
+    _, s = run(domain=coarse_run["domain"], spec=coarse_run["spec"], out_dir=tmp_path,
+               optimize_design=False, echo=False, crosscheck=True)
+    check = s["solve"]["crosscheck"]
+    assert 1e-5 < check["u_rel_diff"] < 0.05
+    html = build_site(run_dir=tmp_path, site_dir=tmp_path / "site").read_text()
+    assert "expanded into a layer of 3D bricks" in html
+
+
+def test_a_run_that_needs_calculix_says_how_to_get_it(coarse_run, tmp_path, monkeypatch):
+    monkeypatch.setattr(calculix, "CCX", "no-such-ccx")
+    with pytest.raises(RuntimeError, match="apt install calculix-ccx"):
+        run(domain=coarse_run["domain"], spec=coarse_run["spec"], out_dir=tmp_path,
+            echo=False, solver="calculix")

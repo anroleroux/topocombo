@@ -13,11 +13,13 @@ plotted or rendered here.
 from __future__ import annotations
 
 import dataclasses
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
 
+from . import calculix
 from .fea import (
     LoadCase,
     Material,
@@ -138,6 +140,42 @@ def _driver_limits(limits: Sequence[Any], cases: Sequence[StudyCase], mesh: Any)
     return out
 
 
+def _crosscheck(log: RunLog, mesh: Any, material: Material, depth: float, nodal: Any,
+                prescribed: Any, densities: np.ndarray | None, ke_all: np.ndarray,
+                results: Sequence[Any], cases: Sequence[StudyCase], solver: str, penal: float,
+                what: str) -> dict[str, Any]:
+    """Solve again with the other solver and compare, case by case: the
+    largest displacement difference relative to the largest displacement,
+    and the compliances."""
+    other = "direct" if solver == "calculix" else "calculix"
+    t0 = time.perf_counter()
+    again = solve_cases(mesh, material, depth, nodal, densities=densities, penal=penal,
+                        ke_all=ke_all, solver=other, prescribed=prescribed)
+    seconds = time.perf_counter() - t0
+    names = {"calculix": "CalculiX", "direct": "topocombo (direct)", "amg-cg": "topocombo (CG)"}
+    rows = []
+    for case, a, b in zip(cases, results, again):
+        scale = float(np.abs(a.u).max()) or 1.0
+        rows.append({
+            "case": case.name,
+            "compliance": a.compliance,
+            "compliance_other": b.compliance,
+            "compliance_rel_diff": abs(b.compliance - a.compliance) / (abs(a.compliance) or 1.0),
+            "u_rel_diff": float(np.abs(b.u - a.u).max()) / scale,
+        })
+    worst = max(r["u_rel_diff"] for r in rows)
+    log.log(
+        f"cross-check at {what}: {names.get(other, other)} against "
+        f"{names.get(results[0].solver, results[0].solver)} ({seconds:.2f} s): displacements "
+        f"agree to {worst:.2e} of the largest"
+        + "".join(f"; case '{r['case']}' compliance {r['compliance']:.7g} vs "
+                  f"{r['compliance_other']:.7g}" for r in rows)
+    )
+    return {"solver": results[0].solver, "other": other, "what": what, "seconds": seconds,
+            "cases": rows, "u_rel_diff": worst,
+            "compliance_rel_diff": max(r["compliance_rel_diff"] for r in rows)}
+
+
 def _held_dofs(mesh: Any, constraints: Sequence[Fix | Displace], dim: int) -> dict[int, float]:
     """DOF -> held displacement for ``constraints``; two of them holding a
     component at different values is an error."""
@@ -194,8 +232,14 @@ def run(
     passive_regions: Sequence[Passive] = (),
     objective: str = "compliance",
     limits: Sequence[Any] = (),
+    crosscheck: bool = False,
 ) -> tuple[RunLog, dict[str, Any]]:
     """Mesh the domain, solve it at full density, then run the SIMP loop.
+
+    ``crosscheck`` solves the full-density model and the final design again
+    with the other solver — CalculiX when the run uses the built-in one, the
+    built-in direct solver when it runs on CalculiX — and records how far
+    the two agree.
 
     ``constraints`` (:class:`Fix`, :class:`Displace`), the forces — ``loads``
     for one case or ``load_cases`` for several — and ``passive_regions``
@@ -206,6 +250,11 @@ def run(
     """
     three_d = domain.dim == 3
     scripted = isinstance(domain, CadDomain)
+    if (solver == "calculix" or crosscheck) and not calculix.available():
+        raise RuntimeError(
+            "this run needs CalculiX (solver='calculix' or crosscheck=True) but 'ccx' is not "
+            "installed: apt install calculix-ccx, or set TOPOCOMBO_CCX to the executable"
+        )
     if three_d != isinstance(spec, MeshSpec3D):
         raise TypeError("a 3D domain needs a MeshSpec3D, a 2D domain a MeshSpec")
     regions = domain.regions()
@@ -278,6 +327,7 @@ def run(
         "regions": {name: _region_summary(shape) for name, shape in regions.items()},
         "simp": simp.as_dict(),
         "solver": solver,
+        "crosscheck": crosscheck,
     }
     if study is not None:
         log.params["study"] = {"path": str(study.path), "part": study.study.part}
@@ -630,7 +680,8 @@ def run(
 
         how = (
             f"multigrid-preconditioned CG, {result.solver_iterations} iterations"
-            if result.solver == "amg-cg" else f"sparse {result.solver}"
+            if result.solver == "amg-cg" else
+            "CalculiX" if result.solver == "calculix" else f"sparse {result.solver}"
         )
         log.log(f"solved {result.n_free_dofs} free DOFs ({how})"
                 + (f", {len(cases)} load cases" if len(cases) > 1 else ""))
@@ -642,7 +693,9 @@ def run(
                 f"case '{case.name}': compliance = {r.compliance:.6g} N*mm; reactions "
                 f"({', '.join(f'{v:.6g}' for v in react)}) N vs applied "
                 f"({', '.join(f'{0.0 - v:g}' for v in applied)}) N; "
-                f"||KU - F|| on free DOFs = {r.equilibrium_residual:.3e}"
+                + (f"CalculiX's nodal forces sum to {r.equilibrium_residual:.3e} N"
+                   if r.solver == "calculix" else
+                   f"||KU - F|| on free DOFs = {r.equilibrium_residual:.3e}")
             )
             case_summaries.append({
                 "name": case.name, "weight": case.weight, "compliance": r.compliance,
@@ -666,8 +719,10 @@ def run(
                 + (" (beam theory ignores the cutouts)" if domain.has_cutouts else "")
             )
         log.log(
-            f"equilibrium: ||KU - F|| on free DOFs = {result.equilibrium_residual:.3e}, "
-            f"sum of reactions = ({', '.join(f'{v:.6g}' for v in reactions)}) N"
+            (f"equilibrium: CalculiX's nodal forces sum to {result.equilibrium_residual:.3e} N"
+             if result.solver == "calculix" else
+             f"equilibrium: ||KU - F|| on free DOFs = {result.equilibrium_residual:.3e}")
+            + f", sum of reactions = ({', '.join(f'{v:.6g}' for v in reactions)}) N"
         )
         log.log(
             f"von Mises at centroids: {result.von_mises.min():.4g} – "
@@ -697,6 +752,11 @@ def run(
             "load": load.as_dict(),
             "material": material.as_dict(),
         }
+        if crosscheck:
+            solve_summary["crosscheck"] = _crosscheck(
+                log, mesh, material, depth, nodal, prescribed_arg, density0, ke_all, results,
+                cases, solver, 3.0, "full density",
+            )
         log.record(**solve_summary)
         summary["solve"] = solve_summary
 
@@ -820,6 +880,14 @@ def run(
             )
             opt_summary = design.as_dict()
             opt_summary["compliance_ratio_to_full_density"] = reduction
+            if crosscheck:
+                final = solve_cases(mesh, material, depth, nodal, densities=design.densities,
+                                    penal=simp.penal, ke_all=ke_all, solver=solver,
+                                    prescribed=prescribed_arg)
+                opt_summary["crosscheck"] = _crosscheck(
+                    log, mesh, material, depth, nodal, prescribed_arg, design.densities, ke_all,
+                    final, cases, solver, simp.penal, "the optimized design",
+                )
             log.record(**opt_summary)
             summary["optimization"] = opt_summary
 

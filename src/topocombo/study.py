@@ -304,7 +304,7 @@ class Study:
     optimize: SimpParams | None = field(default_factory=SimpParams)
     thickness: float = 1.0  # 2D only: plane-stress out-of-plane size, mm
     #: linear solver: "auto" (direct up to 30k free DOFs, multigrid CG above),
-    #: "direct" or "cg"
+    #: "direct", "cg" or "calculix" (the external CalculiX, ccx)
     solver: str = "auto"
     load_cases: tuple[LoadCase, ...] = ()
     passive: tuple[Passive, ...] = ()
@@ -312,6 +312,10 @@ class Study:
     #: and any limits) or "volume" (the lightest design within the limits)
     objective: str = "compliance"
     limits: tuple[ComplianceLimit | DisplacementLimit | StressLimit, ...] = ()
+    #: solve the full-density model and the final design again with the other
+    #: solver (CalculiX, or the built-in one when the run uses CalculiX) and
+    #: report how closely they agree
+    crosscheck: bool = False
 
     def __post_init__(self) -> None:
         for name in ("constraints", "loads", "load_cases", "passive", "limits"):
@@ -446,6 +450,7 @@ def run_loaded(loaded: LoadedStudy, out_dir: Path, echo: bool = True,
         passive_regions=s.passive,
         objective=s.objective,
         limits=s.limits,
+        crosscheck=s.crosscheck,
         study=loaded,
         echo=echo,
         solver=s.solver,

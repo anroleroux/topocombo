@@ -20,4 +20,5 @@ study = Study(
     objective="volume",
     limits=[StressLimit(max=350.0, p=8.0)],  # MPa, on the p-norm
     optimize=SimpParams(optimizer="mma", filter_radius=2.0, max_iterations=300),
+    crosscheck=True,  # solve again in CalculiX and compare
 )

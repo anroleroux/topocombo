@@ -422,16 +422,23 @@ def solve_cases(
 
     ``solver`` is ``"direct"`` (sparse LU, factorised once per constrained
     set), ``"cg"`` (conjugate gradients preconditioned by smoothed-aggregation
-    algebraic multigrid, built on the rigid-body modes) or ``"auto"``: direct
-    up to :data:`DIRECT_MAX_DOFS` free DOFs, CG above.  ``x0`` (one entry per
-    case) warm-starts CG — the SIMP loop passes the previous displacements.
+    algebraic multigrid, built on the rigid-body modes), ``"auto"``: direct
+    up to :data:`DIRECT_MAX_DOFS` free DOFs, CG above; or ``"calculix"``:
+    the external CalculiX (:mod:`topocombo.calculix`), all cases in one run,
+    see :func:`_solve_calculix`.  ``x0`` (one entry per case) warm-starts CG
+    — the SIMP loop passes the previous displacements.
     """
     if ke_all is None:
         ke_all = element_stiffnesses(mesh, material, thickness)
     scale = None if densities is None else simp_scaling(densities, penal)
+    per_case = _per_case(prescribed, len(loads))
+    if solver == "calculix":
+        results, case_systems = _solve_calculix(
+            mesh, material, thickness, loads, fixed_node_set, per_case, ke_all, scale
+        )
+        return (results, case_systems) if return_system else results
 
     k = assemble_stiffness(mesh, ke_all, scale)
-    per_case = _per_case(prescribed, len(loads))
     systems: dict[bytes, LinearSystem] = {}
     dofs = element_dofs(mesh.cells, mesh.dofs_per_node)
     results, case_systems = [], []
@@ -494,6 +501,66 @@ def solve_cases(
     return results
 
 
+def _solve_calculix(
+    mesh: Mesh, material: Material, thickness: float, loads: Sequence[Any],
+    fixed_node_set: str | Sequence[str] | None, per_case: list[Mapping[int, float] | None],
+    ke_all: np.ndarray, scale: np.ndarray | None,
+) -> tuple[list[FEResult], list["LinearSystem"]]:
+    """:func:`solve_cases` through CalculiX.
+
+    Displacements and reactions come from CalculiX; compliance is
+    ``f . u - u_p . r_p`` with its reactions.  The element energies (the
+    SIMP sensitivities) and centroid stresses are evaluated on its
+    displacements with topocombo's element matrices — for the 3D elements
+    the same as CalculiX's (they agree to its seven printed digits).
+    ``equilibrium_residual`` is the balance of CalculiX's reactions against
+    the loads, component by component (N): the stiffness matrix stays inside
+    CalculiX."""
+    from . import calculix
+
+    cases, systems, seen = [], [], {}
+    for index, load in enumerate(loads):
+        fixed, values = constrained_dofs(mesh, fixed_node_set, per_case[index])
+        loose = rigid_body_free(mesh, fixed)
+        if loose:
+            raise ValueError(
+                f"the constraints leave {loose} rigid-body motion(s) free "
+                "(translations or rotations that deform nothing): hold more components"
+            )
+        cases.append(calculix.CcxCase(force_vector(mesh, load), fixed, values))
+        key = fixed.tobytes()
+        if key not in seen:
+            free = np.setdiff1d(np.arange(mesh.n_dofs), fixed, assume_unique=True)
+            seen[key] = CalculixSystem(mesh=mesh, free=free, k_ff=None, solver="calculix",
+                                       fixed=fixed, material=material, thickness=thickness,
+                                       scale=scale)
+        systems.append(seen[key])
+    solved = calculix.run(mesh, material.youngs_modulus, material.poisson_ratio, thickness,
+                          cases, scale)
+    dofs = element_dofs(mesh.cells, mesh.dofs_per_node)
+    results = []
+    for case, (u, internal) in zip(cases, solved):
+        u[case.fixed] = case.values  # exactly, not to CalculiX's printed digits
+        ue = u[dofs]
+        unscaled = np.einsum("ei,eij,ej->e", ue, ke_all, ue)
+        # CalculiX's RF is K u at every node; topocombo's reactions are K u - f
+        reactions = internal - case.force
+        balance = internal.reshape(-1, mesh.dofs_per_node).sum(axis=0)
+        results.append(FEResult(
+            u=u,
+            compliance=float(case.force @ u - case.values @ reactions[case.fixed]),
+            element_compliance=unscaled if scale is None else unscaled * scale,
+            element_compliance_unscaled=unscaled,
+            von_mises=centroid_von_mises(mesh, u, material, scale),
+            reactions=reactions,
+            equilibrium_residual=float(np.linalg.norm(balance)),
+            n_free_dofs=int(mesh.n_dofs - case.fixed.size),
+            dofs_per_node=mesh.dofs_per_node,
+            solver="calculix",
+        ))
+    return results, systems
+
+
 def _per_case(
     prescribed: Mapping[int, float] | Sequence[Mapping[int, float] | None] | None, n: int,
 ) -> list[Mapping[int, float] | None]:
@@ -537,11 +604,35 @@ class LinearSystem:
         return out
 
 
+@dataclass
+class CalculixSystem(LinearSystem):
+    """A constrained stiffness that lives in CalculiX: each adjoint solve is
+    a CalculiX run with the right-hand side as nodal loads and the
+    constrained DOFs held at zero."""
+
+    material: Material | None = None
+    thickness: float = 1.0
+    scale: np.ndarray | None = None
+
+    def solve(self, rhs: np.ndarray) -> np.ndarray:
+        from . import calculix
+
+        rhs = np.asarray(rhs, dtype=float).copy()
+        rhs[self.fixed] = 0.0
+        if not np.any(rhs):
+            return np.zeros(self.mesh.n_dofs)
+        case = calculix.CcxCase(rhs, self.fixed, np.zeros(self.fixed.size))
+        u, _ = calculix.run(self.mesh, self.material.youngs_modulus,
+                            self.material.poisson_ratio, self.thickness, [case], self.scale)[0]
+        u[self.fixed] = 0.0
+        return u
+
+
 #: Above this many free DOFs, ``solver="auto"`` switches from the direct sparse
 #: LU to multigrid-preconditioned CG (a quadratic-tet mesh of the published
 #: part at 1 mm has ~55k: LU ~7 s per solve, warm-started CG a fraction).
 DIRECT_MAX_DOFS = 30_000
-SOLVERS = ("auto", "direct", "cg")
+SOLVERS = ("auto", "direct", "cg", "calculix")
 #: CG stops at this relative residual; compliance is then good to ~1e-10.
 CG_RTOL = 1e-9
 

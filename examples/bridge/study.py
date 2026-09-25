@@ -31,4 +31,5 @@ study = Study(
         volume_fraction=0.4, filter_radius=2.0, optimizer="mma",
         projection=16.0, max_iterations=400,
     ),
+    crosscheck=True,  # solve again in CalculiX and compare
 )

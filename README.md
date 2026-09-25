@@ -4,13 +4,13 @@ A topology optimization pipeline built from decoupled, open-source components �
 
 ## Goal
 
-Explore topology optimization (SIMP-based compliance minimization) on a cantilever beam, using an open-source toolchain end to end — as a 3D solid meshed with hexahedra (the default published run), or as the original 2D plane-stress problem meshed with quadrilaterals. The focus is a working, terminal-driven optimization loop; visualization is treated as a downstream, optional concern rather than something embedded in the loop itself. The FEA solver is a custom, minimal implementation, with CalculiX as a planned future swap-in once the core loop is validated.
+Explore topology optimization (SIMP-based compliance minimization) on a cantilever beam, using an open-source toolchain end to end — as a 3D solid meshed with hexahedra (the default published run), or as the original 2D plane-stress problem meshed with quadrilaterals. The focus is a working, terminal-driven optimization loop; visualization is treated as a downstream, optional concern rather than something embedded in the loop itself. The FEA solver is a custom, minimal implementation; [CalculiX](http://www.calculix.de/) can be swapped in for it, and cross-checks it.
 
 ## Components
 
 - **CAD (geometry)** — [CadQuery](https://github.com/CadQuery/cadquery): parametric definition of the design domain (beam dimensions, aspect ratio, load/support regions), scripted in Python.
 - **Mesher** — [Gmsh](https://gmsh.info/): structured (transfinite) or body-fitted quadrilateral / hexahedral meshing, and tetrahedral meshing of any solid, driven via its Python API.
-- **FEA solver** — custom solver with Q4 plane-stress quads, H8 solid hexahedra and T4 / T10 tetrahedra (numpy/scipy: sparse stiffness assembly, a direct solve or multigrid-preconditioned CG via [PyAMG](https://github.com/pyamg/pyamg)), implemented in `src/topocombo/fea.py` and `src/topocombo/elements.py`. Chosen over an external solver initially so the optimizer has direct, in-memory access to element stiffness matrices and displacement fields for sensitivity analysis. [CalculiX](http://www.calculix.de/) is the planned later alternative for a verified, general-purpose solver.
+- **FEA solver** — custom solver with Q4 plane-stress quads, H8 solid hexahedra and T4 / T10 tetrahedra (numpy/scipy: sparse stiffness assembly, a direct solve or multigrid-preconditioned CG via [PyAMG](https://github.com/pyamg/pyamg)), implemented in `src/topocombo/fea.py` and `src/topocombo/elements.py`. Chosen over an external solver initially so the optimizer has direct, in-memory access to element stiffness matrices and displacement fields for sensitivity analysis. [CalculiX](http://www.calculix.de/) (`ccx`) is the alternative, in `src/topocombo/calculix.py`: `solver="calculix"` runs every solve of the loop in it, and `crosscheck=True` solves again with the other solver and reports how closely they agree.
 - **Optimizer** — SIMP (Solid Isotropic Material with Penalization) loop, implemented in `src/topocombo/optimize.py` and `src/topocombo/mma.py`: density update via Optimality Criteria, or the Method of Moving Asymptotes for any objective and limits (displacement, stress, compliance, minimum volume) on exact adjoint gradients (`src/topocombo/responses.py`; [NLopt](https://nlopt.readthedocs.io/)'s MMA as an alternative driver), with sensitivity or density filtering to avoid checkerboarding. The per-iteration coupling (FEA solve → compliance + sensitivity → filter → update) is custom code.
 - **Visualization (decoupled)**:
   - [PyVista](https://pyvista.org/) — scripted plotting of density fields and results, run as a separate process/script against exported data, not called from within the optimization loop.
@@ -36,7 +36,7 @@ No plotting or rendering happens inside this loop — it only reads geometry/mes
 - **PyVista**: `python -m topocombo.viz --run <run dir>` reads the exported `.vtu` files and renders the thresholded topology, the density field and the deformed stress field — to PNGs off screen, or interactively with `--show`.
 - **Blender**: import `optimization/topology.stl` — the density field thresholded at 0.5, as a closed, outward-facing surface written with `meshio` — for polished rendering.
 
-Because both visualization paths consume the same on-disk result artifacts rather than talking to the solver directly, swapping the FEA backend (e.g. to CalculiX later) does not require changes to either visualization script.
+Because both visualization paths consume the same on-disk result artifacts rather than talking to the solver directly, swapping the FEA backend (e.g. to CalculiX) does not require changes to either visualization script.
 
 ## Running the cantilever example
 
@@ -211,6 +211,9 @@ the free end. The default 60 x 20 x 1 mesh (1200 hexes, 7686 DOFs) converges in
 
 `gmsh`'s shared library links against GLU, so on a bare Linux box install it first:
 `sudo apt-get install libglu1-mesa libxrender1 libxcursor1 libxft2 libxinerama1`.
+CalculiX is `sudo apt-get install calculix-ccx` (or point `TOPOCOMBO_CCX` at a
+`ccx` executable); only runs that ask for it need it, and its tests skip
+without it.
 Rendering PyVista off screen on a headless box also needs `libosmesa6` or `libegl1`.
 
 Run the tests with `pytest` — they mesh a coarse beam and assert the grid is
@@ -309,7 +312,8 @@ src/topocombo/
   elements.py   the element registry (quad4, hex8, tet4, tet10): reference cell, shape functions, quadrature,
                 edges / facets; vectorised B matrices, stiffness and measures
   fea.py        linear-elastic solve on any registered element: cached assembly, loads,
-                direct or multigrid-CG solve
+                direct, multigrid-CG or CalculiX solve
+  calculix.py   CalculiX as the solver: write the deck, run ccx, read displacements and reactions
   optimize.py   SIMP loop: neighbourhood filter, OC update, convergence, log.csv
   responses.py  compliance, volume, displacement and p-norm stress, with adjoint gradients
   mma.py        the Method of Moving Asymptotes (and NLopt's): any objective, any limits
@@ -554,4 +558,45 @@ used `H` where it needs `H^T`. On a uniform grid `H` is symmetric and nothing
 changes; on a body-fitted mesh the weights include element sizes, so it is
 not, and the gradient was slightly off (MMA already used `H^T`).
 
-Next: the CalculiX swap-in for the solver once the loop is trusted.
+### CalculiX
+
+`Study(solver="calculix")` hands every solve to [CalculiX](http://www.calculix.de/)
+2.21 (`ccx`, the `calculix-ccx` package): the mesh, the SIMP stiffness of each
+element, the supports and the nodal forces are written as an input deck —
+one static step per load case, each with its own `*BOUNDARY, OP=NEW`, every
+distinct stiffness factor a material — and the displacements and reactions
+come back from the `.dat` file. Compliance is `f . u - u_p . r_p` on its
+reactions; the element energies that drive the sensitivities are evaluated
+on its displacements. MMA's adjoint solves run in CalculiX too (a deck with
+the adjoint load and the supports held at zero).
+`Study(crosscheck=True)` solves the full-density model and the final design
+again with the other solver and puts the comparison in the log and the
+report.
+
+| element | CalculiX | agreement with the built-in solver |
+| --- | --- | --- |
+| hex8 | `C3D8` | 7e-8 (cantilever), 3e-7 on its final design |
+| tet10 | `C3D10` | 3e-7 (bracket, both cases, full density and final design) |
+| tet4 | `C3D4` | < 1e-5 (tests) |
+| quad4 | `CPS4` | 0.1% (MBB, L-bracket) to 2% (bridge, on point supports) |
+
+The 3D elements are the same formulation in both, so they agree to the
+seven digits CalculiX prints. CalculiX expands a plane-stress `CPS4` into a
+layer of 3D bricks internally: a different element, 3% stiffer in bending
+on a 10 x 2 cantilever, equal in tension to 8e-4 — the report says which
+kind of agreement to expect. The published cantilever now runs its whole
+SIMP loop on CalculiX: 1127.309 N·mm in 48 iterations, against 1127.3095
+built in (the same design), in about 12 s; every example cross-checks.
+
+Two things this turned up, both about CalculiX rather than the models:
+
+* it reads at most 20 characters per number: a node at y = -7.85e-14
+  written in full precision (21 characters) was read as y = -0.785, and
+  bent one element of the cantilever by 59%. The deck is written in
+  `%.12e` now, and a test pins it.
+* the Ubuntu build, run multithreaded, returned wrong displacements for
+  one step of a two-step deck in about 1 run in 20 (24–40% off, the same deck
+  each time); single-threaded, never in 40. It runs on one thread.
+
+Next: 3D examples beyond the prism and the bracket, and larger meshes on the
+iterative solver.

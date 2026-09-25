@@ -4,6 +4,9 @@
 
 Constraints and loads refer to the regions part.py names.  Everything here is
 ordinary Python, so values can be computed, looped over or imported.
+
+Every solve of the SIMP loop runs in CalculiX (ccx), and the built-in solver
+checks the full-density model and the final design against it.
 """
 from topocombo.study import Fix, Force, Material, Mesh, SimpParams, Study
 
@@ -15,4 +18,6 @@ study = Study(
     constraints=[Fix("wall")],  # clamped: every displacement component zero
     loads=[Force("tip", (0.0, -1000.0, 0.0))],  # N, total, spread along the line
     optimize=SimpParams(volume_fraction=0.5, penal=3.0, filter_radius=1.5),
+    solver="calculix",  # the external CalculiX; "auto" is the built-in solver
+    crosscheck=True,  # and solve again with the other one
 )

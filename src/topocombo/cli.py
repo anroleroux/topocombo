@@ -137,9 +137,10 @@ def _add_model_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--solver",
-        choices=("auto", "direct", "cg"),
+        choices=("auto", "direct", "cg", "calculix"),
         default="auto",
-        help="linear solver: direct sparse LU, multigrid-preconditioned CG, or auto"
+        help="linear solver: direct sparse LU, multigrid-preconditioned CG, auto, or the "
+        "external CalculiX (ccx)"
         " (direct up to 30k free DOFs) (default: auto)",
     )
     p.add_argument(

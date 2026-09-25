@@ -29,4 +29,5 @@ study = Study(
         Passive("wall", state="solid", within=1.5),  # a 1.5 mm mounting pad
     ],
     optimize=SimpParams(volume_fraction=0.3, penal=3.0, filter_radius=1.5 * size),
+    crosscheck=True,  # solve again in CalculiX and compare
 )

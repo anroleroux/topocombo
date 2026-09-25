@@ -19,4 +19,5 @@ study = Study(
     ],
     loads=[Force("load", (0.0, -1000.0))],  # N, half the full beam's 2 kN
     optimize=SimpParams(volume_fraction=0.5, penal=3.0, filter_radius=1.5, max_iterations=150),
+    crosscheck=True,  # solve again in CalculiX and compare
 )

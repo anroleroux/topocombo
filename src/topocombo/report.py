@@ -856,6 +856,7 @@ def _solve_cards(solve: dict[str, Any]) -> str:
             (
                 "Equilibrium",
                 f"{solve.get('equilibrium_residual', 0):.1e}",
+                "N: CalculiX's nodal forces summed" if solve.get("solver") == "calculix" else
                 f"||KU-F|| on {solve.get('n_free_dofs', 0)} free DOFs",
             ),
         ]
@@ -880,6 +881,43 @@ def _limits_table(opt: dict[str, Any]) -> str:
         " subject to these limits (a stress limit bounds a p-norm of the element stresses,"
         " a smooth stand-in for the largest):</p>"
         + _kv_table(rows)
+    )
+
+
+SOLVER_NAMES = {"calculix": "CalculiX", "direct": "topocombo (direct)",
+                "amg-cg": "topocombo (CG)"}
+
+
+def _crosscheck_table(check: dict[str, Any] | None, dim: int) -> str:
+    """How closely the other solver reproduced this solve, case by case."""
+    if not check:
+        return ""
+    this = SOLVER_NAMES.get(check.get("solver"), check.get("solver"))
+    other = SOLVER_NAMES.get(check.get("other"), check.get("other"))
+    rows = "".join(
+        f"<tr><td>{_e(r['case'])}</td>"
+        f"<td class='num'>{float(r['compliance']):.7g}</td>"
+        f"<td class='num'>{float(r['compliance_other']):.7g}</td>"
+        f"<td class='num'>{float(r['compliance_rel_diff']):.1e}</td>"
+        f"<td class='num'>{float(r['u_rel_diff']):.1e}</td></tr>"
+        for r in check.get("cases", [])
+    )
+    note = (
+        " CalculiX's plane-stress CPS4 is expanded into a layer of 3D bricks inside CalculiX,"
+        " a different element from the built-in Q4: expect agreement to a few per cent in"
+        " bending, not to round-off."
+        if dim == 2 else
+        " The 3D elements are the same formulation in both, so they agree to CalculiX's seven"
+        " printed digits."
+    )
+    return (
+        f"<p class='lede'>Cross-check at {_e(check.get('what'))}: solved again by {_e(other)}"
+        f" ({float(check.get('seconds', 0)):.2f} s).{note}</p>"
+        "<table><thead><tr><th>Load case</th>"
+        f"<th class='num'>Compliance, {_e(this)}</th><th class='num'>{_e(other)}</th>"
+        "<th class='num'>Relative difference</th>"
+        "<th class='num'>Largest displacement difference</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table>"
     )
 
 
@@ -1353,9 +1391,13 @@ def render_html(
         solve_section = (
             f"<h2>{'3D solid' if three_d else 'Plane-stress'} solve</h2>"
             "<p class='lede'>Full density (every element solid) — the starting point of the"
-            " optimization, and the case where an analytical answer exists to check against.</p>"
+            " optimization, and the case where an analytical answer exists to check against."
+            + (" Solved by CalculiX (<code>ccx</code>), as is every solve of the loop."
+               if solve.get("solver") == "calculix" else "")
+            + "</p>"
             + _solve_cards(solve)
             + figure
+            + _crosscheck_table(solve.get("crosscheck"), params.get("dim", 2))
         )
 
     optimization_section = ""
@@ -1433,6 +1475,7 @@ def render_html(
             + _optimization_cards(optimization, solve)
             + _limits_table(optimization)
             + density_fig
+            + _crosscheck_table(optimization.get("crosscheck"), params.get("dim", 2))
             + topology_fig
             + charts
         )

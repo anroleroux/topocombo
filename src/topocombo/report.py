@@ -18,6 +18,8 @@ from typing import Any
 
 import numpy as np
 
+from .elements import ELEMENTS, HEX8
+
 _CSS = """
 :root {
   color-scheme: light dark;
@@ -128,9 +130,7 @@ def _fmt(value: Any) -> str:
 
 
 #: The six faces of a hexahedron, as corner indices (Gmsh / VTK order).
-_HEX_FACES = np.array(
-    [[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
-)
+_HEX_FACES = np.array(HEX8.facets)
 
 
 def _side_view(
@@ -1103,12 +1103,14 @@ def render_html(
     domain = params.get("domain", {})
     mesh = params.get("mesh", {})
     three_d = params.get("dim") == 3
-    if three_d:
-        meshed_as = "structured hexahedra (one element through the width by default)"
-        solved_as = "a 3D solid problem"
-    else:
-        meshed_as = "structured quadrilaterals"
-        solved_as = "a plane-stress problem"
+    # the run's element, from the registry (older runs recorded only the label)
+    label = params.get("element") or ("H8 hexahedron" if three_d else "Q4 quadrilateral")
+    el = next((e for e in ELEMENTS.values() if e.label == label), None)
+    noun = label.split(" ", 1)[-1]
+    plural = el.plural if el else noun + "s"
+    fitted = mesh.get("mode", "structured") == "body-fitted"
+    meshed_as = f"{'body-fitted' if fitted else 'structured'} {plural}"
+    solved_as = "a 3D solid problem" if three_d else "a plane-stress problem"
     env = run.get("environment", {})
     tools = env.get("tools", {})
 
@@ -1133,14 +1135,13 @@ def render_html(
         f"The hatched {'/'.join(_e(n) for n in fixed_names) or 'fixed'} region is clamped;"
         f" the arrow marks the load on {'/'.join(_e(n) for n in load_names) or 'load'}."
     )
+    every = f"every {noun}" + (" of the body-fitted mesh" if fitted else "")
     if three_d:
-        mesh_caption = "Side view: every hexahedron is one design variable for the SIMP loop. " + held
+        mesh_caption = f"Side view: {every} is one design variable for the SIMP loop. " + held
     else:
-        mesh_caption = "Every quad is one design variable for the SIMP loop. " + held
-    if summary.get("mesh_mode") == "body-fitted":
-        mesh_caption = mesh_caption.replace(
-            "every hexahedron", "every hexahedron of the body-fitted mesh"
-        ).replace("Every quad", "Every quad of the body-fitted mesh") + (
+        mesh_caption = every[0].upper() + every[1:] + " is one design variable for the SIMP loop. " + held
+    if fitted:
+        mesh_caption += (
             " The mesh follows the CAD boundary, so the dashed cutout is a real hole in it."
             if params.get("domain", {}).get("holes") else ""
         )

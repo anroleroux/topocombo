@@ -301,7 +301,9 @@ src/topocombo/
   regions.py    named regions -> mesh node sets, and how a force spreads over them
   meshing.py    structured (transfinite) or body-fitted (unstructured quad / extruded hex) meshing (Gmsh)
   mesh_io.py    .msh -> dimension-agnostic Mesh, quality checks, .npz/.vtu export
-  fea.py        Q4 plane-stress / H8 solid solver: element stiffness, assembly, direct solve
+  elements.py   the element registry (quad4, hex8): reference cell, shape functions, quadrature,
+                edges / facets; vectorised B matrices, stiffness and measures
+  fea.py        linear-elastic solve on any registered element: assembly, loads, direct solve
   optimize.py   SIMP loop: neighbourhood filter, OC update, convergence, log.csv
   pipeline.py   the geometry -> mesh -> solve -> optimize run, terminal-driven
   runlog.py     structured, timed logging of a run
@@ -330,17 +332,26 @@ all steps but solver scaling (step 5) are done. Step 5 — an iterative solver
 for meshes many elements through the width — is only needed once `--nelz`
 grows well beyond the default of 1.
 
+Element code lives in one place: `elements.py` describes each element once
+(reference cell, shape-function derivatives, quadrature with weights, edges,
+outward facets, the node permutation that un-inverts a cell), and the solver,
+mesh reading and checks, load spreading and the STL export all work from that
+description, integrating many elements at once. Adding an element is a new
+entry there plus a mesher for it; every entry is held to the same tests
+(shape functions sum to one, quadrature integrates the reference cell, facets
+face outward, the stiffness has exactly the rigid-body modes as its
+nullspace). Moving the Q4 and H8 code there changed no result beyond
+round-off (compliance within 3e-12 relative, densities within 1e-9, the same
+iteration counts on the published study and four parametric runs).
+
 Next, in order:
 
-1. An element refactor with no change in results: the solver, the loads and
-   the report pick their element code by cell type, so new elements only add
-   code.
-2. Tetrahedral elements — T10, with T4 for testing — meshed by Gmsh from any
+1. Tetrahedral elements — T10, with T4 for testing — meshed by Gmsh from any
    3D part, lifting the prism-only restriction of the extruded hex mesh
    (`Mesh(element="tet10")`), with iterative solves for the larger meshes
    (step 5 of the migration plan). T10 is CalculiX's C3D10, which keeps the
    solver swap open.
-3. More general boundary conditions: constraints on chosen components and
+2. More general boundary conditions: constraints on chosen components and
    prescribed displacements, several load cases, passive regions held solid,
    and a second example that is not a cantilever.
 

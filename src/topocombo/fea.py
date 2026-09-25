@@ -7,10 +7,11 @@ quantity SIMP sensitivities are built from.
 
 Conventions: with ``d = mesh.dofs_per_node`` components per node, node ``n``
 owns DOFs ``d*n`` (x), ``d*n + 1`` (y) and, in 3D, ``d*n + 2`` (z); units are
-N and mm throughout, so stresses come out in MPa.  Element routines dispatch on
-``mesh.cell_type``: bilinear quads (plane stress, with an out-of-plane
-thickness) and trilinear hexahedra (full 3D, where the width is modelled and
-``thickness`` is not used).  Both integrate with the 2-point Gauss rule.
+N and mm throughout, so stresses come out in MPa.  Everything element-specific
+comes from the mesh's :class:`~topocombo.elements.Element` (shape functions,
+quadrature, B matrices); this module only picks the constitutive law by
+dimension — plane stress in 2D (with an out-of-plane ``thickness``), full 3D
+elasticity in 3D (where the width is modelled and ``thickness`` is not used).
 """
 
 from __future__ import annotations
@@ -22,12 +23,9 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
-from .mesh_io import Mesh, gauss_points, shape_derivatives
-
-#: 2x2 Gauss-Legendre points and weights on the reference square.
-_GAUSS = [(-1 / np.sqrt(3), -1 / np.sqrt(3)), (1 / np.sqrt(3), -1 / np.sqrt(3)),
-          (1 / np.sqrt(3), 1 / np.sqrt(3)), (-1 / np.sqrt(3), 1 / np.sqrt(3))]
-_NODE_XI = np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]])
+from . import elements
+from .elements import HEX8, QUAD4
+from .mesh_io import Mesh
 
 
 @dataclass(frozen=True)
@@ -64,6 +62,10 @@ class Material:
         d[:3, :3] += 2.0 * mu * np.eye(3)
         d[3:, 3:] = mu * np.eye(3)
         return d
+
+    def stiffness_matrix(self, dim: int) -> np.ndarray:
+        """The D matrix for a ``dim``-dimensional analysis: plane stress in 2D."""
+        return self.constitutive_matrix() if dim == 2 else self.constitutive_matrix_3d()
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -169,70 +171,30 @@ class FEResult:
         return float(-self.component(1).min())
 
 
-def _shape_gradients(coords: np.ndarray, xi: float, eta: float) -> tuple[np.ndarray, float]:
-    """dN/dx, dN/dy (2x4) and det(J) of the isoparametric map at (xi, eta)."""
-    dn_dxi = 0.25 * np.column_stack(
-        [
-            _NODE_XI[:, 0] * (1.0 + _NODE_XI[:, 1] * eta),
-            _NODE_XI[:, 1] * (1.0 + _NODE_XI[:, 0] * xi),
-        ]
-    )  # (4, 2)
-    jac = dn_dxi.T @ coords  # (2, 2)
-    det = float(np.linalg.det(jac))
-    if det <= 0.0:
-        raise ValueError(f"non-positive Jacobian ({det:.3e}); element is inverted or degenerate")
-    return np.linalg.solve(jac, dn_dxi.T), det
-
-
 def strain_displacement(coords: np.ndarray, xi: float, eta: float) -> tuple[np.ndarray, float]:
-    """B matrix (3x8) and det(J) for a Q4 element at (xi, eta)."""
-    grads, det = _shape_gradients(coords, xi, eta)
-    b = np.zeros((3, 8))
-    b[0, 0::2] = grads[0]
-    b[1, 1::2] = grads[1]
-    b[2, 0::2] = grads[1]
-    b[2, 1::2] = grads[0]
-    return b, det
+    """B matrix (3x8) and det(J) for one Q4 element at (xi, eta)."""
+    b, det = elements.strain_displacement(QUAD4, np.asarray(coords)[None], np.array([xi, eta]))
+    return b[0], float(det[0])
 
 
 def element_stiffness(coords: np.ndarray, d: np.ndarray, thickness: float) -> np.ndarray:
-    """Q4 plane-stress element stiffness (8x8) by 2x2 Gauss quadrature."""
-    ke = np.zeros((8, 8))
-    for xi, eta in _GAUSS:
-        b, det = strain_displacement(coords, xi, eta)
-        ke += thickness * det * (b.T @ d @ b)  # unit Gauss weights
-    return ke
+    """Q4 plane-stress element stiffness (8x8) of one element."""
+    return elements.stiffness(QUAD4, np.asarray(coords)[None], d, thickness)[0]
 
 
 def hex_strain_displacement(coords: np.ndarray, point: np.ndarray) -> tuple[np.ndarray, float]:
-    """B matrix (6x24) and det(J) for an H8 element at reference ``point``.
+    """B matrix (6x24) and det(J) for one H8 element at reference ``point``.
 
     Strain order is [exx, eyy, ezz, gxy, gyz, gzx] (engineering shears), matching
     :meth:`Material.constitutive_matrix_3d`.
     """
-    dn_dxi = shape_derivatives("hexahedron", point)  # (8, 3)
-    jac = dn_dxi.T @ coords  # (3, 3)
-    det = float(np.linalg.det(jac))
-    if det <= 0.0:
-        raise ValueError(f"non-positive Jacobian ({det:.3e}); element is inverted or degenerate")
-    g = np.linalg.solve(jac, dn_dxi.T)  # (3, 8): dN/dx, dN/dy, dN/dz
-    b = np.zeros((6, 24))
-    b[0, 0::3] = g[0]
-    b[1, 1::3] = g[1]
-    b[2, 2::3] = g[2]
-    b[3, 0::3], b[3, 1::3] = g[1], g[0]
-    b[4, 1::3], b[4, 2::3] = g[2], g[1]
-    b[5, 2::3], b[5, 0::3] = g[0], g[2]
-    return b, det
+    b, det = elements.strain_displacement(HEX8, np.asarray(coords)[None], np.asarray(point))
+    return b[0], float(det[0])
 
 
 def hex_element_stiffness(coords: np.ndarray, d: np.ndarray) -> np.ndarray:
-    """H8 solid element stiffness (24x24) by 2x2x2 Gauss quadrature."""
-    ke = np.zeros((24, 24))
-    for point in gauss_points(3):
-        b, det = hex_strain_displacement(coords, point)
-        ke += det * (b.T @ d @ b)  # unit Gauss weights
-    return ke
+    """H8 solid element stiffness (24x24) of one element."""
+    return elements.stiffness(HEX8, np.asarray(coords)[None], d)[0]
 
 
 def element_dofs(cells: np.ndarray, dofs_per_node: int = 2) -> np.ndarray:
@@ -247,17 +209,6 @@ def node_dofs(nodes: np.ndarray, dofs_per_node: int = 2) -> np.ndarray:
     return np.sort((dofs_per_node * np.asarray(nodes)[:, None] + comps).reshape(-1))
 
 
-def _element_function(mesh: Mesh, material: Material, thickness: float):
-    """The stiffness routine for the mesh's cell type, bound to its material."""
-    if mesh.cell_type == "quad":
-        d = material.constitutive_matrix()
-        return lambda coords: element_stiffness(coords, d, thickness)
-    if mesh.cell_type == "hexahedron":
-        d = material.constitutive_matrix_3d()
-        return lambda coords: hex_element_stiffness(coords, d)
-    raise NotImplementedError(f"no element formulation for {mesh.cell_type!r} cells")  # pragma: no cover
-
-
 def element_stiffnesses(mesh: Mesh, material: Material, thickness: float) -> np.ndarray:
     """Stiffness matrix of every element at full density, shape (n_elements, k, k).
 
@@ -266,14 +217,15 @@ def element_stiffnesses(mesh: Mesh, material: Material, thickness: float) -> np.
     broadcast view) instead of repeating the integration per element.
     ``thickness`` applies to plane-stress quads only.
     """
-    element = _element_function(mesh, material, thickness)
+    el = mesh.element
+    d = material.stiffness_matrix(el.dim)
     xyz = mesh.nodes[mesh.cells]  # (m, k, dim)
     rel = xyz - xyz[:, :1]
     size = float(np.ptp(mesh.nodes, axis=0).max()) or 1.0
     if np.allclose(rel, rel[:1], rtol=0.0, atol=1e-12 * size):
-        ke = element(rel[0])
+        ke = elements.stiffness(el, rel[:1], d, thickness)[0]
         return np.broadcast_to(ke, (mesh.n_elements, *ke.shape))
-    return np.array([element(coords) for coords in rel])
+    return elements.stiffness(el, rel, d, thickness)
 
 
 def simp_scaling(
@@ -331,22 +283,11 @@ def _von_mises(stress: np.ndarray) -> np.ndarray:
 def centroid_von_mises(
     mesh: Mesh, u: np.ndarray, material: Material, scale: np.ndarray | None = None
 ) -> np.ndarray:
-    """Von Mises stress at each element centroid, MPa (plane stress for quads)."""
-    if mesh.cell_type == "quad":
-        d = material.constitutive_matrix()
-
-        def b_at_centre(coords: np.ndarray) -> np.ndarray:
-            return strain_displacement(coords, 0.0, 0.0)[0]
-    elif mesh.cell_type == "hexahedron":
-        d = material.constitutive_matrix_3d()
-
-        def b_at_centre(coords: np.ndarray) -> np.ndarray:
-            return hex_strain_displacement(coords, np.zeros(3))[0]
-    else:  # pragma: no cover
-        raise NotImplementedError(f"no element formulation for {mesh.cell_type!r} cells")
-
+    """Von Mises stress at each element's centre, MPa (plane stress in 2D)."""
+    el = mesh.element
+    d = material.stiffness_matrix(el.dim)
     dofs = element_dofs(mesh.cells, mesh.dofs_per_node)
-    b_all = np.array([b_at_centre(mesh.nodes[cell]) for cell in mesh.cells])
+    b_all, _ = elements.strain_displacement(el, mesh.nodes[mesh.cells], el.centre)
     strain = np.einsum("eij,ej->ei", b_all, u[dofs])
     stress = strain @ d.T
     if scale is not None:

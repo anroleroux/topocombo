@@ -1546,3 +1546,81 @@ def test_report_shows_the_mesh_force_and_constraint_inputs(coarse_run, fitted_ru
     assert "target element edge (mm)" in fitted
     if fitted_run["summary"]["dim"] == 3:
         assert "(0, -1000, 0)" in fitted
+
+
+# --------------------------------------------------------------------------
+# the element registry: invariants every element must satisfy (tets included,
+# once they are added)
+# --------------------------------------------------------------------------
+from topocombo import elements as E  # noqa: E402
+
+ALL_ELEMENTS = list(E.ELEMENTS.values())
+
+
+def _distorted(el, seed=0):
+    rng = np.random.default_rng(seed)
+    return el.reference_nodes * np.arange(1.0, el.dim + 1) * 0.7 + 0.1 * rng.random(
+        el.reference_nodes.shape
+    )
+
+
+@pytest.mark.parametrize("el", ALL_ELEMENTS, ids=lambda e: e.name)
+def test_element_shape_functions_and_quadrature_are_consistent(el):
+    points, weights = el.quadrature
+    for p in points:  # the shape functions sum to one: their derivatives to zero
+        assert np.allclose(el.shape_derivatives(p).sum(axis=0), 0.0)
+    ref = el.reference_nodes
+    # the reference cell mapped onto itself has det J = 1: its measure is sum(weights)
+    assert E.measures(el, ref, np.arange(el.n_nodes)[None])[0] == pytest.approx(weights.sum())
+    # a linear map x = A xi scales every measure by det A
+    a = np.diag(np.arange(2.0, el.dim + 2)) + 0.1
+    assert E.measures(el, ref @ a.T, np.arange(el.n_nodes)[None])[0] == pytest.approx(
+        weights.sum() * np.linalg.det(a)
+    )
+
+
+@pytest.mark.parametrize("el", ALL_ELEMENTS, ids=lambda e: e.name)
+def test_element_facets_face_outward_and_flip_inverts(el):
+    ref = el.reference_nodes
+    centre = ref.mean(axis=0)
+    for facet in el.facets:
+        p = ref[list(facet)]
+        if el.dim == 2:
+            d = p[1] - p[0]
+            normal = np.array([d[1], -d[0]])
+        else:
+            normal = np.cross(p[1] - p[0], p[2] - p[0])
+        assert normal @ (p.mean(axis=0) - centre) > 0
+    cells = np.arange(el.n_nodes)[None]
+    flipped = cells[:, list(el.flip)]
+    assert E.measures(el, ref, flipped)[0] == pytest.approx(-E.measures(el, ref, cells)[0])
+    assert sorted(el.flip) == list(range(el.n_nodes))
+    assert all(len(f) == len(el.facets[0]) for f in el.facets)
+
+
+@pytest.mark.parametrize("el", ALL_ELEMENTS, ids=lambda e: e.name)
+def test_element_stiffness_has_only_rigid_body_modes_as_nullspace(el):
+    d = Material().stiffness_matrix(el.dim)
+    coords = _distorted(el)
+    ke = E.stiffness(el, coords[None], d)[0]
+    assert np.allclose(ke, ke.T, atol=1e-9 * abs(ke).max())
+    eig = np.linalg.eigvalsh(ke)
+    rigid = 3 if el.dim == 2 else 6
+    assert np.sum(np.abs(eig) < 1e-8 * eig.max()) == rigid
+    # vectorised over elements = one element at a time
+    batch = np.stack([_distorted(el, s) for s in range(3)])
+    together = E.stiffness(el, batch, d, chunk=2)
+    for i in range(3):
+        assert np.allclose(together[i], E.stiffness(el, batch[i][None], d)[0])
+
+
+def test_element_lookup_names_the_supported_types():
+    assert E.element("hexahedron") is E.HEX8 and E.BY_NAME["quad4"] is E.QUAD4
+    with pytest.raises(ValueError, match="supported"):
+        E.element("pyramid")
+
+
+def test_an_inverted_element_is_refused():
+    el = E.QUAD4
+    with pytest.raises(ValueError, match="non-positive Jacobian"):
+        E.stiffness(el, el.reference_nodes[list(el.flip)][None], Material().stiffness_matrix(2))

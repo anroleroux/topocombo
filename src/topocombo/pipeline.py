@@ -153,7 +153,8 @@ def run(
     )
     log.params = {
         "dim": 3 if three_d else 2,
-        "element": "H8 hexahedron" if three_d else "Q4 quadrilateral",
+        "element": spec.element.label,
+        "element_name": spec.element.name,
         "domain": domain.as_dict(),
         "mesh": {**spec.as_dict(), "element_size": _element_size(domain, spec)},
         "material": material.as_dict(),
@@ -247,7 +248,7 @@ def run(
             cad_script=domain.cadquery_script(),
         )
 
-    cells_word = "hexahedra" if three_d else "quadrilaterals"
+    cells_word = spec.element.plural
     kind = "structured" if spec.structured else "body-fitted"
     with log.step("meshing", f"2. Mesh with Gmsh ({kind} {cells_word})"):
         if spec.structured:
@@ -287,8 +288,7 @@ def run(
             log=log,
             **extra,
         )
-        mesh_word = "hexahedral" if three_d else "quadrilateral"
-        log.artifact(msh_path, f"{mesh_word} mesh with physical groups (Gmsh 2.2 ASCII)")
+        log.artifact(msh_path, f"{spec.element.label} mesh with physical groups (Gmsh 2.2 ASCII)")
         size = None if spec.structured else spec.element_size(domain)
         log.record(**spec.as_dict(), element_size=size)
 

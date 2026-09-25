@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .elements import ELEMENTS as _REGISTRY
 from .fea import Material
 from .geometry import CadDomain
 from .meshing import MESH_MODES, MeshSpec, MeshSpec3D
@@ -27,9 +28,12 @@ from .optimize import SimpParams
 
 __all__ = ["Study", "Mesh", "Fix", "Force", "Material", "SimpParams", "load_study", "run_study"]
 
-#: Element types per dimension.  Hexahedra are extruded from the x-y profile,
-#: so a 3D part must be a prism along z; tetrahedra will lift that.
-ELEMENTS = {2: ("quad4",), 3: ("hex8",)}
+#: Element names per dimension, from the element registry.  Hexahedra are
+#: extruded from the x-y profile, so a 3D part must be a prism along z;
+#: tetrahedra will lift that.
+ELEMENTS = {
+    dim: tuple(e.name for e in _REGISTRY.values() if e.dim == dim) for dim in (2, 3)
+}
 
 
 @dataclass(frozen=True)
@@ -67,9 +71,10 @@ class Mesh:
         if element not in ELEMENTS[dim]:
             raise ValueError(f"a {dim}D part takes {', '.join(ELEMENTS[dim])} elements, not {element}")
         common = {"nelx": self.nelx, "nely": self.nely, "mode": self.mode, "size": self.size}
-        if dim == 3:
-            return MeshSpec3D(nelz=self.layers, **common)
-        return MeshSpec(**common)
+        spec = MeshSpec3D(nelz=self.layers, **common) if dim == 3 else MeshSpec(**common)
+        if spec.element.name != element:  # pragma: no cover - one element per dimension today
+            raise ValueError(f"no mesher for {element} elements yet")
+        return spec
 
 
 @dataclass(frozen=True)

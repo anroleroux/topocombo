@@ -26,12 +26,13 @@ chordal error of the element edges) at the cost of a non-uniform mesh.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
 import gmsh
 
+from .elements import HEX8, QUAD4, Element
 from .geometry import Domain
 
 #: Physical group name of the meshed surface / volume in the .msh file.
@@ -69,6 +70,9 @@ class MeshSpec:
         if self.nelx < 1 or self.nely < 1:
             raise ValueError("nelx and nely must be >= 1")
         _check_mode(self.mode, self.size)
+
+    #: the element this spec meshes into
+    element: Element = field(default=QUAD4, init=False, repr=False, compare=False)
 
     @property
     def structured(self) -> bool:
@@ -112,6 +116,9 @@ class MeshSpec3D:
         if self.nelx < 1 or self.nely < 1 or self.nelz < 1:
             raise ValueError("nelx, nely and nelz must be >= 1")
         _check_mode(self.mode, self.size)
+
+    #: the element this spec meshes into
+    element: Element = field(default=HEX8, init=False, repr=False, compare=False)
 
     @property
     def structured(self) -> bool:

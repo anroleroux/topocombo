@@ -17,13 +17,12 @@ from typing import Any
 import meshio
 import numpy as np
 
+from .elements import HEX8, boundary_facets, triangulate
 from .mesh_io import Mesh
 
 #: The six faces of a hexahedron, corners ordered so the right-hand normal
 #: points out of a positively oriented cell (VTK / Gmsh reference numbering).
-HEX_FACES = np.array(
-    [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
-)
+HEX_FACES = np.array(HEX8.facets)
 
 
 def extrude(mesh: Mesh, thickness: float) -> Mesh:
@@ -45,12 +44,9 @@ def extrude(mesh: Mesh, thickness: float) -> Mesh:
     return Mesh(nodes=nodes, cells=cells, node_sets={}, cell_type="hexahedron")
 
 
-def boundary_faces(cells: np.ndarray) -> np.ndarray:
-    """Outward quads bounding the union of ``cells`` (hexes), shape (k, 4)."""
-    faces = cells[:, HEX_FACES].reshape(-1, 4)
-    keys = np.sort(faces, axis=1)
-    _, inverse, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
-    return faces[counts[inverse.ravel()] == 1]
+def boundary_faces(cells: np.ndarray, el=HEX8) -> np.ndarray:
+    """Outward facets bounding the union of ``cells`` (hexes by default)."""
+    return boundary_facets(el, cells)
 
 
 def solid_surface(
@@ -58,8 +54,7 @@ def solid_surface(
 ) -> tuple[np.ndarray, np.ndarray]:
     """(points, triangles) of the thresholded design's closed outer surface."""
     solid = np.asarray(densities) >= threshold
-    quads = boundary_faces(mesh.cells[solid])
-    triangles = np.vstack([quads[:, [0, 1, 2]], quads[:, [0, 2, 3]]])
+    triangles = triangulate(boundary_faces(mesh.cells[solid], mesh.element))
     # keep only the points the surface uses, renumbered
     used, tri = np.unique(triangles, return_inverse=True)
     return mesh.nodes[used], tri.reshape(triangles.shape)

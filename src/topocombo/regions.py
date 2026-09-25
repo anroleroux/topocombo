@@ -21,20 +21,7 @@ import numpy as np
 
 import cadquery as cq
 
-#: Element edges and boundary facets per cell type, in local node indices.
-_EDGES = {
-    "quad": [(0, 1), (1, 2), (2, 3), (3, 0)],
-    "hexahedron": [
-        (0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
-        (0, 4), (1, 5), (2, 6), (3, 7),
-    ],
-}
-_FACETS = {
-    "quad": [(0, 1), (1, 2), (2, 3), (3, 0)],
-    "hexahedron": [
-        (0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7),
-    ],
-}
+from .elements import boundary_facets, element
 
 _KINDS = (cq.Vertex, cq.Edge, cq.Wire, cq.Face, cq.Shell)
 
@@ -117,11 +104,11 @@ def node_shares(nodes: np.ndarray, cells: np.ndarray, cell_type: str,
         raise ValueError(f"region '{name}' is a face: a 2D part takes loads on edges or vertices")
     inside = np.zeros(nodes.shape[0], dtype=bool)
     inside[selected] = True
+    el = element(cell_type)
     if dim == mesh_dim - 1:  # boundary facets: edges of a 2D mesh, faces of a 3D one
-        local = _FACETS[cell_type]
-        pieces = _boundary(cells, local)
+        pieces = boundary_facets(el, cells)
     else:  # a line inside a face or along an edge of a 3D mesh: element edges
-        pieces = np.unique(np.sort(cells[:, np.array(_EDGES[cell_type])].reshape(-1, 2), axis=1), axis=0)
+        pieces = np.unique(np.sort(cells[:, np.array(el.edges)].reshape(-1, 2), axis=1), axis=0)
     pieces = pieces[np.all(inside[pieces], axis=1)]
     if pieces.size == 0:
         raise ValueError(f"region '{name}': its nodes span no element edge or face")
@@ -130,14 +117,6 @@ def node_shares(nodes: np.ndarray, cells: np.ndarray, cell_type: str,
         np.add.at(weight, piece, _measure(nodes[piece]) / len(piece))
     shares = weight[selected]
     return shares / shares.sum()
-
-
-def _boundary(cells: np.ndarray, local: list[tuple[int, ...]]) -> np.ndarray:
-    """Facets (as node rows, original order) that belong to exactly one cell."""
-    facets = cells[:, np.array(local)].reshape(-1, len(local[0]))
-    keys = np.sort(facets, axis=1)
-    _, first, counts = np.unique(keys, axis=0, return_index=True, return_counts=True)
-    return facets[first[counts == 1]]
 
 
 def _measure(points: np.ndarray) -> float:

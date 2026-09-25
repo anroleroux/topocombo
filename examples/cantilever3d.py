@@ -16,9 +16,10 @@ height = 20.0  # along y
 width = 1.0  # along z
 
 # circular cutouts through z, as (x, y, diameter).  The hole started at
-# mid-height, (20, 10); it is moved -20 in y to test that every stage copes
-# with whatever the CAD produces.
-holes = [(20.0, -10.0, 10.0)]
+# mid-height, (20, 10); it is moved down to the bottom edge, y = 0, where it
+# bites a half-circle notch out of the beam — a boundary that is no longer a
+# rectangle, to test that every stage copes with whatever the CAD produces.
+holes = [(20.0, 0.0, 10.0)]
 
 result = cq.Workplane("XY").box(length, height, width, centered=False)
 for x, y, d in holes:

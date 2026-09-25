@@ -1346,9 +1346,9 @@ def test_the_example_script_builds_the_published_part():
     domain = CadDomain.from_file(EXAMPLE)
     assert domain.dim == 3 and domain.path == str(EXAMPLE)
     assert (domain.length, domain.height, domain.width) == pytest.approx((60.0, 20.0, 1.0))
-    # the hole at y = -10 lies wholly below the beam: the cut removes nothing
-    assert domain.material_volume == pytest.approx(1200.0)
-    assert not domain.has_cutouts
+    # the hole on the bottom edge (y = 0) bites a half-circle notch out of the beam
+    assert domain.material_volume == pytest.approx(1200.0 - np.pi * 25.0 / 2)
+    assert domain.has_cutouts
     assert domain.cadquery_script() == EXAMPLE.read_text()
 
 

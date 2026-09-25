@@ -115,11 +115,11 @@ resulting CAD shape alongside one of the optimized topology.
 
 Cutouts are given as `--hole X,Y,D` (repeatable) or cut in a script. The
 published script has one hole of diameter 10 mm at x = 20, moved from
-mid-height (y = 10) to y = -10 as a generalisation test: it now lies wholly
-below the beam (y from -15 to -5), so the cut removes nothing and the part is
-the plain 60 x 20 x 1 box — which every stage handles, reproducing the plain
-beam's 559.2 / 899.98 N·mm. A hole that bites into an edge (y = 0 or y = -4)
-runs through both mesh modes and the optimizer too; the tests cover a notch.
+mid-height (y = 10) to the bottom edge (y = 0) as a generalisation test: it
+now bites a half-circle notch out of the beam, so the profile is no longer a
+rectangle with an interior hole. Body-fitted, that meshes into 1214 hexes and
+converges in 48 iterations to 1127 N·mm (761 N·mm at full density); on the
+structured grid 40 cells are held void, giving 1111 N·mm.
 CadQuery cuts holes from the model, so the script, STEP, BREP and picture all
 carry them. The structured grid still covers the full L x H envelope
 (`design_envelope.brep` is what Gmsh meshes), and the elements whose centres

@@ -15,7 +15,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import scipy.sparse as sp
@@ -157,7 +157,7 @@ def optimize(
     material: Material,
     thickness: float,
     load: LoadCase,
-    fixed_node_set: str,
+    fixed_node_set: str | Sequence[str],
     params: SimpParams | None = None,
     on_iteration: Callable[[dict[str, float], np.ndarray], None] | None = None,
     passive: np.ndarray | None = None,

@@ -6,11 +6,11 @@ import argparse
 import sys
 from pathlib import Path
 
-from .geometry import BeamDomain, BeamDomain3D, CadDomain, Domain
+from .geometry import BeamDomain, BeamDomain3D, Domain
 from .meshing import MESH_MODES, MeshSpec, MeshSpec3D
 
 #: Inputs of the parametric beam and their defaults.  The flags default to None
-#: so a flag that --cad-script makes meaningless can be rejected.
+#: so a flag that --study makes meaningless can be rejected.
 CAD_DEFAULTS = {
     "dim": 2, "length": 60.0, "height": 20.0, "thickness": 1.0, "width": 1.0, "holes": (),
 }
@@ -25,14 +25,23 @@ def _hole(text: str) -> tuple[float, float, float]:
     return x, y, d
 
 
+#: Flags a study sets itself; given together with --study they are an error.
+#: (--out, --site and --no-optimize still apply.)
+_STUDY_SETS = (
+    "dim", "length", "height", "thickness", "width", "holes", "nelx", "nely", "nelz",
+    "mesh_mode", "mesh_size", "youngs", "poisson", "load", "volfrac", "penal", "rmin",
+    "filter_type", "max_iter", "tol",
+)
+
+
 def _add_cad_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
-        "--cad-script",
+        "--study",
         type=Path,
         default=None,
-        help="CadQuery script that assigns the part to `result`: a face in the x-y plane"
-        " (2D) or a solid prismatic along z (3D), bounding box starting at the origin."
-        " Replaces the parametric beam flags below (--thickness still applies in 2D)",
+        help="a study script (study.py): it names the CadQuery part script and sets the"
+        " mesh, material, constraints, loads and optimizer. Without it, the flags below"
+        " describe a parametric cantilever",
     )
     p.add_argument(
         "--dim",
@@ -64,14 +73,25 @@ def _add_cad_args(p: argparse.ArgumentParser) -> None:
     )
 
 
-def _resolve_cad_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+def _resolve_cad_args(
+    parser: argparse.ArgumentParser, sub: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
     """Fill the parametric beam inputs in ``args`` with their defaults; with
-    --cad-script the script is the geometry, so its flags are rejected."""
-    if args.cad_script is not None:
-        given = [k for k in CAD_DEFAULTS if k != "thickness" and getattr(args, k) is not None]
+    --study the study sets them, so giving them too is rejected."""
+    if args.study is not None:
+        given = [
+            k for k in _STUDY_SETS
+            if hasattr(args, k) and getattr(args, k) != sub.get_default(k)
+        ]
         if given:
-            flags = ", ".join("--hole" if k == "holes" else f"--{k}" for k in given)
-            parser.error(f"--cad-script defines the geometry; drop {flags}")
+            flags = ", ".join(
+                {"holes": "--hole", "mesh_mode": "--mesh", "filter_type": "--filter"}.get(
+                    k, "--" + k.replace("_", "-")
+                )
+                for k in given
+            )
+            parser.error(f"--study sets these itself; drop {flags}")
+        return
     for key, default in CAD_DEFAULTS.items():
         if getattr(args, key) is None:
             setattr(args, key, default)
@@ -79,10 +99,6 @@ def _resolve_cad_args(parser: argparse.ArgumentParser, args: argparse.Namespace)
 
 def _domain(parser: argparse.ArgumentParser, args: argparse.Namespace) -> Domain:
     try:
-        if args.cad_script is not None:
-            domain = CadDomain.from_file(args.cad_script, thickness=args.thickness)
-            args.dim = domain.dim
-            return domain
         if args.dim == 3:
             return BeamDomain3D(
                 length=args.length, height=args.height, width=args.width, holes=args.holes
@@ -189,21 +205,47 @@ def main(argv: list[str] | None = None) -> int:
     p_all.add_argument("--site", type=Path, default=Path("site"))
 
     args = parser.parse_args(argv)
-    if args.command in ("cad", "run", "all"):
-        _resolve_cad_args(parser, args)
+    subparsers = {"cad": p_cad, "run": p_run, "all": p_all}
+    if args.command in subparsers:
+        _resolve_cad_args(parser, subparsers[args.command], args)
+
+    loaded = None
+    if getattr(args, "study", None) is not None:
+        from .study import load_study
+
+        try:
+            loaded = load_study(args.study)
+        except (OSError, ValueError) as exc:
+            parser.error(f"--study: {exc}")
 
     if args.command == "cad":
         from .cadview import render_brep
         from .geometry import export_domain
 
-        domain = _domain(parser, args)
+        domain = loaded.domain if loaded else _domain(parser, args)
         print(domain.cadquery_script())
         exported = export_domain(domain, args.out)
         exported["png"] = render_brep(exported["brep"], args.out / "design_domain.png")
         for kind, path in exported.items():
             print(f"{kind}: {path}")
 
-    if args.command in ("run", "all"):
+    if args.command in ("run", "all") and loaded is not None:
+        from .optimize import SimpParams
+        from .pipeline import run
+
+        s = loaded.study
+        run(
+            domain=loaded.domain,
+            spec=loaded.spec,
+            out_dir=args.out,
+            material=s.material,
+            simp=s.optimize or SimpParams(),
+            optimize_design=s.optimize is not None and not args.no_optimize,
+            constraints=s.constraints,
+            loads=s.loads,
+            study=loaded,
+        )
+    elif args.command in ("run", "all"):
         from .fea import Material
         from .optimize import SimpParams
         from .pipeline import run

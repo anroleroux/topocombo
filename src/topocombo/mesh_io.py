@@ -20,7 +20,7 @@ import meshio
 import numpy as np
 
 from .geometry import Domain
-from .meshing import PHYS_FIXED, PHYS_LOAD
+from .meshing import PHYS_DOMAIN
 
 
 #: Nodes per cell for every supported cell type (meshio naming).
@@ -218,9 +218,9 @@ def load_mesh(msh_path: Path) -> Mesh:
 
     tags = _physical_tags(mesh)
     node_sets: dict[str, np.ndarray] = {}
-    for name in (PHYS_FIXED, PHYS_LOAD):
-        if name in tags:
-            node_sets[name] = _nodes_in_group(mesh, tags[name], BOUNDARY_CELL[cell_type])
+    for name, tag in tags.items():  # boundary groups, if the .msh carries any
+        if name != PHYS_DOMAIN:
+            node_sets[name] = _nodes_in_group(mesh, tag, BOUNDARY_CELL[cell_type])
 
     return Mesh(nodes=nodes, cells=cells, node_sets=node_sets, cell_type=cell_type)
 
@@ -319,9 +319,9 @@ def check_mesh(
             np.all(np.abs(lower) < 1e-9) and np.all(np.abs(upper - extent) < 1e-9 * extent)
         ),
         "no_orphan_nodes": bool(np.unique(mesh.cells).size == mesh.n_nodes),
-        "fixed_set_non_empty": bool(mesh.node_sets.get(PHYS_FIXED, np.empty(0)).size > 0),
-        "load_set_non_empty": bool(mesh.node_sets.get(PHYS_LOAD, np.empty(0)).size > 0),
     }
+    for set_name, idx in mesh.node_sets.items():
+        checks[f"region_{set_name}_has_nodes"] = bool(np.asarray(idx).size > 0)
 
     return {
         "n_nodes": mesh.n_nodes,
@@ -359,6 +359,8 @@ def save_mesh(
     load_node: int | None = None,
     load_nodes: np.ndarray | None = None,
     passive: np.ndarray | None = None,
+    fixed_nodes: np.ndarray | None = None,
+    load_vector: Any = None,
 ) -> dict[str, Path]:
     """Write the solver-facing ``mesh.npz`` and the visualisation-facing ``mesh.vtu``.
 
@@ -380,6 +382,10 @@ def save_mesh(
         arrays["load_nodes"] = np.asarray(load_nodes, dtype=int)
     if passive is not None:
         arrays["passive"] = np.asarray(passive, dtype=bool)
+    if fixed_nodes is not None:  # every constrained node, whatever its region
+        arrays["fixed_nodes"] = np.asarray(fixed_nodes, dtype=int)
+    if load_vector is not None:  # the total force, for drawing its direction
+        arrays["load_vector"] = np.asarray(load_vector, dtype=float)
 
     npz = out_dir / "mesh.npz"
     np.savez_compressed(npz, **arrays)

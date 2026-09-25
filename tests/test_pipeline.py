@@ -10,7 +10,9 @@ from scipy.spatial import cKDTree
 
 from topocombo.geometry import BeamDomain
 from topocombo.mesh_io import Mesh, load_mesh
-from topocombo.meshing import PHYS_FIXED, PHYS_LOAD, MeshSpec
+from topocombo.geometry import BEAM_FIXED, BEAM_LOAD
+from topocombo.meshing import MeshSpec
+from topocombo.regions import apply_regions
 from topocombo.pipeline import run
 from topocombo.report import build_site
 
@@ -73,15 +75,19 @@ def test_mesh_is_a_uniform_structured_grid(coarse_run):
 
 
 def test_boundary_node_sets(coarse_run):
+    """The beam's regions pick the clamped edge and the tip-load node; the mesh
+    file itself carries no boundary groups any more."""
     mesh = load_mesh(coarse_run["dir"] / "mesh" / "beam.msh")
     domain, spec = coarse_run["domain"], coarse_run["spec"]
+    assert mesh.node_sets == {}
+    apply_regions(mesh, domain.regions())
 
-    fixed = mesh.node_sets[PHYS_FIXED]
-    load_edge = mesh.node_sets[PHYS_LOAD]
+    fixed = mesh.node_sets[BEAM_FIXED]
+    load = mesh.node_sets[BEAM_LOAD]
     assert fixed.size == spec.nely + 1
-    assert load_edge.size == spec.nely + 1
     assert np.allclose(mesh.nodes[fixed, 0], 0.0)
-    assert np.allclose(mesh.nodes[load_edge, 0], domain.length)
+    assert load.size == 1
+    assert mesh.nodes[load[0]] == pytest.approx(domain.load_point)
 
 
 def test_load_node_sits_at_the_free_edge_mid_height(coarse_run):
@@ -95,7 +101,7 @@ def test_solver_facing_npz(coarse_run):
     assert data["nodes"].shape == (spec.n_nodes, 2)
     assert data["cells"].shape == (spec.n_elements, 4)
     assert str(data["cell_type"]) == "quad"
-    assert f"set_{PHYS_FIXED}" in data
+    assert f"set_{BEAM_FIXED}" in data
     assert int(data["load_node"][0]) in range(spec.n_nodes)
     assert (coarse_run["dir"] / "mesh" / "mesh.vtu").exists()
 
@@ -159,9 +165,10 @@ def slender_beam(tmp_path_factory):
     spec = MeshSpec(nelx=80, nely=8)
     _, summary = run(domain=domain, spec=spec, out_dir=out, echo=False)
     mesh = load_mesh(out / "mesh" / "beam.msh")
+    apply_regions(mesh, domain.regions())
     material = Material()
     load = LoadCase(node=summary["load_node"], fy=-500.0)
-    result = solve(mesh, material, domain.thickness, load, PHYS_FIXED)
+    result = solve(mesh, material, domain.thickness, load, BEAM_FIXED)
     return {"domain": domain, "mesh": mesh, "material": material, "load": load, "result": result}
 
 
@@ -260,7 +267,7 @@ def test_solution_scales_linearly_with_load(slender_beam):
     doubled = solve(
         mesh, material, domain.thickness,
         LoadCase(node=slender_beam["load"].node, fy=2.0 * slender_beam["load"].fy),
-        PHYS_FIXED,
+        BEAM_FIXED,
     )
     assert np.allclose(doubled.u, 2.0 * base.u)
     assert doubled.compliance == pytest.approx(4.0 * base.compliance, rel=1e-9)
@@ -269,7 +276,7 @@ def test_solution_scales_linearly_with_load(slender_beam):
 def test_density_scaling_softens_the_structure(slender_beam):
     mesh, material, domain = slender_beam["mesh"], slender_beam["material"], slender_beam["domain"]
     half = solve(
-        mesh, material, domain.thickness, slender_beam["load"], PHYS_FIXED,
+        mesh, material, domain.thickness, slender_beam["load"], BEAM_FIXED,
         densities=np.full(mesh.n_elements, 0.5), penal=3.0,
     )
     # uniform density x with penalty p scales stiffness by x^p, so compliance by x^-p
@@ -320,7 +327,7 @@ def optimized(slender_beam):
         material=slender_beam["material"],
         thickness=slender_beam["domain"].thickness,
         load=slender_beam["load"],
-        fixed_node_set=PHYS_FIXED,
+        fixed_node_set=BEAM_FIXED,
         params=params,
         on_iteration=lambda record, densities: seen.append(record),
     )
@@ -390,7 +397,7 @@ def test_optimization_reduces_compliance(optimized):
     # and beats a uniform design of the same volume, which is the naive alternative
     uniform = solve(
         optimized["mesh"], optimized["material"], optimized["domain"].thickness,
-        optimized["load"], PHYS_FIXED,
+        optimized["load"], BEAM_FIXED,
         densities=np.full(optimized["mesh"].n_elements, optimized["params"].volume_fraction),
         penal=optimized["params"].penal,
     )
@@ -529,16 +536,16 @@ def test_hex_mesh_is_a_uniform_structured_grid(hex_run):
 
 
 def test_hex_boundary_faces(hex_run):
-    msh, domain, spec = hex_run["msh"], hex_run["domain"], hex_run["spec"]
-    face_nodes = (spec.nely + 1) * (spec.nelz + 1)
-    fixed = np.unique(_group_cells(msh, PHYS_FIXED, "quad"))
-    loaded = np.unique(_group_cells(msh, PHYS_LOAD, "quad"))
-    assert fixed.size == loaded.size == face_nodes
-    assert np.allclose(msh.points[fixed, 0], 0.0)
-    assert np.allclose(msh.points[loaded, 0], domain.length)
-    # the load line (mid-height, across the width) lies on the loaded face
-    on_line = np.isclose(msh.points[loaded, 1], domain.height / 2.0)
-    assert on_line.sum() == spec.nelz + 1
+    """The clamped face region picks the whole x = 0 face; the load region, a
+    line across the free end, picks its mid-height nodes."""
+    domain, spec = hex_run["domain"], hex_run["spec"]
+    mesh = load_mesh(hex_run["msh_path"])
+    apply_regions(mesh, domain.regions())
+    fixed, loaded = mesh.node_sets[BEAM_FIXED], mesh.node_sets[BEAM_LOAD]
+    assert fixed.size == (spec.nely + 1) * (spec.nelz + 1)
+    assert np.allclose(mesh.nodes[fixed, 0], 0.0)
+    assert loaded.size == spec.nelz + 1
+    assert np.allclose(mesh.nodes[loaded, :2], [domain.length, domain.height / 2.0])
 
 
 # --------------------------------------------------------------------------
@@ -576,8 +583,6 @@ def test_load_mesh_reads_hexes_and_face_node_sets(hex_run):
 
     volumes = mesh.cell_measures()
     assert np.allclose(volumes, domain.volume / spec.n_elements)  # all positive, all equal
-    face_nodes = (spec.nely + 1) * (spec.nelz + 1)
-    assert mesh.node_sets[PHYS_FIXED].size == mesh.node_sets[PHYS_LOAD].size == face_nodes
 
     edges = mesh.edge_lengths()
     assert edges.shape == (spec.n_elements, 12)
@@ -615,7 +620,8 @@ def test_mesh_rejects_nodes_of_the_wrong_dimension():
 def test_load_line_is_picked_from_the_loaded_face(hex_run):
     mesh = load_mesh(hex_run["msh_path"])
     domain, spec = hex_run["domain"], hex_run["spec"]
-    line = nodes_on_segment(mesh, *domain.load_line, candidates=mesh.node_sets[PHYS_LOAD])
+    apply_regions(mesh, domain.regions())
+    line = nodes_on_segment(mesh, *domain.load_line, candidates=mesh.node_sets[BEAM_LOAD])
     assert line.size == spec.nelz + 1
     assert np.allclose(mesh.nodes[line, :2], [domain.length, domain.height / 2.0])
     assert np.all(np.diff(mesh.nodes[line, 2]) > 0)  # ordered from the start point
@@ -638,17 +644,21 @@ def test_hex_mesh_artifacts(hex_run, tmp_path):
 def _hex_mesh(out, domain: BeamDomain3D, spec: MeshSpec3D) -> Mesh:
     cad = export_domain(domain, out / "cad")
     msh, _ = generate_hex_mesh(domain, spec, cad["brep"], out / "mesh")
-    return load_mesh(msh)
+    mesh = load_mesh(msh)
+    apply_regions(mesh, domain.regions())
+    return mesh
 
 
 def _quad_mesh(out, domain: BeamDomain, spec: MeshSpec) -> Mesh:
     cad = export_domain(domain, out / "cad")
     msh, _ = generate_quad_mesh(domain, spec, cad["brep"], out / "mesh")
-    return load_mesh(msh)
+    mesh = load_mesh(msh)
+    apply_regions(mesh, domain.regions())
+    return mesh
 
 
 def _tip_line_load(mesh: Mesh, domain: BeamDomain3D, fy: float) -> LoadCase:
-    line = nodes_on_segment(mesh, *domain.load_line, candidates=mesh.node_sets[PHYS_LOAD])
+    line = nodes_on_segment(mesh, *domain.load_line, candidates=mesh.node_sets[BEAM_LOAD])
     return LoadCase.along_line(mesh, line, fy=fy)
 
 
@@ -723,10 +733,10 @@ def test_hex_solve_matches_plane_stress_with_one_element_through_the_width(tmp_p
     mesh2 = _quad_mesh(tmp_path / "q4", domain2, MeshSpec(nelx=20, nely=4))
     mesh3 = _hex_mesh(tmp_path / "h8", domain3, MeshSpec3D(nelx=20, nely=4, nelz=1))
 
-    r2 = solve(mesh2, material, width, LoadCase(node=find_node(mesh2, domain2.load_point), fy=-1000.0), PHYS_FIXED)
+    r2 = solve(mesh2, material, width, LoadCase(node=find_node(mesh2, domain2.load_point), fy=-1000.0), BEAM_FIXED)
     load3 = _tip_line_load(mesh3, domain3, fy=-1000.0)
     assert load3.node_shares() == pytest.approx([0.5, 0.5])
-    r3 = solve(mesh3, material, width, load3, PHYS_FIXED)
+    r3 = solve(mesh3, material, width, load3, BEAM_FIXED)
 
     assert r3.compliance == pytest.approx(r2.compliance, rel=1e-10)
 
@@ -754,7 +764,7 @@ def slender_hex_beam(tmp_path_factory):
     mesh = _hex_mesh(out, domain, MeshSpec3D(nelx=80, nely=8, nelz=1))
     material = Material()
     load = _tip_line_load(mesh, domain, fy=-500.0)
-    result = solve(mesh, material, domain.width, load, PHYS_FIXED)
+    result = solve(mesh, material, domain.width, load, BEAM_FIXED)
     return {"domain": domain, "mesh": mesh, "material": material, "load": load, "result": result, "dir": out}
 
 
@@ -781,11 +791,11 @@ def test_hex_solution_is_linear_and_softens_with_density(slender_hex_beam):
     base, load = slender_hex_beam["result"], slender_hex_beam["load"]
     doubled = solve(
         mesh, material, domain.width,
-        LoadCase(node=load.node, fy=2.0 * load.fy, shares=load.shares), PHYS_FIXED,
+        LoadCase(node=load.node, fy=2.0 * load.fy, shares=load.shares), BEAM_FIXED,
     )
     assert np.allclose(doubled.u, 2.0 * base.u)
     half = solve(
-        mesh, material, domain.width, load, PHYS_FIXED,
+        mesh, material, domain.width, load, BEAM_FIXED,
         densities=np.full(mesh.n_elements, 0.5), penal=3.0,
     )
     assert half.compliance == pytest.approx(8.0 * base.compliance, rel=1e-6)
@@ -816,8 +826,8 @@ def test_hex_optimization_matches_the_2d_design_with_one_element_through_the_wid
     mesh3 = _hex_mesh(tmp_path / "h8", domain3, MeshSpec3D(nelx=30, nely=10, nelz=1))
 
     load2 = LoadCase(node=find_node(mesh2, domain2.load_point), fy=-1000.0)
-    design2 = optimize(mesh2, material, width, load2, PHYS_FIXED, params)
-    design3 = optimize(mesh3, material, width, _tip_line_load(mesh3, domain3, -1000.0), PHYS_FIXED, params)
+    design2 = optimize(mesh2, material, width, load2, BEAM_FIXED, params)
+    design3 = optimize(mesh3, material, width, _tip_line_load(mesh3, domain3, -1000.0), BEAM_FIXED, params)
 
     assert design3.iterations == design2.iterations
     c2 = [h["compliance"] for h in design2.history]
@@ -838,7 +848,7 @@ def optimized_hex(tmp_path_factory):
     params = SimpParams(volume_fraction=0.4, filter_radius=1.5, max_iterations=15, tolerance=0.02)
     seen: list[dict[str, float]] = []
     result = optimize(
-        mesh, material, domain.width, load, PHYS_FIXED, params,
+        mesh, material, domain.width, load, BEAM_FIXED, params,
         on_iteration=lambda record, densities: seen.append(record),
     )
     return {"domain": domain, "mesh": mesh, "material": material, "load": load,
@@ -855,7 +865,7 @@ def test_hex_optimization_holds_the_volume_constraint(optimized_hex):
 def test_hex_optimization_beats_a_uniform_design(optimized_hex):
     o = optimized_hex
     uniform = solve(
-        o["mesh"], o["material"], o["domain"].width, o["load"], PHYS_FIXED,
+        o["mesh"], o["material"], o["domain"].width, o["load"], BEAM_FIXED,
         densities=np.full(o["mesh"].n_elements, o["params"].volume_fraction), penal=o["params"].penal,
     )
     assert o["result"].compliance < 0.5 * uniform.compliance
@@ -1188,13 +1198,13 @@ def test_void_mask_picks_the_centroids_inside_the_cutout():
 
 def test_passive_elements_stay_void_and_the_volume_holds():
     mesh = _brick_grid(8, 4, 1)
-    mesh.node_sets[PHYS_FIXED] = np.flatnonzero(mesh.nodes[:, 0] == 0.0)
+    mesh.node_sets[BEAM_FIXED] = np.flatnonzero(mesh.nodes[:, 0] == 0.0)
     tip = int(np.flatnonzero((mesh.nodes[:, 0] == 8.0) & (mesh.nodes[:, 1] == 2.0))[0])
     passive = np.zeros(mesh.n_elements, dtype=bool)
     passive[:4] = True  # the column of elements next to the clamp
     for filter_type in ("sensitivity", "density"):
         design = optimize(
-            mesh, Material(), 1.0, LoadCase(node=tip, fy=-10.0), PHYS_FIXED,
+            mesh, Material(), 1.0, LoadCase(node=tip, fy=-10.0), BEAM_FIXED,
             SimpParams(max_iterations=8, filter_type=filter_type, filter_radius=1.5),
             passive=passive,
         )
@@ -1326,53 +1336,74 @@ def test_cli_runs_a_body_fitted_mesh(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# geometry as code: any CadQuery script (--cad-script)
+# a design as two Python scripts: part.py (geometry + regions) and study.py
 # --------------------------------------------------------------------------
 from pathlib import Path  # noqa: E402
 
-EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "cantilever3d.py"
+from topocombo.regions import node_shares, region_dim  # noqa: E402
+from topocombo.study import Fix, Force, Mesh as StudyMesh, Study, load_study  # noqa: E402
+
+EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "cantilever"
 
 
-def _holed_box(y: float, length: float = 60.0, height: float = 20.0, d: float = 10.0) -> str:
+def _part(length=12.0, height=4.0, notch_y=0.0, d=2.0, regions=None) -> str:
+    regions = regions or (
+        '{"wall": result.faces("<X"), "tip": cq.Edge.makeLine('
+        f'cq.Vector({length}, {height / 2}, 0), cq.Vector({length}, {height / 2}, 1))}}'
+    )
     return (
         "import cadquery as cq\n"
         f"result = cq.Workplane('XY').box({length}, {height}, 1.0, centered=False)\n"
-        f"result = result.cut(cq.Workplane('XY').center({length / 3}, {y}).circle({d / 2})"
-        ".extrude(3.0, both=True))\n"
+        f"result = result.cut(cq.Workplane('XY').center({length / 3}, {notch_y})"
+        f".circle({d / 2}).extrude(3.0, both=True))\n"
+        f"regions = {regions}\n"
     )
 
 
-def test_the_example_script_builds_the_published_part():
-    domain = CadDomain.from_file(EXAMPLE)
-    assert domain.dim == 3 and domain.path == str(EXAMPLE)
+def _study(tmp_path, part_source: str, body: str) -> Path:
+    (tmp_path / "part.py").write_text(part_source)
+    study = tmp_path / "study.py"
+    study.write_text(
+        "from topocombo.study import Fix, Force, Material, Mesh, SimpParams, Study\n"
+        f"study = Study(part='part.py', {body})\n"
+    )
+    return study
+
+
+def test_the_example_study_loads_its_part_and_regions():
+    loaded = load_study(EXAMPLE / "study.py")
+    domain = loaded.domain
+    assert domain.dim == 3 and domain.path == str(EXAMPLE / "part.py")
     assert (domain.length, domain.height, domain.width) == pytest.approx((60.0, 20.0, 1.0))
     # the hole on the bottom edge (y = 0) bites a half-circle notch out of the beam
     assert domain.material_volume == pytest.approx(1200.0 - np.pi * 25.0 / 2)
-    assert domain.has_cutouts
-    assert domain.cadquery_script() == EXAMPLE.read_text()
+    assert set(domain.regions()) == {"wall", "tip"}
+    assert region_dim(domain.regions()["wall"]) == 2 and region_dim(domain.regions()["tip"]) == 1
+    assert loaded.study.constraints == (Fix("wall"),)
+    assert loaded.study.loads == (Force("tip", (0.0, -1000.0, 0.0)),)
+    assert loaded.spec.mode == "body-fitted" and loaded.spec.nelz == 1
 
 
-def test_a_script_notch_is_read_from_the_shape():
-    domain = CadDomain(_holed_box(0.0))  # a half-hole bitten out of the bottom edge
+def test_a_part_notch_is_read_from_the_shape():
+    domain = CadDomain(_part(60.0, 20.0, 0.0, 10.0))
     assert domain.has_cutouts
     assert domain.material_area == pytest.approx(1200.0 - np.pi * 25.0 / 2)
-    assert domain.material_volume == pytest.approx(domain.material_area)
     assert domain.envelope().volume == pytest.approx(1200.0)
     centroids = np.array([[20.0, 0.5, 0.5], [20.0, 10.0, 0.5], [40.0, 0.5, 0.5]])
     assert domain.void_mask(centroids).tolist() == [True, False, False]
-    assert domain.load_line == ((60.0, 10.0, 0.0), (60.0, 10.0, 1.0))
 
 
-def test_a_script_face_is_a_2d_domain():
+def test_a_part_face_is_a_2d_domain():
     source = (
         "import cadquery as cq\n"
         "result = cq.Workplane('XY').rect(12.0, 4.0, centered=False).extrude(1.0)"
         ".faces('<Z').val()\n"
+        "regions = {'left': cq.Workplane().add(result).edges('<X')}\n"
     )
     domain = CadDomain(source, thickness=2.0)
     assert domain.dim == 2 and domain.thickness == 2.0
     assert domain.area == pytest.approx(48.0) and not domain.has_cutouts
-    assert domain.load_point == pytest.approx((12.0, 2.0))
+    assert region_dim(domain.regions()["left"]) == 1
 
 
 @pytest.mark.parametrize(
@@ -1381,61 +1412,124 @@ def test_a_script_face_is_a_2d_domain():
         ("result = cq.Workplane('XY').box(6, 2, 1)", "origin"),
         ("result = cq.Workplane('XY').box(6, 2, 1, centered=False).edges('|X').fillet(0.2)",
          "prism"),
-        ("result = cq.Workplane('XY').polyline([(0, 0), (6, 0), (6, 0.5), (3, 2), (0, 2)])"
-         ".close().extrude(1)", "load point"),
         ("result = cq.Workplane('XY').box(2, 2, 1, centered=False)"
          ".add(cq.Workplane('XY').box(2, 2, 1, centered=False).translate((4, 0, 0)).val())",
          "one connected"),
         ("box = cq.Workplane('XY').box(6, 2, 1)", "result"),
+        ("result = cq.Workplane('XY').box(6, 2, 1, centered=False)\nregions = {'all': result}",
+         "vertices, edges or faces"),
+        ("result = cq.Workplane('XY').box(6, 2, 1, centered=False)\n"
+         "regions = {'none': result.faces('%SPHERE')}", "selects nothing"),
     ],
-    ids=["off-origin", "not-a-prism", "no-load-edge", "two-solids", "no-result"],
+    ids=["off-origin", "not-a-prism", "two-solids", "no-result", "solid-region", "empty-region"],
 )
-def test_a_script_the_pipeline_cannot_mesh_is_rejected(body, message):
+def test_a_part_the_pipeline_cannot_use_is_rejected(body, message):
     with pytest.raises(ValueError, match=message):
         CadDomain("import cadquery as cq\n" + body + "\n")
 
 
+@pytest.mark.parametrize(
+    "body, message",
+    [
+        ("constraints=[], loads=[Force('tip', (0, -1, 0))]", "at least one Fix"),
+        ("constraints=[Fix('wall')], loads=[]", "exactly one Force"),
+        ("constraints=[Fix('base')], loads=[Force('tip', (0, -1, 0))]", "base not defined"),
+        ("constraints=[Fix('wall')], loads=[Force('tip', (0, -1))]", "2 components"),
+        ("constraints=[Fix('wall')], loads=[Force('tip', (0, -1, 0))], mesh=Mesh(mode='tet')",
+         "Mesh.mode"),
+        ("constraints=[Fix('wall')], loads=[Force('tip', (0, -1, 0))], mesh=Mesh(element='quad4')",
+         "hex8"),
+    ],
+    ids=["no-fix", "no-force", "unknown-region", "wrong-dimension", "bad-mode", "wrong-element"],
+)
+def test_a_study_that_does_not_fit_its_part_is_rejected(tmp_path, body, message):
+    with pytest.raises(ValueError, match=message):
+        load_study(_study(tmp_path, _part(), body))
+
+
+def test_loads_spread_by_tributary_length_and_area():
+    mesh = _brick_grid(2, 2, 1)  # 2 x 2 x 1 unit bricks
+    face = np.flatnonzero(np.isclose(mesh.nodes[:, 0], 2.0))  # the x = 2 face, 3 x 2 nodes
+    shares = node_shares(mesh.nodes, mesh.cells, mesh.cell_type, face, 2, "end")
+    corner, edge_mid = 1.0 / 8.0, 2.0 / 8.0  # a quarter of one / two unit facets, of 2
+    y = mesh.nodes[face, 1]
+    assert shares.sum() == pytest.approx(1.0)
+    assert np.allclose(shares[np.isclose(y, 1.0)], edge_mid)
+    assert np.allclose(shares[~np.isclose(y, 1.0)], corner)
+    line = face[np.isclose(mesh.nodes[face, 2], 0.0)]  # along y on that face: 3 nodes
+    shares = node_shares(mesh.nodes, mesh.cells, mesh.cell_type, line, 1, "edge")
+    assert sorted(shares) == pytest.approx([0.25, 0.25, 0.5])
+    with pytest.raises(ValueError, match="no mesh nodes"):
+        node_shares(mesh.nodes, mesh.cells, mesh.cell_type, np.empty(0, int), 1, "gone")
+
+
 @pytest.mark.parametrize("mode", ["structured", "body-fitted"])
-def test_cli_runs_any_cad_script(mode, tmp_path):
-    script = tmp_path / "notched.py"
-    script.write_text(_holed_box(0.0, length=12.0, height=4.0, d=2.0))
-    out = tmp_path / mode
-    code = cli_main([
-        "all", "--cad-script", str(script), "--nelx", "24", "--nely", "8", "--mesh", mode,
-        "--max-iter", "5", "--out", str(out), "--site", str(tmp_path / f"site-{mode}"),
-    ])
+def test_cli_runs_a_study(mode, tmp_path):
+    study = _study(
+        tmp_path, _part(),
+        f"mesh=Mesh(mode='{mode}', nelx=24, nely=8), constraints=[Fix('wall')], "
+        "loads=[Force('tip', (0.0, -1000.0, 0.0))], optimize=SimpParams(max_iterations=5)",
+    )
+    out = tmp_path / "run"
+    code = cli_main(["all", "--study", str(study), "--out", str(out),
+                     "--site", str(tmp_path / "site")])
     assert code == 0
     run_json = json.loads((out / "run.json").read_text())
-    assert run_json["params"]["dim"] == 3
-    assert run_json["params"]["domain"]["script_path"] == str(script)
+    params = run_json["params"]
+    assert params["dim"] == 3 and params["study"]["path"] == str(study)
+    assert params["boundary_conditions"]["constraints"][0]["region"] == "wall"
     steps = {step["name"]: step.get("data", {}) for step in run_json["steps"]}
     assert steps["validation"]["all_checks_passed"]
-    assert steps["solve"]["reaction_y"] == pytest.approx(1000.0, rel=1e-9)
-    assert (out / "cad" / "design_domain.py").read_text() == script.read_text()
+    assert steps["validation"]["node_sets"]["tip"] == 2
+    assert steps["solve"]["reactions"] == pytest.approx([0.0, 1000.0, 0.0], abs=1e-6)
+    assert steps["solve"]["beam_theory"] is None  # a study is not assumed to be a beam
+    assert (out / "study.py").read_text() == study.read_text()
+    assert (out / "cad" / "design_domain.py").read_text() == (tmp_path / "part.py").read_text()
     if mode == "structured":  # the grid cells in the notch are held void
         passive = np.load(out / "mesh" / "mesh.npz")["passive"]
         assert passive.sum() == steps["validation"]["passive_elements"] > 0
         densities = np.load(out / "optimization" / "density.npz")["densities"]
         assert np.all(densities[passive] == 0.0)
-    html = (tmp_path / f"site-{mode}" / "index.html").read_text()
-    assert "--cad-script" in html and str(script) in html
+    html = (tmp_path / "site" / "index.html").read_text()
+    assert "study.py" in html and "&#x27;wall&#x27;: face region" in html
 
 
-def test_cli_rejects_beam_flags_with_a_cad_script(tmp_path):
+def test_a_study_face_load_matches_the_line_load_it_spreads(tmp_path):
+    """The same total force over the whole free face instead of the mid-height
+    line: equilibrium still holds and every face node takes a share."""
+    study = _study(
+        tmp_path, _part(),
+        "mesh=Mesh(mode='structured', nelx=24, nely=8), constraints=[Fix('wall')], "
+        "loads=[Force('tip', (0.0, -1000.0, 0.0))], optimize=None",
+    )
+    part = (tmp_path / "part.py").read_text().replace(
+        '"tip": cq.Edge', '"tip": result.faces(">X"), "line": cq.Edge'
+    )
+    (tmp_path / "part.py").write_text(part)
+    from topocombo.study import run_study
+
+    _, summary = run_study(study, tmp_path / "run", echo=False)
+    assert len(summary["load_nodes"]) == 9 * 2  # the whole x = L face
+    assert summary["solve"]["reactions"][1] == pytest.approx(1000.0, rel=1e-9)
+
+
+def test_cli_rejects_flags_a_study_sets(tmp_path):
     with pytest.raises(SystemExit):
-        cli_main(["cad", "--cad-script", str(EXAMPLE), "--length", "30",
-                  "--out", str(tmp_path / "cad")])
+        cli_main(["run", "--study", str(EXAMPLE / "study.py"), "--volfrac", "0.3",
+                  "--out", str(tmp_path / "run")])
 
 
 # --------------------------------------------------------------------------
 # mesh and boundary-condition inputs in the report
 # --------------------------------------------------------------------------
-def test_run_records_the_boundary_conditions_as_inputs(coarse_run):
+def test_run_records_the_boundary_conditions(coarse_run):
     params = json.loads((coarse_run["dir"] / "run.json").read_text())["params"]
     bcs = params["boundary_conditions"]
+    assert bcs["constraints"][0]["region"] == BEAM_FIXED
+    assert bcs["constraints"][0]["kind"] == "edge"
     assert bcs["constraints"][0]["displacements"] == {"ux": 0.0, "uy": 0.0}
-    assert bcs["loads"][0]["force"] == {"fx": 0.0, "fy": params["load"]["fy"]}
-    assert bcs["loads"][0]["point"] == pytest.approx(list(coarse_run["domain"].load_point))
+    assert bcs["loads"][0]["region"] == BEAM_LOAD and bcs["loads"][0]["kind"] == "vertex"
+    assert bcs["loads"][0]["force"] == {"fx": 0.0, "fy": -1000.0}
     domain, spec = coarse_run["domain"], coarse_run["spec"]
     assert params["mesh"]["element_size"] == pytest.approx(
         [domain.length / spec.nelx, domain.height / spec.nely]
@@ -1444,11 +1538,11 @@ def test_run_records_the_boundary_conditions_as_inputs(coarse_run):
 
 def test_report_shows_the_mesh_force_and_constraint_inputs(coarse_run, fitted_run, tmp_path):
     html = build_site(run_dir=coarse_run["dir"], site_dir=tmp_path / "a").read_text()
-    for legend in ("Mesh size", "Force", "Displacement constraints"):
-        assert f"<legend>{legend}</legend>" in html
-    assert "name='fy' value='-1000' readonly data-control='--load'" in html
-    assert "name='ux' value='0' readonly" in html and "name='nelx'" in html
+    for title in ("Mesh size", "Loads", "Displacement constraints"):
+        assert f"<h3>{title}</h3>" in html
+    assert "(0, -1000)" in html and "clamped" in html
+    assert "<input" not in html  # a report, not a form
     fitted = build_site(run_dir=fitted_run["dir"], site_dir=tmp_path / "b").read_text()
-    assert "data-control='--mesh-size'" in fitted
+    assert "target element edge (mm)" in fitted
     if fitted_run["summary"]["dim"] == 3:
-        assert "name='uz'" in fitted and "name='fz'" in fitted
+        assert "(0, -1000, 0)" in fitted

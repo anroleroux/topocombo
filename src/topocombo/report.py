@@ -85,21 +85,8 @@ pre code { padding: 0; background: none; font-size: inherit; }
 figcaption { color: var(--muted); font-size: 0.85rem; margin-top: 10px; }
 .inputs { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px;
           margin-bottom: 16px; }
-.inputs fieldset { margin: 0; min-width: 0; background: var(--panel); border: 1px solid var(--border);
-                   border-radius: 10px; padding: 12px 16px 14px; }
-.inputs legend { padding: 0 6px; margin-left: -6px; font-weight: 600; font-size: 0.9rem; }
-.inputs .field { display: grid; grid-template-columns: minmax(0, 1fr) 7.5rem; gap: 2px 10px;
-                 align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); }
-.inputs .field:last-of-type { border-bottom: 0; }
-.inputs .field.wide { grid-template-columns: minmax(0, 1fr); }
-.inputs .field.wide input { text-align: left; }
-.inputs label { font-size: 0.85rem; }
-.inputs input { width: 100%; font-family: var(--mono); font-size: 0.85rem; text-align: right;
-                padding: 4px 8px; color: var(--text); background: var(--bg);
-                border: 1px solid var(--border); border-radius: 6px; }
-.inputs .hint { grid-column: 1 / -1; color: var(--muted); font-size: 0.75rem; }
-.inputs .hint code { font-size: 0.95em; }
-.inputs p { margin: 8px 0 0; color: var(--muted); font-size: 0.8rem; }
+.inputs h3 { font-size: 0.9rem; margin: 0 0 4px; }
+.inputs td { overflow-wrap: anywhere; }
 .step { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 14px; overflow: hidden; }
 .step > .head { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
                 background: var(--panel); border-bottom: 1px solid var(--border); }
@@ -222,8 +209,12 @@ def mesh_svg(
     data = np.load(npz_path)
     nodes, quads, drawn = _side_view(data["nodes"], data["cells"])
     passive = data["passive"][drawn] if "passive" in data else np.zeros(len(quads), dtype=bool)
-    fixed = data["set_fixed"] if "set_fixed" in data else np.empty(0, dtype=int)
+    if "fixed_nodes" in data:
+        fixed = data["fixed_nodes"]
+    else:  # runs from before regions
+        fixed = data["set_fixed"] if "set_fixed" in data else np.empty(0, dtype=int)
     load_node = int(data["load_node"][0]) if "load_node" in data else None
+    direction = _arrow_direction(data)
 
     xmin, ymin = nodes.min(axis=0)
     xmax, ymax = nodes.max(axis=0)
@@ -264,18 +255,25 @@ def mesh_svg(
             f'text-anchor="middle">\u2300{hd:g} cutout</text>'
         )
 
-    # outline
+    # outline: the bounding box, only when the mesh fills it (a body-fitted
+    # mesh of a notched part shows its own boundary through the elements)
     corners = [
         px(np.array([xmin, ymin])),
         px(np.array([xmax, ymin])),
         px(np.array([xmax, ymax])),
         px(np.array([xmin, ymax])),
     ]
-    parts.append(
-        '<polygon class="bd" points="'
-        + " ".join(f"{x:.2f},{y:.2f}" for x, y in corners)
-        + '"/>'
-    )
+    q = nodes[quads]
+    area = 0.5 * np.abs(
+        np.sum(q[:, :, 0] * np.roll(q[:, :, 1], -1, axis=1)
+               - np.roll(q[:, :, 0], -1, axis=1) * q[:, :, 1], axis=1)
+    ).sum()
+    if area >= 0.999 * span_x * span_y:
+        parts.append(
+            '<polygon class="bd" points="'
+            + " ".join(f"{x:.2f},{y:.2f}" for x, y in corners)
+            + '"/>'
+        )
 
     # clamped edge: hatching along the fixed boundary
     if fixed.size:
@@ -292,24 +290,20 @@ def mesh_svg(
             )
         parts.append(
             f'<text class="lbl" x="{fx - 12:.2f}" y="{top - 12:.2f}" text-anchor="start">'
-            f'fixed ({fixed.size} nodes)</text>'
+            f'clamped ({fixed.size} nodes)</text>'
         )
 
-    # tip load: downward arrow at the load node
+    # the load: an arrow along the force's in-plane direction, ending at the load node
     if load_node is not None:
         lx, ly = px(nodes[load_node])
-        parts.append(f'<line class="ld" x1="{lx:.2f}" y1="{ly - 34:.2f}" x2="{lx:.2f}" y2="{ly:.2f}"/>')
-        parts.append(
-            f'<polygon class="ld" points="{lx:.2f},{ly:.2f} {lx - 5:.2f},{ly - 11:.2f} '
-            f'{lx + 5:.2f},{ly - 11:.2f}"/>'
-        )
+        parts.append(_arrow(lx, ly, direction))
         # keep the label inside the viewBox when the load sits on the right edge
         near_right = lx > width / 2
         anchor = "end" if near_right else "start"
         tx = lx - 8 if near_right else lx + 8
         parts.append(
-            f'<text class="lbl" x="{tx:.2f}" y="{ly - 40:.2f}" text-anchor="{anchor}">'
-            f'F (node {load_node})</text>'
+            f'<text class="lbl" x="{tx:.2f}" y="{ly - 40 * direction[1] - 6:.2f}" '
+            f'text-anchor="{anchor}">F (node {load_node})</text>'
         )
 
     # dimension labels
@@ -400,11 +394,7 @@ def solution_svg(
     if "load_node" in mesh_data:
         ln = int(mesh_data["load_node"][0])
         lx, ly = px(deformed[ln])
-        parts.append(f'<line class="ld" x1="{lx:.2f}" y1="{ly - 34:.2f}" x2="{lx:.2f}" y2="{ly:.2f}"/>')
-        parts.append(
-            f'<polygon class="ld" points="{lx:.2f},{ly:.2f} {lx - 5:.2f},{ly - 11:.2f} '
-            f'{lx + 5:.2f},{ly - 11:.2f}"/>'
-        )
+        parts.append(_arrow(lx, ly, _arrow_direction(mesh_data)))
 
     parts.append(
         f'<text class="lbl" x="{width / 2:.2f}" y="{height - 12:.2f}" text-anchor="middle">'
@@ -412,6 +402,30 @@ def solution_svg(
     )
     parts.append("</svg>")
     return "\n".join(parts), [float(10.0**e) for e in edges]
+
+
+def _arrow_direction(data: Any) -> tuple[float, float]:
+    """Unit screen direction (SVG y down) of the load's in-plane part; straight
+    down when the run predates the recorded force or the force is out of plane."""
+    if "load_vector" in data:
+        v = np.asarray(data["load_vector"], dtype=float)[:2]
+        n = float(np.linalg.norm(v))
+        if n > 0:
+            return (v[0] / n, -v[1] / n)
+    return (0.0, 1.0)
+
+
+def _arrow(x: float, y: float, d: tuple[float, float], length: float = 34.0) -> str:
+    """A load arrow whose head touches (x, y), pointing along screen direction d."""
+    dx, dy = d
+    x0, y0 = x - dx * length, y - dy * length
+    bx, by = x - dx * 11, y - dy * 11  # base of the head
+    nx, ny = -dy * 5, dx * 5
+    return (
+        f'<line class="ld" x1="{x0:.2f}" y1="{y0:.2f}" x2="{x:.2f}" y2="{y:.2f}"/>'
+        f'<polygon class="ld" points="{x:.2f},{y:.2f} {bx + nx:.2f},{by + ny:.2f} '
+        f'{bx - nx:.2f},{by - ny:.2f}"/>'
+    )
 
 
 def _ramp_legend(edges: list[float], label: str, n_steps: int = 7) -> str:
@@ -740,7 +754,7 @@ def _cards(cards: list[tuple[str, Any, str]]) -> str:
 
 
 def _solve_cards(solve: dict[str, Any]) -> str:
-    beam = solve.get("beam_theory", {})
+    beam = solve.get("beam_theory") or {}
     return _cards(
         [
             (
@@ -749,10 +763,11 @@ def _solve_cards(solve: dict[str, Any]) -> str:
                 "N\u00b7mm, F\u00b7U at full density",
             ),
             (
-                "Tip deflection",
+                "uy at the load",
                 f"{solve.get('tip_uy', 0):.4g} mm",
                 f"beam theory {beam.get('total', 0):.4g} mm"
-                f" ({solve.get('beam_theory_rel_diff', 0) * 100:.2f}% off)",
+                f" ({(solve.get('beam_theory_rel_diff') or 0) * 100:.2f}% off)"
+                if beam else "mean over the load region's nodes",
             ),
             (
                 "Peak von Mises",
@@ -912,6 +927,7 @@ def _cad_section(
     holes = domain.get("holes") or []
     if scripted:
         rows.append(("x-y profile area (mm\u00b2)", domain.get("material_area")))
+        rows.append(("regions", ", ".join(domain.get("regions") or []) or "none"))
         rows.append(("geometry from", domain.get("script_path") or "a CadQuery script"))
     else:
         rows.append((
@@ -952,133 +968,117 @@ def _cad_section(
     return (
         "<h2>Geometry (CadQuery)</h2>"
         + (
-            "<p class='lede'>The design domain is code: the CadQuery script below builds the"
-            " part, and every later stage reads the shape it produced — its bounding box, its"
-            " x-y profile and whatever it cut away — rather than any parameters. It opens as-is"
-            " in CQ-editor; pass another one with <code>--cad-script</code>.</p>"
+            "<p class='lede'>The design domain is code: the CadQuery part script below builds"
+            " the part and names its regions — the places the study holds and loads it. Every"
+            " later stage reads the shape it produced (its bounding box, its x-y profile,"
+            " whatever it cut away) rather than any parameters. It opens as-is in"
+            " CQ-editor.</p>"
             if scripted else
             "<p class='lede'>The design domain is built by running a generated CadQuery script,"
             " so the input to CAD is explicit and reproducible: the parameters on the left are"
             " written into the script below, which also opens as-is in CQ-editor. For any other"
-            " geometry, write the script yourself and pass it with <code>--cad-script</code>.</p>"
+            " geometry, write a part script and a study and pass it with <code>--study</code>.</p>"
         )
         + f"<div class='cad'>{table}{image}</div>"
         + code
     )
 
 
-def _input_field(
-    name: str, label: str, value: Any, unit: str, control: str | None,
-    derived: str | None = None, wide: bool = False,
-) -> str:
-    """One read-only input: the value the run used and what sets it.
-
-    ``control`` is the CLI flag that sets it today; ``derived`` says what it
-    follows from instead; with neither, the value is fixed in the pipeline for
-    now.  The ``name`` is the key a future editable form would submit.
-    """
-    if control:
-        hint = f"set with <code>{_e(control)}</code>"
-    elif derived:
-        hint = f"follows from {derived}"
-    else:
-        hint = "fixed in the pipeline for now"
-    text = _fmt(value) if value is not None else "\u2014"
-    return (
-        f"<div class='field{' wide' if wide else ''}'><label for='in-{_e(name)}'>{_e(label)}"
-        + (f" ({_e(unit)})" if unit else "")
-        + f"</label><input id='in-{_e(name)}' name='{_e(name)}' value='{_e(text)}' readonly"
-        + f" data-control='{_e(control or '')}'>"
-        + f"<span class='hint'>{hint}</span></div>"
-    )
+def _fmt_vec(values: Any) -> str:
+    return "(" + ", ".join(_fmt(float(v)) for v in values) + ")"
 
 
-def _mesh_inputs(params: dict[str, Any], summary: dict[str, Any], run: dict[str, Any]) -> str:
-    """The inputs of the mesh and the boundary value problem: element size,
-    forces and displacement constraints, as read-only form fields."""
+def _fmt_axes(symbol: str, axes: str) -> str:
+    return "(" + ", ".join(f"{symbol}{a}" for a in axes) + ")"
+
+
+def _nodes(count: Any) -> str:
+    return "? nodes" if count is None else f"{count} node{'' if count == 1 else 's'}"
+
+
+def _study_inputs(params: dict[str, Any], summary: dict[str, Any], run: dict[str, Any],
+                  geometry: dict[str, Any], copied: dict[str, str]) -> str:
+    """What the run was told: mesh size, loads and displacement constraints —
+    and, for a study, the study script itself.  Read-only: the study script is
+    where these are set."""
     mesh = params.get("mesh", {})
-    domain = params.get("domain", {})
     three_d = params.get("dim") == 3
     axes = "xyz"[: 3 if three_d else 2]
     structured = mesh.get("mode", "structured") == "structured"
+    study = params.get("study")
+    sets = summary.get("node_sets", {})
 
     size = mesh.get("element_size")
     if size is None:  # runs from before the size was recorded
         fitted = _mesh_step_data(run).get("element_size")
         size = [fitted] if fitted else None
-    fields = [_input_field("mesh", "mesh mode", mesh.get("mode", "structured"), "", "--mesh")]
+    mesh_rows: list[tuple[str, Any]] = [("mode", mesh.get("mode", "structured"))]
     if structured:
-        for axis in axes:
-            fields.append(_input_field(
-                f"nel{axis}", f"elements along {axis}", mesh.get(f"nel{axis}"), "", f"--nel{axis}"
-            ))
+        mesh_rows += [(f"elements along {a}", mesh.get(f"nel{a}")) for a in axes]
         if size:
-            fields.append(_input_field(
-                "element_size", "element size " + " \u00d7 ".join(f"d{a}" for a in axes),
-                " \u00d7 ".join(f"{v:.4g}" for v in size), "mm", None,
-                derived="the part's extent / " + ", ".join(f"<code>--nel{a}</code>" for a in axes),
+            mesh_rows.append((
+                "element size " + " \u00d7 ".join(f"d{a}" for a in axes) + " (mm)",
+                " \u00d7 ".join(f"{v:.4g}" for v in size),
             ))
     else:
-        fields.append(_input_field(
-            "mesh_size", "target element edge", size[0] if size else None, "mm", "--mesh-size"
-        ))
+        mesh_rows.append(("target element edge (mm)", size[0] if size else None))
         if three_d:
-            fields.append(_input_field("nelz", "layers through the width", mesh.get("nelz"), "", "--nelz"))
+            mesh_rows.append(("layers through the width", mesh.get("nelz")))
             if size and len(size) > 1:
-                fields.append(_input_field(
-                    "layer", "layer thickness dz", size[1], "mm", None,
-                    derived="the width / <code>--nelz</code>",
-                ))
-    counts = (
-        f"{_e(summary.get('n_elements', '?'))} elements, {_e(summary.get('n_nodes', '?'))} nodes"
-        + ("" if structured else " \u2014 the mesher's count for that size")
-    )
-    mesh_set = (
-        "<fieldset><legend>Mesh size</legend>" + "".join(fields) + f"<p>{counts}</p></fieldset>"
-    )
+                mesh_rows.append(("layer thickness dz (mm)", size[1]))
+    mesh_rows.append(("result", f"{summary.get('n_elements', '?')} elements, "
+                                f"{summary.get('n_nodes', '?')} nodes"))
 
     bcs = params.get("boundary_conditions") or {}
-    load = (bcs.get("loads") or [{}])[0]
-    force = load.get("force") or {"fx": 0.0, "fy": params.get("load", {}).get("fy")}
-    if three_d:
-        force.setdefault("fz", 0.0)
-    where = load.get("location") or f"point {_fmt(domain.get('load_point'))}"
-    n_load = len(summary.get("load_nodes") or [summary.get("load_node")])
-    force_fields = [_input_field(
-        "load_location", "applied at", where, "", None,
-        derived="the part: mid-height of its free end", wide=True,
-    )]
-    for axis in axes:
-        force_fields.append(_input_field(
-            f"f{axis}", f"F{axis}", force.get(f"f{axis}"), "N", "--load" if axis == "y" else None
-        ))
-    force_set = (
-        "<fieldset><legend>Force</legend>" + "".join(force_fields)
-        + f"<p>total, shared over {n_load} node{'s' if n_load != 1 else ''} of the "
-        "<code>load_edge</code> set</p></fieldset>"
-    )
+    load_rows: list[tuple[str, Any]] = []
+    for load in bcs.get("loads", []):
+        force = load.get("force", {})
+        name = load.get("region") or load.get("node_set", "load")
+        load_rows += [
+            (f"'{name}': {load.get('kind', '')} region".replace(":  region", ""),
+             _nodes(sets.get(name))),
+            ("force " + _fmt_axes("F", axes) + " (N, total)",
+             _fmt_vec(force.get(f"f{a}", 0.0) for a in axes)),
+        ]
+    fix_rows: list[tuple[str, Any]] = []
+    for c in bcs.get("constraints", []):
+        name = c.get("region") or c.get("node_set", "fixed")
+        disp = c.get("displacements", {})
+        fix_rows += [
+            (f"'{name}': {c.get('kind', '')} region".replace(":  region", ""),
+             f"{_nodes(sets.get(name))}, {c.get('type', 'clamped')}"),
+            ("displacement " + _fmt_axes("u", axes) + " (mm)",
+             _fmt_vec(disp.get(f"u{a}", 0.0) for a in axes)),
+        ]
 
-    constraint = (bcs.get("constraints") or [{}])[0]
-    fixed_where = constraint.get("location") or ("face x = 0" if three_d else "edge x = 0")
-    disp = constraint.get("displacements") or {f"u{a}": 0.0 for a in axes}
-    n_fixed = summary.get("node_sets", {}).get("fixed")
-    fix_fields = [_input_field(
-        "fixed_location", "constrained", fixed_where, "", None,
-        derived="the part: its boundary at x = 0", wide=True,
-    )]
-    for axis in axes:
-        fix_fields.append(_input_field(f"u{axis}", f"u{axis}", disp.get(f"u{axis}"), "mm", None))
-    fixed_set = (
-        "<fieldset><legend>Displacement constraints</legend>" + "".join(fix_fields)
-        + f"<p>{constraint.get('type', 'clamped')}: {_e(n_fixed if n_fixed is not None else '?')}"
-        f" nodes of the <code>fixed</code> set, {len(axes)} DOFs each</p></fieldset>"
+    def block(title: str, rows: list[tuple[str, Any]]) -> str:
+        return f"<div><h3>{_e(title)}</h3>{_kv_table(rows)}</div>"
+
+    source = geometry.get("study_script")
+    code = ""
+    if source:
+        link = copied.get("study.py")
+        code = (
+            "<div class='script'><div class='head'>"
+            "<span><code>study.py</code> — the study, exactly as it ran</span>"
+            + (f"<a href='{_e(link)}' download>download</a>" if link else "")
+            + f"</div><pre><code>{_e(source)}</code></pre></div>"
+        )
+    lede = (
+        f"Set in <code>{_e(study.get('path'))}</code>, which refers to the regions the part"
+        " script names."
+        if study else
+        "The parametric cantilever: set with command-line flags; the clamp and the tip load"
+        " are the beam's own <code>fixed</code> and <code>load</code> regions."
     )
     return (
-        "<p class='lede'>The inputs that shape the mesh and the boundary value problem it"
-        " carries, as this run used them. They are read-only here: each says what sets it"
-        " today, a command-line flag or a value still fixed in the pipeline.</p>"
-        f"<form class='inputs' aria-label='Mesh and boundary condition inputs'"
-        f" onsubmit='return false'>{mesh_set}{force_set}{fixed_set}</form>"
+        f"<p class='lede'>{lede}</p>"
+        "<div class='inputs'>"
+        + block("Mesh size", mesh_rows)
+        + block("Loads", load_rows)
+        + block("Displacement constraints", fix_rows)
+        + "</div>"
+        + code
     )
 
 
@@ -1126,19 +1126,17 @@ def render_html(
         elif step.get("name") == "optimize":
             optimization = step.get("data", {})
 
-    n_fixed = _e(summary.get("node_sets", {}).get("fixed", "?"))
+    bcs = params.get("boundary_conditions") or {}
+    fixed_names = [c.get("region") or c.get("node_set", "fixed") for c in bcs.get("constraints", [])]
+    load_names = [f.get("region") or f.get("node_set", "load") for f in bcs.get("loads", [])]
+    held = (
+        f"The hatched {'/'.join(_e(n) for n in fixed_names) or 'fixed'} region is clamped;"
+        f" the arrow marks the load on {'/'.join(_e(n) for n in load_names) or 'load'}."
+    )
     if three_d:
-        mesh_caption = (
-            "Side view: every hexahedron is one design variable for the SIMP loop. The x = 0"
-            f" face is clamped (all {n_fixed} nodes, all three DOFs); the tip load acts"
-            " downwards along the mid-height line across the free end."
-        )
+        mesh_caption = "Side view: every hexahedron is one design variable for the SIMP loop. " + held
     else:
-        mesh_caption = (
-            "Every quad is one design variable for the SIMP loop. The left edge is clamped"
-            f" (all {n_fixed} nodes, both DOFs); the tip load acts downwards at the"
-            " mid-height node of the free edge."
-        )
+        mesh_caption = "Every quad is one design variable for the SIMP loop. " + held
     if summary.get("mesh_mode") == "body-fitted":
         mesh_caption = mesh_caption.replace(
             "every hexahedron", "every hexahedron of the body-fitted mesh"
@@ -1158,8 +1156,8 @@ def render_html(
     chips.append(f"python {env.get('python', '?')}")
 
     param_rows = [
-        ("beam length L (mm)", domain.get("length")),
-        ("beam height H (mm)", domain.get("height")),
+        ("length L, bounding box (mm)", domain.get("length")),
+        ("height H, bounding box (mm)", domain.get("height")),
         ("out-of-plane thickness (mm)", domain.get("thickness")),
         ("aspect ratio L/H", domain.get("aspect_ratio")),
         ("mesh mode", mesh.get("mode", "structured")),
@@ -1169,10 +1167,9 @@ def render_html(
             if mesh.get("mode", "structured") == "structured"
             else [("target element size (mm)", _mesh_step_data(run).get("element_size"))]
         ),
-        ("load point (mm)", domain.get("load_point")),
-        ("tip load node index", summary.get("load_node")),
-        ("fixed node set size", summary.get("node_sets", {}).get("fixed")),
-        ("load edge node set size", summary.get("node_sets", {}).get("load_edge")),
+        ("load region", ", ".join(load_names)),
+        ("load nodes", len(summary.get("load_nodes") or [])),
+        ("constrained regions", ", ".join(fixed_names)),
     ]
     material = params.get("material", {})
     simp = params.get("simp", {})
@@ -1180,7 +1177,8 @@ def render_html(
         param_rows += [
             ("Young's modulus E (MPa)", material.get("youngs_modulus")),
             ("Poisson's ratio", material.get("poisson_ratio")),
-            ("tip load Fy (N)", params.get("load", {}).get("fy")),
+            ("force (N)", _fmt_vec(params.get("load", {}).get(f"f{a}", 0.0)
+                                   for a in "xyz"[: 3 if three_d else 2])),
         ]
     if simp:
         param_rows += [
@@ -1276,23 +1274,25 @@ def render_html(
         )
 
     all_ok = summary.get("all_checks_passed", False)
+    study_path = (params.get("study") or {}).get("path")
+    case_name = Path(study_path).parent.name if study_path else "cantilever beam"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>topocombo — cantilever beam</title>
-<meta name="description" content="Procedure log of the topocombo cantilever beam run: CadQuery geometry, Gmsh mesh, FEA solve and SIMP optimization.">
+<title>topocombo — {_e(case_name)}</title>
+<meta name="description" content="Procedure log of the topocombo {_e(case_name)} run: CadQuery geometry, Gmsh mesh, FEA solve and SIMP optimization.">
 <style>{_CSS}</style>
 </head>
 <body>
 <div class="wrap">
 <header class="top">
-  <h1>Cantilever beam — mesh, solve, optimize</h1>
+  <h1>{_e(case_name[:1].upper() + case_name[1:])} — mesh, solve, optimize</h1>
   <p class="lede">
     The <a href="https://github.com/anroleroux/topocombo">topocombo</a> pipeline so far, run end
-    to end: a parametric design domain defined in CadQuery, exported to BREP, meshed into
+    to end: a design domain defined in CadQuery, exported to BREP, meshed into
     {meshed_as} with Gmsh, solved as {solved_as} with the custom solver,
     and driven through a SIMP compliance-minimisation loop until the density field converges.
     Every number and figure below comes from the artifacts this run wrote to disk.
@@ -1306,7 +1306,7 @@ def render_html(
 {_cad_section(geometry, params, copied, cad_image)}
 
 <h2>Mesh</h2>
-{_mesh_inputs(params, summary, run)}
+{_study_inputs(params, summary, run, geometry, copied)}
 <figure>
 {svg}
 <figcaption>

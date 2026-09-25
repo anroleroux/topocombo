@@ -36,11 +36,14 @@ running exactly that script.  The script is exported next to the BREP/STEP
 files and shown in the report, so what went into CadQuery is never implicit —
 and it opens as-is in CQ-editor.
 
-:class:`CadDomain` takes the CadQuery input as code: any script that assigns
-the part to ``result`` — a planar face in the x-y plane (2D) or a solid
-prismatic along z (3D).  Nothing downstream reads parameters from it: the
-extent, the material area or volume, the profile Gmsh meshes and which grid
-cells lie outside the part all come from the shape the script built.
+:class:`CadDomain` takes the CadQuery input as code: a part script that
+assigns the part to ``result`` — a planar face in the x-y plane (2D) or a
+solid prismatic along z (3D) — and names where it is held and loaded in
+``regions``.  Nothing downstream reads parameters from it: the extent, the
+material area or volume, the profile Gmsh meshes, which grid cells lie outside
+the part and which nodes carry the boundary conditions all come from the
+shapes the script built.  The parametric beams bring their own regions:
+``fixed`` (the x = 0 edge or face) and ``load`` (the tip-load point or line).
 """
 
 from __future__ import annotations
@@ -53,6 +56,11 @@ from typing import Any
 import numpy as np
 
 import cadquery as cq
+
+
+#: Region names of the parametric beam: its clamp and its tip load.
+BEAM_FIXED = "fixed"
+BEAM_LOAD = "load"
 
 
 @dataclass(frozen=True)
@@ -133,6 +141,17 @@ class BeamDomain:
     def workplane(self) -> cq.Workplane:
         """The domain as built by running :meth:`cadquery_script`."""
         return run_cadquery_script(self.cadquery_script())
+
+    def regions(self) -> dict[str, cq.Shape]:
+        """The cantilever's regions: the clamped edge x = 0 (``fixed``) and the
+        tip-load point at mid-height of the free edge (``load``)."""
+        return {
+            BEAM_FIXED: cq.Workplane("XY").add(self.face()).edges("<X").val(),
+            BEAM_LOAD: cq.Vertex.makeVertex(*self.load_point, 0.0),
+        }
+
+    def profile(self) -> cq.Face:
+        return self.face()
 
     def face(self) -> cq.Face:
         """The planar face representing the design domain."""
@@ -231,6 +250,15 @@ class BeamDomain3D:
         """The x-y cross-section at z = 0 — what the body-fitted mesh extrudes."""
         return BeamDomain(length=self.length, height=self.height, holes=self.holes).face()
 
+    def regions(self) -> dict[str, cq.Shape]:
+        """The cantilever's regions: the clamped face x = 0 (``fixed``) and the
+        tip-load line at mid-height of the free end, across the width (``load``)."""
+        start, end = self.load_line
+        return {
+            BEAM_FIXED: cq.Workplane("XY").add(self.solid()).faces("<X").val(),
+            BEAM_LOAD: cq.Edge.makeLine(cq.Vector(*start), cq.Vector(*end)),
+        }
+
 
 #: Relative tolerance on the part's placement and on the prism check.
 _CAD_RTOL = 1e-6
@@ -238,16 +266,20 @@ _CAD_RTOL = 1e-6
 
 @dataclass(frozen=True)
 class CadDomain:
-    """A design domain given as code: any CadQuery script that assigns the part
-    to ``result``.
+    """A design domain given as code: a CadQuery part script.
+
+    The script assigns the part to ``result`` and names the places where
+    constraints and loads will act in a ``regions`` dict — vertices, edges or
+    faces, picked from the part with selectors or built on their own::
+
+        result = cq.Workplane("XY").box(60, 20, 1, centered=False)
+        regions = {"mount": result.faces("<X"), "tip": result.faces(">X")}
 
     The shape decides the dimension: a planar face in the x-y plane is a 2D
     plane-stress domain (``thickness`` is the solver's out-of-plane size), a
     solid is a 3D domain, which must be a prism along z because the hex mesh
     is an extrusion of its x-y profile.  The part's bounding box must start at
-    the origin; the cantilever conventions then hold as for :class:`BeamDomain`:
-    the part's boundary at x = 0 is clamped and the load acts at mid-height of
-    x = L, where the part must have an edge (2D) or face (3D).
+    the origin.
 
     ``length``, ``height`` and ``width`` are the bounding box; ``area`` /
     ``volume`` are the envelope's and ``material_area`` / ``material_volume``
@@ -258,12 +290,16 @@ class CadDomain:
     path: str | None = None
     thickness: float = 1.0
     _shape: cq.Shape = field(init=False, repr=False, compare=False)
+    _regions: dict = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        from .regions import as_shape
+
         if not self.thickness > 0:
             raise ValueError("thickness must be positive")
         where = self.path or "the CadQuery script"
-        shape = _single_shape(run_cadquery_script(self.source, self.path or "design_domain.py"), where)
+        namespace = _exec_script(self.source, self.path or "design_domain.py")
+        shape = _single_shape(_result(namespace), where)
         bb = shape.BoundingBox()
         size = max(bb.xlen, bb.ylen, bb.zlen)
         if max(abs(bb.xmin), abs(bb.ymin), abs(bb.zmin)) > _CAD_RTOL * size:
@@ -284,7 +320,14 @@ class CadDomain:
                     f"through the width): the profile gives {prism:.6g} mm^3, the solid "
                     f"has {shape.Volume():.6g} mm^3"
                 )
-        _check_cantilever_edges(profile, bb.xlen, bb.ylen, where)
+        raw = namespace.get("regions", {})
+        if not isinstance(raw, dict) or not all(isinstance(k, str) for k in raw):
+            raise ValueError(f"{where}: `regions` must be a dict of name -> CadQuery geometry")
+        try:
+            regions = {name: as_shape(value, name) for name, value in raw.items()}
+        except ValueError as exc:
+            raise ValueError(f"{where}: {exc}") from None
+        object.__setattr__(self, "_regions", regions)
 
     @property
     def dim(self) -> int:
@@ -345,15 +388,9 @@ class CadDomain:
         """True for elements whose centroid lies outside the part's x-y profile."""
         return ~_in_face(self.profile(), centroids)
 
-    @property
-    def load_point(self) -> tuple[float, ...]:
-        if self.dim == 3:
-            return (self.length, self.height / 2.0, self.width / 2.0)
-        return (self.length, self.height / 2.0)
-
-    @property
-    def load_line(self) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
-        return (self.length, self.height / 2.0, 0.0), (self.length, self.height / 2.0, self.width)
+    def regions(self) -> dict[str, cq.Shape]:
+        """The named regions of the part script, as shapes."""
+        return dict(self._regions)
 
     def as_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -364,16 +401,11 @@ class CadDomain:
             "aspect_ratio": self.aspect_ratio,
             "area": self.area,
             "material_area": self.material_area,
-            "load_point": list(self.load_point),
             "holes": [],
+            "regions": sorted(self._regions),
         }
         if self.dim == 3:
-            d.update(
-                width=self.width,
-                volume=self.volume,
-                material_volume=self.material_volume,
-                load_line=[list(p) for p in self.load_line],
-            )
+            d.update(width=self.width, volume=self.volume, material_volume=self.material_volume)
         else:
             d["thickness"] = self.thickness
         return d
@@ -398,9 +430,10 @@ class CadDomain:
         """The part's x-y cross-section at z = 0 (the face itself in 2D)."""
         if isinstance(self._shape, cq.Face):
             return self._shape
+        tol = _CAD_RTOL * self._shape.BoundingBox().xlen
         faces = [
             f for f in self._shape.Faces()
-            if f.BoundingBox().zlen <= _CAD_RTOL * self.length and abs(f.Center().z) <= _CAD_RTOL * self.length
+            if f.BoundingBox().zlen <= tol and abs(f.Center().z) <= tol
         ]
         if len(faces) != 1:
             raise ValueError(
@@ -429,26 +462,6 @@ def _single_shape(result: cq.Workplane, where: str) -> cq.Face | cq.Solid:
             f"{where}: `result` must be one connected face (2D) or solid (3D), not {kinds}"
         )
     return shapes[0]
-
-
-def _check_cantilever_edges(profile: cq.Face, length: float, height: float, where: str) -> None:
-    """The profile needs a boundary at x = 0 to clamp and one at x = L that
-    passes through mid-height, where the load acts."""
-    tol = _CAD_RTOL * max(length, height)
-    at_x = {"x = 0": 0.0, "x = L": length}
-    found = {name: [] for name in at_x}
-    for edge in profile.Edges():
-        bb = edge.BoundingBox()
-        for name, x in at_x.items():
-            if abs(bb.xmin - x) <= tol and abs(bb.xmax - x) <= tol:
-                found[name].append((bb.ymin, bb.ymax))
-    if not found["x = 0"]:
-        raise ValueError(f"{where}: the part has no straight edge at x = 0 to clamp")
-    if not any(y0 - tol <= height / 2 <= y1 + tol for y0, y1 in found["x = L"]):
-        raise ValueError(
-            f"{where}: the part has no edge at x = L = {length:g} through the load point "
-            f"at mid-height y = {height / 2:g}"
-        )
 
 
 def _in_face(face: cq.Face, points: np.ndarray) -> np.ndarray:
@@ -576,17 +589,26 @@ def _in_holes(holes: tuple[tuple[float, float, float], ...], centroids: np.ndarr
     return mask
 
 
-def run_cadquery_script(source: str, filename: str = "design_domain.py") -> cq.Workplane:
-    """Execute a CadQuery script and return the ``result`` it defines (a
-    ``cq.Shape`` is wrapped in a workplane)."""
+def _exec_script(source: str, filename: str = "design_domain.py") -> dict[str, Any]:
+    """Execute a CadQuery script; return its namespace."""
     namespace: dict[str, Any] = {"__name__": "__cadquery_script__"}
     exec(compile(source, filename, "exec"), namespace)
+    return namespace
+
+
+def _result(namespace: dict[str, Any]) -> cq.Workplane:
     result = namespace.get("result")
     if isinstance(result, cq.Shape):
         result = cq.Workplane("XY").add(result)
     if not isinstance(result, cq.Workplane):
         raise ValueError("a CadQuery script must assign a cq.Workplane or cq.Shape to `result`")
     return result
+
+
+def run_cadquery_script(source: str, filename: str = "design_domain.py") -> cq.Workplane:
+    """Execute a CadQuery script and return the ``result`` it defines (a
+    ``cq.Shape`` is wrapped in a workplane)."""
+    return _result(_exec_script(source, filename))
 
 
 #: Anything the pipeline can mesh.

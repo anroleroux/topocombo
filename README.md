@@ -60,15 +60,12 @@ python -m topocombo.cli all
 # the same cantilever as a 3D solid: hexahedra, one element through the width
 python -m topocombo.cli all --dim 3 --width 1 --nelz 1 --out results/cantilever3d
 
-# or any geometry, written as a CadQuery script that assigns the part to `result`
-python -m topocombo.cli all --cad-script examples/cantilever3d.py --out results/cantilever3d
+# any design: a study script (mesh, material, constraints, loads, optimizer)
+# pointing at a CadQuery part script (geometry + named regions) — what CI publishes
+python -m topocombo.cli all --study examples/cantilever/study.py --out results/cantilever --site site
 
-# what CI runs and publishes: that script, meshed body-fitted
-python -m topocombo.cli all --cad-script examples/cantilever3d.py --mesh body-fitted \
-    --nelx 60 --nely 20 --nelz 1 --out results/cantilever --site site
-
-# just the CAD stage: print the CadQuery script, write it with BREP, STEP and a PNG preview
-python -m topocombo.cli cad --cad-script examples/cantilever3d.py --out results/cad
+# just the CAD stage of a study: print the part script, write BREP, STEP and a PNG preview
+python -m topocombo.cli cad --study examples/cantilever/study.py --out results/cad
 
 # a 10 mm hole through z at x = 20, y = 10 (repeat --hole for more)
 python -m topocombo.cli all --dim 3 --hole 20,10,10 --out results/holed
@@ -85,36 +82,81 @@ pip install -e ".[viz]"
 python -m topocombo.viz --run results/cantilever3d
 ```
 
-### CadQuery input
+### A design as two Python scripts
 
-The CAD input is code. `--cad-script FILE.py` runs any CadQuery script that
-assigns the part to `result` (a `cq.Workplane` or a `cq.Shape`), so the
-geometry is whatever CadQuery can build, not a fixed set of parameters —
-`examples/cantilever3d.py` is the published one. The pipeline reads everything
-it needs from the shape the script produced: the dimension (a face in the x-y
-plane is a 2D plane-stress part, `--thickness` still sets its out-of-plane
-size; a solid is 3D), the bounding box, the x-y profile Gmsh meshes, the
-material area or volume the mesh is checked against, and which grid cells lie
-outside the part. Nothing in it is assumed to be a rectangle with round holes.
+Any design is a directory with two scripts; `examples/cantilever/` is the
+published one:
 
-The script is checked before anything is meshed, with a message naming the
-file: `result` must be one connected face or solid; its bounding box must start
-at the origin; a solid must be a prism along z (its z = 0 face swept through
-the width — the hex mesh is an extrusion of that profile); and the cantilever
-conventions must have somewhere to act: an edge at x = 0 to clamp and one at
-x = L through mid-height for the load. The beam flags (`--dim`, `--length`,
-`--height`, `--width`, `--hole`) are rejected alongside `--cad-script`.
+```
+examples/cantilever/
+  part.py     # CadQuery: `result` (the part) and `regions` (named places on it)
+  study.py    # `study = Study(part="part.py", ...)`: mesh, material, constraints, loads, optimizer
+```
 
-Without a script, the flags describe the parametric beam: each run generates
-a standalone CadQuery script from `dim`, `length`, `height`, `thickness` (2D),
-`width` (3D) and `--hole` cutouts, builds the shape by executing exactly that
-script, and a cutout must lie strictly inside the beam and clear of the others.
-Either way the script that ran is written to `cad/design_domain.py` (it opens
-as-is in CQ-editor), and the report prints it with a shaded picture of the
-resulting CAD shape alongside one of the optimized topology.
+**`part.py`** is a CadQuery script. It assigns the part to `result` and names
+the places where it will be held and loaded in a `regions` dict — vertices,
+edges or faces, picked from the part with selectors or built on their own:
 
-Cutouts are given as `--hole X,Y,D` (repeatable) or cut in a script. The
-published script has one hole of diameter 10 mm at x = 20, moved from
+```python
+result = cq.Workplane("XY").box(60, 20, 1, centered=False)  # ... cut the notch
+regions = {
+    "wall": result.faces("<X"),                                    # the x = 0 face
+    "tip": cq.Edge.makeLine(cq.Vector(60, 10, 0), cq.Vector(60, 10, 1)),  # a load line
+}
+```
+
+**`study.py`** refers to those names:
+
+```python
+from topocombo.study import Fix, Force, Material, Mesh, SimpParams, Study
+
+study = Study(
+    part="part.py",
+    mesh=Mesh(mode="body-fitted", size=1.0, layers=1),
+    material=Material(youngs_modulus=210_000.0, poisson_ratio=0.3),
+    constraints=[Fix("wall")],                  # clamped: every component zero
+    loads=[Force("tip", (0.0, -1000.0, 0.0))],  # N, total, spread over the region
+    optimize=SimpParams(volume_fraction=0.5, penal=3.0, filter_radius=1.5),
+)
+```
+
+Both are ordinary Python, so values can be computed, looped over or imported.
+Each building block checks its own fields, and `load_study` checks the two
+scripts agree — every region the study names exists, the force has one
+component per dimension, the element fits the part — before anything is
+meshed. `--study` replaces the flags it covers; giving one of them as well is
+an error (`--out`, `--site` and `--no-optimize` still apply).
+
+Nothing in the pipeline knows where a part is held or loaded. Each region
+becomes the node set of the mesh nodes lying on it (a distance test against
+the CAD shape, so it works the same for a structured grid, a body-fitted mesh
+and, later, tetrahedra); the body-fitted mesher embeds the regions' corners
+first, so a region that is not a whole CAD edge or face — the load line above
+— still lands on real nodes. A force is spread over its region by the
+region's dimension: all on one node (a vertex), by tributary length (edges),
+or by tributary area (faces). `Fix` clamps every displacement component for
+now; one `Force` per study.
+
+The part script is checked too, with a message naming the file: `result`
+must be one connected face or solid; its bounding box must start at the
+origin; a solid must be a prism along z (its z = 0 face swept through the
+width — the hex mesh is an extrusion of that profile); and regions must be
+vertices, edges or faces that select something. A face in the x-y plane is a
+2D plane-stress part (`Study.thickness` sets its out-of-plane size); a solid
+is 3D. The pipeline reads everything else it needs from the built shape: the
+bounding box, the x-y profile Gmsh meshes, the material area or volume the
+mesh is checked against, and which grid cells lie outside the part.
+
+Without a study, the flags describe the parametric cantilever: each run
+generates a standalone CadQuery script from `dim`, `length`, `height`,
+`thickness` (2D), `width` (3D) and `--hole` cutouts, with the beam's own
+regions — `fixed` (the x = 0 edge or face) and `load` (the mid-height point,
+or line across the width, at the free end) — and `--load` as the force.
+Either way the part script that ran is written to `cad/design_domain.py` (it
+opens as-is in CQ-editor) and a study to `study.py`; the report prints both.
+
+Cutouts are given as `--hole X,Y,D` (repeatable) or cut in a part script. The
+published part has one hole of diameter 10 mm at x = 20, moved from
 mid-height (y = 10) to the bottom edge (y = 0) as a generalisation test: it
 now bites a half-circle notch out of the beam, so the profile is no longer a
 rectangle with an interior hole. Body-fitted, that meshes into 1214 hexes and
@@ -185,12 +227,13 @@ the solid elements.
 
 | File | Contents |
 | --- | --- |
-| `cad/design_domain.py` | the CadQuery script that built the design domain — yours with `--cad-script` (runs in CQ-editor) |
+| `cad/design_domain.py` | the CadQuery part script that built the design domain — yours with `--study` (runs in CQ-editor) |
+| `study.py` | the study script, when the run came from one |
 | `cad/design_domain.brep` | design domain; Gmsh's OCC importer meshes it directly when there are no cutouts |
 | `cad/design_envelope.brep` | when the part does not fill its bounding box: the L x H envelope the structured grid meshes |
 | `cad/design_domain.step` | same geometry for exchange with other CAD tools |
-| `mesh/beam.msh` | hex (3D) or quad (2D) mesh with `design_domain`, `fixed` and `load_edge` physical groups |
-| `mesh/mesh.npz` | nodes, cell connectivity (`cells`, `cell_type`), boundary node sets, tip-load node(s), `passive` void elements (with cutouts) — what the solver reads |
+| `mesh/beam.msh` | hex (3D) or quad (2D) mesh with its `design_domain` physical group |
+| `mesh/mesh.npz` | nodes, cell connectivity (`cells`, `cell_type`), region node sets (`set_<name>`), constrained nodes, load node(s) and force, `passive` void elements (with cutouts) — what the solver reads |
 | `mesh/mesh.vtu` | the same mesh for PyVista / ParaView |
 | `solution/solution.npz` | displacements, per-element compliance and von Mises stress |
 | `solution/solution.vtu` | displacement and stress fields for PyVista / ParaView |
@@ -234,14 +277,11 @@ Each push runs the tests and the 3D pipeline in CI and publishes the procedure
 log — the CadQuery input script with a picture of its output, parameters,
 per-stage terminal output, mesh validation, the full-density solve, the
 optimized density and a shaded view of the optimized topology — to GitHub Pages:
-<https://anroleroux.github.io/topocombo/>. The Mesh section starts with the inputs of the mesh and of the boundary value
-problem it carries — element size, the force, and the displacement
-constraints — as read-only form fields, each saying what sets it today: a
-command-line flag (`--mesh`, `--nelx`/`--nely`/`--nelz`, `--mesh-size`,
-`--load`), the part itself (where the load and the clamp act), or nothing yet
-(Fx, Fz and the prescribed displacements are fixed at 0). The run records the
-same values in `run.json` under `params.mesh.element_size` and
-`params.boundary_conditions`, the shape they will take once they are inputs.
+<https://anroleroux.github.io/topocombo/>. The page is a report only; the
+scripts are where a run is set up. The Mesh section opens with what the run
+was told — mesh size, loads and displacement constraints, by region and with
+their node counts — and the study script as it ran; `run.json` records the
+same under `params.mesh`, `params.boundary_conditions` and `params.regions`.
 The page is generated by
 `topocombo.report`, which reads only the artifacts of a run directory, so it is
 a downstream consumer like the other visualization paths, not part of the loop.
@@ -256,7 +296,9 @@ on the CI runner.
 
 ```
 src/topocombo/
-  geometry.py   design domain: any CadQuery script (CadDomain), or the parametric beam's generated one
+  study.py      a design's study script: Study, Mesh, Fix, Force; load_study / run_study
+  geometry.py   design domain: a part script with named regions (CadDomain), or the parametric beam
+  regions.py    named regions -> mesh node sets, and how a force spreads over them
   meshing.py    structured (transfinite) or body-fitted (unstructured quad / extruded hex) meshing (Gmsh)
   mesh_io.py    .msh -> dimension-agnostic Mesh, quality checks, .npz/.vtu export
   fea.py        Q4 plane-stress / H8 solid solver: element stiffness, assembly, direct solve
@@ -267,10 +309,10 @@ src/topocombo/
   report.py     static HTML report built from a run directory
   cadview.py    `python -m topocombo.cadview`: shaded PNG of a BREP or STL (no OpenGL)
   viz.py        `python -m topocombo.viz`: PyVista views of a run (optional)
-  cli.py        `python -m topocombo.cli cad|run|report|all [--dim 3] [--cad-script FILE.py]`
+  cli.py        `python -m topocombo.cli cad|run|report|all [--dim 3] [--study study.py]`
 tests/          mesh invariants, solver verification, optimizer invariants, 2D <-> 3D checks
 docs/           the 3D migration plan
-examples/       CadQuery input scripts (`--cad-script`)
+examples/       designs as part.py + study.py (`--study`)
 ```
 
 ## Status
@@ -288,6 +330,19 @@ all steps but solver scaling (step 5) are done. Step 5 — an iterative solver
 for meshes many elements through the width — is only needed once `--nelz`
 grows well beyond the default of 1.
 
-Next, in rough order: NLopt-MMA as an alternative to the OC update, the
-CalculiX swap-in for the solver once the loop is trusted (its C3D8 element maps
-directly onto H8), and iterative solves for deeper 3D meshes.
+Next, in order:
+
+1. An element refactor with no change in results: the solver, the loads and
+   the report pick their element code by cell type, so new elements only add
+   code.
+2. Tetrahedral elements — T10, with T4 for testing — meshed by Gmsh from any
+   3D part, lifting the prism-only restriction of the extruded hex mesh
+   (`Mesh(element="tet10")`), with iterative solves for the larger meshes
+   (step 5 of the migration plan). T10 is CalculiX's C3D10, which keeps the
+   solver swap open.
+3. More general boundary conditions: constraints on chosen components and
+   prescribed displacements, several load cases, passive regions held solid,
+   and a second example that is not a cantilever.
+
+Then NLopt-MMA as an alternative to the OC update, and the CalculiX swap-in
+for the solver once the loop is trusted.

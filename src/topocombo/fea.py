@@ -16,7 +16,7 @@ thickness) and trilinear hexahedra (full 3D, where the width is modelled and
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import scipy.sparse as sp
@@ -308,9 +308,12 @@ def load_vector(mesh: Mesh, load: LoadCase) -> np.ndarray:
     return f
 
 
-def fixed_dofs(mesh: Mesh, node_set: str) -> np.ndarray:
-    """Every DOF of every node in ``node_set`` (a fully clamped boundary)."""
-    return node_dofs(mesh.node_sets[node_set], mesh.dofs_per_node)
+def fixed_dofs(mesh: Mesh, node_set: str | Sequence[str]) -> np.ndarray:
+    """Every DOF of every node in ``node_set`` — one name or several (fully
+    clamped boundaries)."""
+    names = [node_set] if isinstance(node_set, str) else list(node_set)
+    nodes = np.unique(np.concatenate([np.asarray(mesh.node_sets[n], dtype=int) for n in names]))
+    return node_dofs(nodes, mesh.dofs_per_node)
 
 
 def _von_mises(stress: np.ndarray) -> np.ndarray:
@@ -356,7 +359,7 @@ def solve(
     material: Material,
     thickness: float,
     load: LoadCase,
-    fixed_node_set: str,
+    fixed_node_set: str | Sequence[str],
     densities: np.ndarray | None = None,
     penal: float = 3.0,
     ke_all: np.ndarray | None = None,

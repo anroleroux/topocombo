@@ -41,15 +41,12 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
-      # The published run is the 3D cantilever, one hexahedron through the width
-      # to keep the job light; the 2D path is still covered by the tests.  The
-      # geometry is the example CadQuery script, which the report prints, and
-      # the mesh is body-fitted: it follows whatever the script built rather
-      # than holding grid cells void (--mesh-size defaults to L/nelx = 1 mm).
+      # The published run is the example study: examples/cantilever/part.py is
+      # the CadQuery part and its named regions, study.py the mesh, material,
+      # constraints, loads and optimizer.  The report prints both.
       - name: Run the pipeline and render the report
         run: |
-          python -m topocombo.cli all --cad-script examples/cantilever3d.py \
-            --mesh body-fitted --nelx 60 --nely 20 --nelz 1 \
+          python -m topocombo.cli all --study examples/cantilever/study.py \
             --out results/cantilever --site site
 
       - name: Upload run artifacts

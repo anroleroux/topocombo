@@ -1,16 +1,19 @@
 """The main flow — geometry, mesh, solve, SIMP — as one terminal-driven run.
 
-The domain decides the dimension: a 2D domain (:class:`BeamDomain`, or a
-:class:`CadDomain` whose script builds a face) runs the plane-stress quad
-pipeline, a 3D one (:class:`BeamDomain3D`, or a script that builds a solid) the
-solid hex pipeline with the tip load spread along a line across the width.  Everything is
-written to a run directory; nothing is plotted or rendered here.
+The domain decides the dimension: a 2D domain (:class:`BeamDomain`, or a part
+script that builds a face) runs the plane-stress quad pipeline, a 3D one
+(:class:`BeamDomain3D`, or a script that builds a solid) the solid hex
+pipeline.  Where the part is held and loaded comes from its named regions
+(:mod:`topocombo.regions`), through the constraints and loads of a study
+(:mod:`topocombo.study`); the parametric beam brings its own cantilever
+regions and defaults.  Everything is written to a run directory; nothing is
+plotted or rendered here.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -21,18 +24,9 @@ from .fea import (
     solve as fea_solve,
     timoshenko_tip_deflection,
 )
-from .geometry import CadDomain, Domain, export_domain
-from .mesh_io import (
-    check_mesh,
-    find_node,
-    load_mesh,
-    nodes_on_segment,
-    save_mesh,
-    save_solution,
-)
+from .geometry import BEAM_FIXED, BEAM_LOAD, CadDomain, Domain, export_domain
+from .mesh_io import check_mesh, load_mesh, save_mesh, save_solution
 from .meshing import (
-    PHYS_FIXED,
-    PHYS_LOAD,
     MeshSpec,
     MeshSpec3D,
     generate_fitted_mesh,
@@ -47,8 +41,12 @@ from .optimize import (
     save_design,
     save_history,
 )
+from .regions import embed_points, node_shares, region_dim, region_nodes
 from .runlog import RunLog
+from .study import Fix, Force
 from .topology import save_topology_stl
+
+_REGION_KIND = {0: "vertex", 1: "edge", 2: "face"}
 
 
 def _element_size(domain: Domain, spec: MeshSpec | MeshSpec3D) -> list[float]:
@@ -63,30 +61,39 @@ def _element_size(domain: Domain, spec: MeshSpec | MeshSpec3D) -> list[float]:
     return size
 
 
-def _boundary_conditions(domain: Domain, load_fy: float) -> dict[str, Any]:
-    """The displacement constraints and forces the solve applies, as inputs."""
-    dofs = ["ux", "uy", "uz"][: domain.dim]
-    if domain.dim == 3:
-        (x0, y0, z0), (_, _, z1) = domain.load_line
-        where = f"line x = {x0:g}, y = {y0:g}, z = {z0:g} .. {z1:g}"
-    else:
-        where = "point x = {:g}, y = {:g}".format(*domain.load_point)
-    force = {"fx": 0.0, "fy": float(load_fy)}
-    if domain.dim == 3:
-        force["fz"] = 0.0
+def _region_summary(shape: Any) -> dict[str, Any]:
+    bb = shape.BoundingBox()
+    dim = region_dim(shape)
+    count = len(shape.Faces() if dim == 2 else shape.Edges() if dim == 1 else shape.Vertices())
     return {
-        "constraints": [{
-            "node_set": PHYS_FIXED,
-            "location": "face x = 0" if domain.dim == 3 else "edge x = 0",
-            "type": "clamped",
-            "displacements": {dof: 0.0 for dof in dofs},
-        }],
-        "loads": [{
-            "node_set": PHYS_LOAD,
-            "location": where,
-            "point": [float(c) for c in domain.load_point],
-            "force": force,
-        }],
+        "kind": _REGION_KIND[dim],
+        "count": count,
+        "bbox": [bb.xmin, bb.ymin, bb.zmin, bb.xmax, bb.ymax, bb.zmax],
+    }
+
+
+def _boundary_conditions(
+    domain: Domain, constraints: Sequence[Fix], loads: Sequence[Force], regions: dict[str, Any]
+) -> dict[str, Any]:
+    """The displacement constraints and forces the solve applies, by region."""
+    axes = "xyz"[: domain.dim]
+    return {
+        "constraints": [
+            {
+                **c.as_dict(),
+                **_region_summary(regions[c.region]),
+                "displacements": {f"u{a}": 0.0 for a in axes},
+            }
+            for c in constraints
+        ],
+        "loads": [
+            {
+                **f.as_dict(),
+                **_region_summary(regions[f.region]),
+                "force": {f"f{a}": v for a, v in zip(axes, f.vector)},
+            }
+            for f in loads
+        ],
     }
 
 
@@ -100,12 +107,39 @@ def run(
     optimize_design: bool = True,
     snapshot_every: int = 10,
     echo: bool = True,
+    constraints: Sequence[Fix] | None = None,
+    loads: Sequence[Force] | None = None,
+    study: Any = None,
 ) -> tuple[RunLog, dict[str, Any]]:
-    """Mesh the domain, solve it at full density, then run the SIMP loop."""
+    """Mesh the domain, solve it at full density, then run the SIMP loop.
+
+    ``constraints`` and ``loads`` refer to the domain's named regions.  Left
+    out, the parametric beam uses its cantilever defaults: ``fixed`` clamped
+    and ``load_fy`` at ``load``.  ``study`` is the loaded study the run came
+    from (see :func:`topocombo.study.run_study`), recorded with the run.
+    """
     three_d = domain.dim == 3
     scripted = isinstance(domain, CadDomain)
     if three_d != isinstance(spec, MeshSpec3D):
         raise TypeError("a 3D domain needs a MeshSpec3D, a 2D domain a MeshSpec")
+    regions = domain.regions()
+    if constraints is None and loads is None and not scripted:
+        constraints = [Fix(BEAM_FIXED)]
+        loads = [Force(BEAM_LOAD, (0.0, load_fy, 0.0)[: domain.dim])]
+    if not constraints or not loads:
+        raise ValueError("a run needs constraints and loads on the part's named regions")
+    unknown = [n for n in [c.region for c in constraints] + [f.region for f in loads]
+               if n not in regions]
+    if unknown:
+        raise ValueError(
+            f"unknown region(s) {', '.join(unknown)}; the part defines "
+            f"{', '.join(sorted(regions)) or 'none'}"
+        )
+    if len(loads) != 1:
+        raise ValueError("exactly one Force for now")
+    force = loads[0]
+    if len(force.vector) != domain.dim:
+        raise ValueError(f"a {domain.dim}D part takes a {domain.dim}-component force")
     out_dir = Path(out_dir)
     material = material or Material()
     simp = simp or SimpParams()
@@ -113,7 +147,7 @@ def run(
     depth = domain.width if three_d else domain.thickness
     analysis = "3D solid" if three_d else "plane-stress"
     log = RunLog(
-        name=f"cantilever beam — meshing, {analysis} solve and SIMP optimization",
+        name=f"topology optimization — meshing, {analysis} solve and SIMP",
         out_dir=out_dir,
         echo=echo,
     )
@@ -123,10 +157,13 @@ def run(
         "domain": domain.as_dict(),
         "mesh": {**spec.as_dict(), "element_size": _element_size(domain, spec)},
         "material": material.as_dict(),
-        "load": {"fy": load_fy},
-        "boundary_conditions": _boundary_conditions(domain, load_fy),
+        "load": {f"f{a}": v for a, v in zip("xyz", force.vector)},
+        "boundary_conditions": _boundary_conditions(domain, constraints, loads, regions),
+        "regions": {name: _region_summary(shape) for name, shape in regions.items()},
         "simp": simp.as_dict(),
     }
+    if study is not None:
+        log.params["study"] = {"path": str(study.path), "part": study.study.part}
 
     import cadquery
     import meshio
@@ -152,11 +189,6 @@ def run(
                     f"design domain {domain.length} x {domain.height} x {domain.width} mm box "
                     f"(aspect ratio {domain.aspect_ratio:.2f})"
                 )
-            (x0, y0, z0), (_, _, z1) = domain.load_line
-            log.log(
-                f"clamped face: x = 0; tip load along x = {x0:g}, y = {y0:g}, "
-                f"z = {z0:g} .. {z1:g}"
-            )
             solid = domain.solid()
             log.log(
                 f"solid volume: {solid.Volume():.3f} mm^3 (expected {domain.material_volume:.3f})"
@@ -169,7 +201,6 @@ def run(
                     f"(aspect ratio {domain.aspect_ratio:.2f}), "
                     f"out-of-plane thickness {domain.thickness} mm"
                 )
-            log.log(f"clamped edge: x = 0; tip load applied at {domain.load_point}")
             face = domain.face()
             log.log(
                 f"planar face area: {face.Area():.3f} mm^2 (expected {domain.material_area:.3f})"
@@ -182,6 +213,12 @@ def run(
             log.log(
                 f"x-y profile: {domain.material_area:.3f} of {domain.area:.3f} mm^2 envelope"
                 + (f" ({cut:.3f} mm^2 cut away)" if domain.has_cutouts else " (fills its bounding box)")
+            )
+        for name, info in log.params["regions"].items():
+            lo, hi = info["bbox"][:3], info["bbox"][3:]
+            log.log(
+                f"region '{name}': {info['count']} {info['kind']}(s), "
+                f"({', '.join(f'{v:g}' for v in lo)}) .. ({', '.join(f'{v:g}' for v in hi)})"
             )
         exported = export_domain(domain, out_dir / "cad")
         log.log(
@@ -197,7 +234,14 @@ def run(
         }
         for kind, path in exported.items():
             log.artifact(path, descriptions[kind])
+        if study is not None:
+            study_copy = out_dir / "study.py"
+            study_copy.write_text(study.source)
+            log.log(f"study: {study.path} (part: {study.study.part})")
+            log.artifact(study_copy, "the study script: mesh, material, constraints, loads, optimizer")
         log.record(
+            study_script=None if study is None else study.source,
+            study_path=None if study is None else str(study.path),
             **cad_record,
             **domain.as_dict(),
             cad_script=domain.cadquery_script(),
@@ -231,12 +275,17 @@ def run(
                 "body-fitted: the mesh follows the CAD boundary, cutouts included"
                 if domain.has_cutouts else "body-fitted: the mesh follows the CAD boundary"
             )
+        tol = 1e-6 * max(domain.length, domain.height, getattr(domain, "width", 0.0))
+        extra = {} if spec.structured else {
+            "points": embed_points(regions, domain.profile(), tol)
+        }
         msh_path, _ = mesher(
             domain=domain,
             spec=spec,
             brep_path=brep,
             out_dir=out_dir / "mesh",
             log=log,
+            **extra,
         )
         mesh_word = "hexahedral" if three_d else "quadrilateral"
         log.artifact(msh_path, f"{mesh_word} mesh with physical groups (Gmsh 2.2 ASCII)")
@@ -245,18 +294,16 @@ def run(
 
     with log.step("validation", "3. Load the mesh and check it"):
         mesh = load_mesh(msh_path)
-        if three_d:
-            load_nodes = nodes_on_segment(
-                mesh, *domain.load_line, candidates=mesh.node_sets[PHYS_LOAD]
-            )
-            if load_nodes.size == 0:  # pragma: no cover - nely odd: no node row at H/2
-                load_nodes = np.array([find_node(mesh, domain.load_point)])
-        else:
-            load_nodes = np.array([find_node(mesh, domain.load_point)])
+        for name in dict.fromkeys([c.region for c in constraints] + [force.region]):
+            mesh.node_sets[name] = region_nodes(mesh.nodes, regions[name], tol)
+        load_nodes = mesh.node_sets[force.region]
+        if load_nodes.size == 0:
+            raise RuntimeError(f"region '{force.region}' has no mesh nodes to carry the load")
+        shares = node_shares(
+            mesh.nodes, mesh.cells, mesh.cell_type, load_nodes,
+            region_dim(regions[force.region]), force.region,
+        )
         load_node = int(load_nodes[0])
-        miss = float(np.linalg.norm(mesh.nodes[load_node][:2] - np.asarray(domain.load_point[:2])))
-        if miss > 1e-6 * domain.length:
-            raise RuntimeError(f"no mesh node at the load point ({miss:.3g} mm away)")
         summary = check_mesh(mesh, domain, expected_elements=spec.n_elements)
         summary["mesh_mode"] = spec.mode
         summary["load_node"] = load_node
@@ -298,10 +345,10 @@ def run(
                 "(the grid resolves a cutout to whole elements)"
             )
         coords = ", ".join(f"{c:.3f}" for c in summary["load_node_coords"])
-        if load_nodes.size > 1:
-            log.log(f"tip load line: {load_nodes.size} nodes, starting at #{load_node} ({coords})")
-        else:
-            log.log(f"tip load node: #{load_node} at ({coords})")
+        log.log(
+            f"load region '{force.region}': {load_nodes.size} node(s), "
+            f"first #{load_node} at ({coords})"
+        )
         for name, passed in summary["checks"].items():
             log.log(f"  [{'PASS' if passed else 'FAIL'}] {name}")
         if not summary["all_checks_passed"]:
@@ -313,28 +360,42 @@ def run(
         paths = save_mesh(
             mesh, out_dir / "mesh", load_node=load_node, load_nodes=load_nodes,
             passive=passive if passive.any() else None,
+            fixed_nodes=np.unique(np.concatenate(
+                [mesh.node_sets[c.region] for c in constraints]
+            )),
+            load_vector=force.vector,
         )
         log.artifact(paths["npz"], f"nodes, {mesh.cell_type} connectivity and boundary node sets (numpy)")
         log.artifact(paths["vtu"], "mesh for PyVista / ParaView")
 
     with log.step("solve", f"5. Assemble and solve ({analysis}, full density)"):
+        components = dict(zip(("fx", "fy", "fz"), force.vector))
         if load_nodes.size > 1:
-            load = LoadCase.along_line(mesh, load_nodes, fy=load_fy)
+            load = LoadCase(
+                node=tuple(int(n) for n in load_nodes), shares=tuple(float(v) for v in shares),
+                **components,
+            )
         else:
-            load = LoadCase(node=load_node, fy=load_fy)
+            load = LoadCase(node=load_node, **components)
+        fixed_sets = [c.region for c in constraints]
+        n_fixed = int(np.unique(np.concatenate([mesh.node_sets[n] for n in fixed_sets])).size)
         log.log(
             f"material: E = {material.youngs_modulus:g} MPa, nu = {material.poisson_ratio:g}, "
             f"G = {material.shear_modulus:g} MPa"
         )
+        vector = ", ".join(f"{v:g}" for v in force.vector)
         log.log(
-            f"boundary conditions: node set '{PHYS_FIXED}' clamped "
-            f"({mesh.dofs_per_node * summary['node_sets'][PHYS_FIXED]} DOFs), "
-            + (
-                f"Fy = {load.fy:g} N spread over {load.nodes.size} nodes "
-                f"(shares {', '.join(f'{v:.3g}' for v in load.node_shares())})"
-                if load.nodes.size > 1
-                else f"Fy = {load.fy:g} N at node {load.node}"
-            )
+            f"constraints: {', '.join(repr(n) for n in fixed_sets)} clamped "
+            f"({n_fixed} nodes, {mesh.dofs_per_node * n_fixed} DOFs)"
+        )
+        shares_text = (
+            f" (shares {', '.join(f'{v:.3g}' for v in load.node_shares())})"
+            if 1 < load.nodes.size <= 6 else ""
+        )
+        log.log(
+            f"load: F = ({vector}) N on '{force.region}', spread over "
+            f"{load.nodes.size} node(s) by {_REGION_KIND[region_dim(regions[force.region])]}"
+            f" tributary share{shares_text}"
         )
         ke_all = element_stiffnesses(mesh, material, depth)
         n_edof = ke_all.shape[1]
@@ -348,32 +409,36 @@ def run(
             material=material,
             thickness=depth,
             load=load,
-            fixed_node_set=PHYS_FIXED,
+            fixed_node_set=fixed_sets,
             densities=np.where(passive, 0.0, 1.0) if passive.any() else None,
             ke_all=ke_all,
         )
-        beam = timoshenko_tip_deflection(
+        tip_uy = float(result.component(1)[load.nodes].mean())
+        reactions = [float(result.component(i, "reactions").sum()) for i in range(mesh.dim)]
+        reaction_y = reactions[1]
+        # a reference only the parametric cantilever has: tip-loaded beam theory
+        beam = None if scripted else timoshenko_tip_deflection(
             domain.length, domain.height, depth, material, load.fy
         )
-        tip_uy = float(result.component(1)[load.nodes].mean())
-        rel = abs(abs(tip_uy) - beam["total"]) / beam["total"]
-        reaction_y = float(result.component(1, "reactions").sum())
+        rel = abs(abs(tip_uy) - beam["total"]) / beam["total"] if beam else None
 
         log.log(f"solved {result.n_free_dofs} free DOFs (sparse direct)")
         log.log(f"compliance F.U = {result.compliance:.6g} N*mm")
         log.log(
-            f"tip deflection uy = {tip_uy:.6g} mm"
-            + (" (mean over the load line)" if load.nodes.size > 1 else "")
+            f"uy at the load = {tip_uy:.6g} mm"
+            + (f" (mean over {load.nodes.size} nodes)" if load.nodes.size > 1 else "")
         )
-        log.log(
-            f"Timoshenko beam theory: {beam['total']:.6g} mm "
-            f"(bending {beam['bending']:.4g} + shear {beam['shear']:.4g}) "
-            f"-> {rel * 100:.2f}% difference"
-            + (" (beam theory ignores the cutouts)" if domain.has_cutouts else "")
-        )
+        if beam:
+            log.log(
+                f"Timoshenko beam theory: {beam['total']:.6g} mm "
+                f"(bending {beam['bending']:.4g} + shear {beam['shear']:.4g}) "
+                f"-> {rel * 100:.2f}% difference"
+                + (" (beam theory ignores the cutouts)" if domain.has_cutouts else "")
+            )
         log.log(
             f"equilibrium: ||KU - F|| on free DOFs = {result.equilibrium_residual:.3e}, "
-            f"sum of vertical reactions = {reaction_y:.6g} N vs applied {-load.fy:g} N"
+            f"sum of reactions = ({', '.join(f'{v:.6g}' for v in reactions)}) N vs applied "
+            f"({', '.join(f'{0.0 - v:g}' for v in force.vector)}) N"
         )
         log.log(
             f"von Mises at centroids: {result.von_mises.min():.4g} – "
@@ -391,6 +456,7 @@ def run(
             "beam_theory_rel_diff": rel,
             "equilibrium_residual": result.equilibrium_residual,
             "reaction_y": reaction_y,
+            "reactions": reactions,
             "n_free_dofs": result.n_free_dofs,
             "von_mises_min": float(result.von_mises.min()),
             "von_mises_max": float(result.von_mises.max()),
@@ -439,7 +505,7 @@ def run(
                 material=material,
                 thickness=depth,
                 load=load,
-                fixed_node_set=PHYS_FIXED,
+                fixed_node_set=fixed_sets,
                 params=simp,
                 on_iteration=on_iteration,
                 passive=passive,

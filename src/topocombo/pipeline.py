@@ -86,15 +86,17 @@ def _boundary_conditions(
 ) -> dict[str, Any]:
     """The displacement constraints and forces the solve applies, by region."""
     axes = "xyz"[: domain.dim]
+    def entry(c: Fix | Displace, case: StudyCase | None) -> dict[str, Any]:
+        return {
+            **c.as_dict(),
+            **_region_summary(regions[c.region]),
+            "displacements": {f"u{axes[i]}": v for i, v in c.components(domain.dim).items()},
+            **({"case": case.name} if case is not None else {}),
+        }
+
     return {
-        "constraints": [
-            {
-                **c.as_dict(),
-                **_region_summary(regions[c.region]),
-                "displacements": {f"u{axes[i]}": v for i, v in c.components(domain.dim).items()},
-            }
-            for c in constraints
-        ],
+        "constraints": [entry(c, None) for c in constraints]
+        + [entry(c, case) for case in cases for c in case.constraints],
         "loads": [
             {
                 **f.as_dict(),
@@ -134,6 +136,24 @@ def _driver_limits(limits: Sequence[Any], cases: Sequence[StudyCase], mesh: Any)
                 out.append(Limit("stress", lim.max, f"stress p-norm ({names[i]})", case=i,
                                  p=lim.p, q=lim.q))
     return out
+
+
+def _held_dofs(mesh: Any, constraints: Sequence[Fix | Displace], dim: int) -> dict[int, float]:
+    """DOF -> held displacement for ``constraints``; two of them holding a
+    component at different values is an error."""
+    held: dict[int, float] = {}
+    held_by: dict[int, str] = {}
+    for c in constraints:
+        for comp, value in c.components(dim).items():
+            for n in mesh.node_sets[c.region]:
+                dof = mesh.dofs_per_node * int(n) + comp
+                if dof in held and held[dof] != value:
+                    raise ValueError(
+                        f"regions '{held_by[dof]}' and '{c.region}' hold node {int(n)}'s "
+                        f"u{'xyz'[comp]} at {held[dof]:g} and {value:g}"
+                    )
+                held[dof], held_by[dof] = value, c.region
+    return held
 
 
 def _clamped_nodes(mesh: Any, prescribed: dict[int, float]) -> np.ndarray:
@@ -196,13 +216,18 @@ def run(
         raise ValueError("give loads (one case) or load_cases, not both")
     cases = list(load_cases) if load_cases else ([StudyCase("load", tuple(loads))] if loads else [])
     passive_regions = list(passive_regions)
-    if not constraints or not cases:
+    constraints = list(constraints or [])
+    if not cases or not (constraints or all(case.constraints for case in cases)):
         raise ValueError("a run needs constraints and loads on the part's named regions")
     forces = [f for case in cases for f in case.loads]
+    if not forces:
+        raise ValueError("a run needs at least one Force(...)")
+    case_constraints = [c for case in cases for c in case.constraints]
     limits = list(limits)
     limit_regions = [lim.region for lim in limits if hasattr(lim, "region")]
     bc_names = list(dict.fromkeys(
-        [c.region for c in constraints] + [f.region for f in forces] + limit_regions
+        [c.region for c in constraints + case_constraints] + [f.region for f in forces]
+        + limit_regions
     ))
     unknown = [n for n in bc_names + [p.region for p in passive_regions] if n not in regions]
     if unknown:
@@ -219,7 +244,7 @@ def run(
     for f in forces:
         if len(f.vector) != domain.dim:
             raise ValueError(f"a {domain.dim}D part takes a {domain.dim}-component force")
-    for c in constraints:
+    for c in constraints + case_constraints:
         c.components(domain.dim)  # a z component on a 2D part raises here
     force = forces[0]  # the first force of the first case: what one-load summaries show
     bc_regions = {n: regions[n] for n in bc_names}
@@ -245,10 +270,7 @@ def run(
         "mesh": {**spec.as_dict(), "element_size": _element_size(domain, spec)},
         "material": material.as_dict(),
         "load": {f"f{a}": v for a, v in zip("xyz", force.vector)},
-        "load_cases": [
-            {"name": c.name, "weight": c.weight, "forces": [f.as_dict() for f in c.loads]}
-            for c in cases
-        ],
+        "load_cases": [c.as_dict() for c in cases],
         "boundary_conditions": _boundary_conditions(domain, constraints, cases, regions),
         "passive": [p.as_dict() for p in passive_regions],
         "objective": objective,
@@ -421,29 +443,28 @@ def run(
                              shares=tuple(float(v) for v in shares_f), **comps)
                     if nodes_f.size > 1 else LoadCase(node=int(nodes_f[0]), **comps)
                 )
-        load = nodal[0][0]
+        load = next(lc[0] for lc in nodal if lc)
         load_nodes = load.nodes
         load_node = int(load_nodes[0])
-        # constraints: DOF -> held displacement, shared by every case
-        prescribed: dict[int, float] = {}
-        held_by: dict[int, str] = {}
-        for c in constraints:
-            for comp, value in c.components(domain.dim).items():
-                for n in mesh.node_sets[c.region]:
-                    dof = mesh.dofs_per_node * int(n) + comp
-                    if dof in prescribed and prescribed[dof] != value:
-                        raise ValueError(
-                            f"regions '{held_by[dof]}' and '{c.region}' hold node {int(n)}'s "
-                            f"u{'xyz'[comp]} at {prescribed[dof]:g} and {value:g}"
-                        )
-                    prescribed[dof], held_by[dof] = value, c.region
-        constrained = np.array(sorted(prescribed), dtype=int)
-        loose = rigid_body_free(mesh, constrained)
-        if loose:
-            raise ValueError(
-                f"the constraints leave the part free to move: {loose} rigid-body motion(s) "
-                "(translations or rotations) are not held; fix more components"
-            )
+        # constraints: DOF -> held displacement, the study's in every case plus
+        # each case's own (which win on a component both hold)
+        prescribed = _held_dofs(mesh, constraints, domain.dim)
+        case_prescribed = [
+            {**prescribed, **_held_dofs(mesh, case.constraints, domain.dim)} for case in cases
+        ]
+        for case, held_c in zip(cases, case_prescribed):
+            loose = rigid_body_free(mesh, np.array(sorted(held_c), dtype=int))
+            if loose:
+                raise ValueError(
+                    "the constraints leave the part free to move"
+                    + (f" in case '{case.name}'" if len(cases) > 1 else "")
+                    + f": {loose} rigid-body motion(s) (translations or rotations) are not held;"
+                    " fix more components"
+                )
+        # what the solver gets: one shared map, or one map per case
+        prescribed_arg = case_prescribed if case_constraints else prescribed
+        every_held = {dof: v for held_c in case_prescribed for dof, v in held_c.items()}
+        constrained = np.array(sorted(every_held), dtype=int)
         fixed_nodes = np.unique(constrained // mesh.dofs_per_node)
         summary = check_mesh(mesh, domain, expected_elements=spec.n_elements)
         summary["mesh_mode"] = spec.mode
@@ -482,7 +503,9 @@ def run(
         summary["load_cases"] = [
             {"name": case.name, "weight": case.weight,
              "forces": [{"region": f.region, "nodes": int(mesh.node_sets[f.region].size),
-                         "vector": list(f.vector)} for f in case.loads]}
+                         "vector": list(f.vector)} for f in case.loads],
+             "constraints": [{**c.as_dict(), "nodes": int(mesh.node_sets[c.region].size)}
+                             for c in case.constraints]}
             for case in cases
         ]
 
@@ -539,8 +562,8 @@ def run(
             fixed_nodes=fixed_nodes,
             load_vector=force.vector,
             solid=solid if solid.any() else None,
-            clamped_nodes=_clamped_nodes(mesh, prescribed),
-            held=_held(mesh, prescribed)[fixed_nodes],
+            clamped_nodes=_clamped_nodes(mesh, every_held),
+            held=_held(mesh, every_held)[fixed_nodes],
         )
         log.artifact(paths["npz"], f"nodes, {mesh.cell_type} connectivity and boundary node sets (numpy)")
         log.artifact(paths["vtu"], "mesh for PyVista / ParaView")
@@ -550,13 +573,20 @@ def run(
             f"material: E = {material.youngs_modulus:g} MPa, nu = {material.poisson_ratio:g}, "
             f"G = {material.shear_modulus:g} MPa"
         )
-        for c in constraints:
+        for case, c in [(None, c) for c in constraints] + [
+            (case, c) for case in cases for c in case.constraints
+        ]:
             comps = c.components(domain.dim)
             what = ", ".join(f"u{'xyz'[i]} = {v:g}" for i, v in comps.items())
             log.log(
-                f"constraint on '{c.region}' ({mesh.node_sets[c.region].size} nodes): {what}"
+                (f"case '{case.name}': " if case is not None else "")
+                + f"constraint on '{c.region}' ({mesh.node_sets[c.region].size} nodes): {what}"
             )
-        log.log(f"{constrained.size} constrained DOFs; every rigid-body motion held")
+        log.log(
+            f"{constrained.size} constrained DOFs"
+            + (" (over all cases)" if case_constraints else "")
+            + "; every rigid-body motion held"
+        )
         for case, loads_c in zip(cases, nodal):
             for f, lc in zip(case.loads, loads_c):
                 shares_text = (
@@ -581,7 +611,7 @@ def run(
             material=material,
             thickness=depth,
             loads=nodal,
-            prescribed=prescribed,
+            prescribed=prescribed_arg,
             densities=density0,
             ke_all=ke_all,
             solver=solver,
@@ -606,7 +636,7 @@ def run(
                 + (f", {len(cases)} load cases" if len(cases) > 1 else ""))
         case_summaries = []
         for case, r, loads_c in zip(cases, results, nodal):
-            applied = sum(np.array(lc.components(mesh.dim)) for lc in loads_c)
+            applied = sum((np.array(lc.components(mesh.dim)) for lc in loads_c), np.zeros(mesh.dim))
             react = [float(r.component(i, "reactions").sum()) for i in range(mesh.dim)]
             log.log(
                 f"case '{case.name}': compliance = {r.compliance:.6g} N*mm; reactions "
@@ -623,7 +653,7 @@ def run(
         if len(cases) > 1:
             log.log(f"weighted compliance = {total:.6g} N*mm")
         log.log(f"compliance F.U = {total:.6g} N*mm"
-                + (" (f.u - u_p.r_p: prescribed displacements do work)" if any(prescribed.values()) else ""))
+                + (" (f.u - u_p.r_p: prescribed displacements do work)" if any(v for held_c in case_prescribed for v in held_c.values()) else ""))
         log.log(
             f"uy at the load = {tip_uy:.6g} mm"
             + (f" (mean over {load.nodes.size} nodes)" if load.nodes.size > 1 else "")
@@ -699,15 +729,23 @@ def run(
                         f"Mnd = {record['measure_of_discreteness']:5.1f}%"
                         + (f"  limits {record['max_violation']:+.3f}"
                            if "max_violation" in record else "")
+                        + (f"  beta {record['beta']:g}" if "beta" in record else "")
                     )
                 if snapshot_every and it % snapshot_every == 0:
                     save_density_field(
                         mesh, densities, snapshots_dir / f"density_iter_{it:04d}.vtu"
                     )
 
+            if simp.projection:
+                log.log(
+                    f"Heaviside projection at eta = {simp.projection_eta:g}: beta from 1, doubled "
+                    f"every {simp.projection_every} iterations (or once the design settles) "
+                    f"up to {simp.projection:g}"
+                )
             optimizer = simp.optimizer
             if optimizer == "auto":
-                optimizer = "oc" if objective == "compliance" and not limits else "mma"
+                plain = objective == "compliance" and not limits and not simp.projection
+                optimizer = "oc" if plain else "mma"
             if optimizer == "oc" and (limits or objective != "compliance"):
                 raise ValueError("limits or a volume objective need optimizer='mma'")
             if optimizer in ("mma", "nlopt"):
@@ -739,7 +777,7 @@ def run(
             if optimizer in ("mma", "nlopt"):
                 design = optimize_mma(
                     mesh, material, depth, weighted, simp, objective=objective,
-                    limits=driver_limits, prescribed=prescribed, passive=passive, solid=solid,
+                    limits=driver_limits, prescribed=prescribed_arg, passive=passive, solid=solid,
                     solver=solver, on_iteration=on_iteration, driver=optimizer,
                 )
                 for lim in design.limits:
@@ -759,7 +797,7 @@ def run(
                     passive=passive,
                     solver=solver,
                     cases=weighted,
-                    prescribed=prescribed,
+                    prescribed=prescribed_arg,
                     solid=solid,
                 )
             reduction = (design.compliance / total) if total else float("nan")

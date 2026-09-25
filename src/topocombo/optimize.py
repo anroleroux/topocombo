@@ -42,6 +42,13 @@ class SimpParams:
     #: filter), "nlopt" (NLopt's MMA) or "auto": OC where it applies, MMA
     #: otherwise
     optimizer: str = "auto"
+    #: Heaviside projection of the filtered densities towards 0 and 1: the
+    #: final sharpness beta (0: off).  beta starts at 1 and doubles every
+    #: ``projection_every`` iterations, or sooner once the design settles,
+    #: until it reaches this.  MMA only, on the density filter.
+    projection: float = 0.0
+    projection_eta: float = 0.5  # the threshold densities are pushed away from
+    projection_every: int = 40
 
     def __post_init__(self) -> None:
         if not 0.0 < self.volume_fraction <= 1.0:
@@ -56,6 +63,17 @@ class SimpParams:
             raise ValueError("optimizer must be 'auto', 'oc', 'mma' or 'nlopt'")
         if not isinstance(self.max_iterations, int) or self.max_iterations < 1:
             raise ValueError("max_iterations must be a whole number >= 1")
+        if self.projection and not self.projection >= 1.0:
+            raise ValueError("projection is the final beta, >= 1 (or 0 for none)")
+        if self.projection and self.optimizer in ("oc", "nlopt"):
+            raise ValueError(
+                "projection needs optimizer='mma' (or 'auto'): OC cycles on it and "
+                "NLopt cannot raise beta between its iterations"
+            )
+        if not 0.0 < self.projection_eta < 1.0:
+            raise ValueError("projection_eta must lie in (0, 1)")
+        if not isinstance(self.projection_every, int) or self.projection_every < 1:
+            raise ValueError("projection_every must be a whole number >= 1")
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -139,6 +157,45 @@ def build_filter(mesh: Mesh, radius: float) -> tuple[sp.csr_matrix, np.ndarray]:
     return h, hs
 
 
+def project(x: np.ndarray, beta: float, eta: float = 0.5) -> tuple[np.ndarray, np.ndarray]:
+    """(Heaviside projection of ``x``, its slope): the smoothed step
+
+        (tanh(beta eta) + tanh(beta (x - eta))) / (tanh(beta eta) + tanh(beta (1 - eta)))
+
+    which keeps 0 and 1 and, as beta grows, sends densities below ``eta`` to
+    0 and above it to 1.  ``beta`` 0 is no projection."""
+    if not beta:
+        return x, np.ones_like(x)
+    t = np.tanh(beta * eta)
+    d = t + np.tanh(beta * (1.0 - eta))
+    th = np.tanh(beta * (x - eta))
+    return (t + th) / d, beta * (1.0 - th**2) / d
+
+
+class Continuation:
+    """The projection's beta over the run: 1 at the start, doubled every
+    ``projection_every`` iterations or when the design settles, up to
+    ``projection``.  Without projection it is 0 throughout and always final."""
+
+    def __init__(self, params: SimpParams) -> None:
+        self.final = float(params.projection)
+        self.every = params.projection_every
+        self.beta = 1.0 if self.final else 0.0
+        self.since = 0
+
+    @property
+    def at_final(self) -> bool:
+        return self.beta >= self.final
+
+    def step(self, change: float, tolerance: float) -> bool:
+        """After an iteration: raise beta if due; True if it changed."""
+        self.since += 1
+        if self.at_final or (change >= tolerance and self.since < self.every):
+            return False
+        self.beta, self.since = min(2.0 * self.beta, self.final), 0
+        return True
+
+
 def oc_update(
     x: np.ndarray,
     dc: np.ndarray,
@@ -183,7 +240,7 @@ def optimize(
     passive: np.ndarray | None = None,
     solver: str = "auto",
     cases: Sequence[tuple[float, Any]] | None = None,
-    prescribed: Mapping[int, float] | None = None,
+    prescribed: Mapping[int, float] | Sequence[Mapping[int, float] | None] | None = None,
     solid: np.ndarray | None = None,
 ) -> OptResult:
     """Minimise compliance subject to a volume constraint, returning the design.
@@ -235,6 +292,11 @@ def optimize(
     iteration = 0
     x_phys = x.copy()
     compliance = float("nan")
+    if params.projection:
+        # OC's fixed-point update cycles on a sharp projection: a few elements
+        # flip between 0 and 1 for good (measured on the MBB beam)
+        raise ValueError("projection needs optimizer='mma'")
+    ht = h.T.tocsr()  # H is not symmetric on unequal elements
 
     def physical(design: np.ndarray) -> np.ndarray:
         if params.filter_type == "density":
@@ -282,9 +344,9 @@ def optimize(
         )
         dv = measure_fraction.copy()
 
-        if params.filter_type == "density":
-            dc = np.asarray(h @ (dc / hs)).ravel()
-            dv = np.asarray(h @ (dv / hs)).ravel()
+        if params.filter_type == "density":  # chain rule through the filter
+            dc = np.asarray(ht @ (dc / hs)).ravel()
+            dv = np.asarray(ht @ (dv / hs)).ravel()
         else:  # sensitivity filtering acts on dc only
             dc = np.asarray(h @ (x * dc)).ravel() / hs / np.maximum(1e-3, x)
 
@@ -336,6 +398,7 @@ def save_history(history: list[dict[str, float]], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     columns = ["iteration", "compliance", "volume_fraction", "change",
                "measure_of_discreteness", "seconds", "solver_iterations"]
+    columns += [c for c in ("max_violation", "beta") if any(c in row for row in history)]
     lines = [",".join(columns)]
     for row in history:
         lines.append(",".join(f"{row.get(c, 0):.10g}" for c in columns))

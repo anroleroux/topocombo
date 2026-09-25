@@ -164,20 +164,44 @@ class Force:
 @dataclass(frozen=True)
 class LoadCase:
     """Forces that act together.  With several cases the optimizer minimises
-    the weighted sum of their compliances: a design stiff for each."""
+    the weighted sum of their compliances: a design stiff for each.
+
+    ``constraints`` (:class:`Fix`, :class:`Displace`) hold in this case only,
+    on top of the study's: a support that settles, a jack that pushes, a
+    part held one way in service and another in handling.  On a component
+    the study also holds, the case's value wins.  A case may have no forces
+    when a :class:`Displace` in it moves something.
+    """
 
     name: str
-    loads: tuple[Force, ...]
+    loads: tuple[Force, ...] = ()
     weight: float = 1.0
+    constraints: tuple[Fix | Displace, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "loads", tuple(self.loads))
+        object.__setattr__(self, "constraints", tuple(self.constraints))
         if not isinstance(self.name, str) or not self.name:
             raise ValueError("LoadCase.name must be a non-empty string")
-        if not self.loads or not all(isinstance(f, Force) for f in self.loads):
-            raise ValueError(f"LoadCase '{self.name}' needs one or more Force(...)")
+        if not all(isinstance(f, Force) for f in self.loads):
+            raise ValueError(f"LoadCase '{self.name}': loads takes Force(...) entries")
+        if not all(isinstance(c, (Fix, Displace)) for c in self.constraints):
+            raise ValueError(f"LoadCase '{self.name}': constraints takes Fix(...) or Displace(...)")
+        moves = any(
+            isinstance(c, Displace) and any(v for v in (c.ux, c.uy, c.uz) if v is not None)
+            for c in self.constraints
+        )
+        if not self.loads and not moves:
+            raise ValueError(
+                f"LoadCase '{self.name}' needs a Force(...), or a Displace(...) that moves something"
+            )
         if not self.weight > 0:
             raise ValueError(f"LoadCase '{self.name}': weight must be positive")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "weight": self.weight,
+                "forces": [f.as_dict() for f in self.loads],
+                "constraints": [c.as_dict() for c in self.constraints]}
 
 
 @dataclass(frozen=True)
@@ -268,11 +292,12 @@ class Study:
     Loads come as ``loads`` — the forces of a single case — or as
     ``load_cases``, several weighted :class:`LoadCase` s; give one or the
     other.  ``constraints`` (:class:`Fix`, :class:`Displace`) hold in every
-    case; ``passive`` regions are kept out of the design.
+    case, and a case may add its own; ``passive`` regions are kept out of
+    the design.
     """
 
     part: str
-    constraints: tuple[Fix | Displace, ...]
+    constraints: tuple[Fix | Displace, ...] = ()
     loads: tuple[Force, ...] = ()
     mesh: Mesh = field(default_factory=Mesh)
     material: Material = field(default_factory=Material)
@@ -291,10 +316,8 @@ class Study:
     def __post_init__(self) -> None:
         for name in ("constraints", "loads", "load_cases", "passive", "limits"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
-        if not self.constraints or not all(
-            isinstance(c, (Fix, Displace)) for c in self.constraints
-        ):
-            raise ValueError("Study.constraints needs at least one Fix(...) or Displace(...)")
+        if not all(isinstance(c, (Fix, Displace)) for c in self.constraints):
+            raise ValueError("Study.constraints takes Fix(...) or Displace(...) entries")
         if not all(isinstance(f, Force) for f in self.loads):
             raise ValueError("Study.loads takes Force(...) entries")
         if not all(isinstance(c, LoadCase) for c in self.load_cases):
@@ -304,6 +327,11 @@ class Study:
         names = [c.name for c in self.load_cases]
         if len(set(names)) != len(names):
             raise ValueError("Study.load_cases need distinct names")
+        if not self.constraints and not all(c.constraints for c in self.cases):
+            raise ValueError(
+                "Study.constraints needs at least one Fix(...) or Displace(...) "
+                "(or every load case its own)"
+            )
         if not all(isinstance(p, Passive) for p in self.passive):
             raise ValueError("Study.passive takes Passive(...) entries")
         for name, cls in (("mesh", Mesh), ("material", Material)):
@@ -345,6 +373,7 @@ class Study:
     def regions_used(self) -> list[str]:
         names = (
             [c.region for c in self.constraints] + [f.region for f in self.forces]
+            + [c.region for case in self.cases for c in case.constraints]
             + [p.region for p in self.passive]
             + [lim.region for lim in self.limits if isinstance(lim, DisplacementLimit)]
         )

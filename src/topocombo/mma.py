@@ -46,7 +46,7 @@ import numpy as np
 from . import responses
 from .fea import Material, element_stiffnesses, solve_cases
 from .mesh_io import Mesh
-from .optimize import OptResult, SimpParams, build_filter
+from .optimize import Continuation, OptResult, SimpParams, build_filter, project
 
 OBJECTIVES = ("compliance", "volume")
 DRIVERS = ("mma", "nlopt")
@@ -158,6 +158,31 @@ def mma_step(state: MMAState, x: np.ndarray, f0: float, df0: np.ndarray,
 # --------------------------------------------------------------------------
 # the problem, and the two drivers
 # --------------------------------------------------------------------------
+def design_map(mesh: Mesh, params: SimpParams, passive: np.ndarray, solid: np.ndarray,
+               beta: Continuation) -> tuple[Callable, Callable]:
+    """(physical, to_design): design variables -> physical densities (the
+    density filter, then the Heaviside projection at ``beta``'s current
+    sharpness, held elements set), and a physical-density gradient -> the
+    design-variable gradient, the chain rule back through both, at the point
+    ``physical`` last saw."""
+    h, hs = build_filter(mesh, params.filter_radius)
+    ht = h.T.tocsr()  # H is not symmetric on unequal elements
+    fixed = passive | solid
+    slope = {"value": np.ones(mesh.n_elements)}
+
+    def physical(x: np.ndarray) -> np.ndarray:
+        x_phys, slope["value"] = project(np.asarray(h @ x).ravel() / hs, beta.beta,
+                                         params.projection_eta)
+        x_phys[passive], x_phys[solid] = 0.0, 1.0
+        return x_phys
+
+    def to_design(grad_phys: np.ndarray) -> np.ndarray:
+        g = np.where(fixed, 0.0, grad_phys * slope["value"])
+        return np.asarray(ht @ (g / hs)).ravel()
+
+    return physical, to_design
+
+
 def optimize_mma(
     mesh: Mesh,
     material: Material,
@@ -167,7 +192,7 @@ def optimize_mma(
     objective: str = "compliance",
     limits: Sequence[Limit] = (),
     fixed_node_set: Any = None,
-    prescribed: Mapping[int, float] | None = None,
+    prescribed: Mapping[int, float] | Sequence[Mapping[int, float] | None] | None = None,
     passive: np.ndarray | None = None,
     solid: np.ndarray | None = None,
     solver: str = "auto",
@@ -202,31 +227,21 @@ def optimize_mma(
     ke_all = element_stiffnesses(mesh, material, thickness)
     measures = mesh.cell_measures()
     measure_fraction = measures / measures.sum()
-    h, hs = build_filter(mesh, params.filter_radius)
-    ht = h.T.tocsr()
-    fixed = passive | solid
     lower, upper = np.zeros(n), np.ones(n)
     lower[solid] = 1.0
     upper[passive] = 0.0
-
-    def physical(x: np.ndarray) -> np.ndarray:
-        x_phys = np.asarray(h @ x).ravel() / hs
-        x_phys[passive], x_phys[solid] = 0.0, 1.0
-        return x_phys
-
-    def to_design(grad_phys: np.ndarray) -> np.ndarray:
-        g = np.where(fixed, 0.0, grad_phys)
-        return np.asarray(ht @ (g / hs)).ravel()
+    beta = Continuation(params)
+    physical, to_design = design_map(mesh, params, passive, solid, beta)
 
     cache: dict[str, Any] = {"key": None}
     u_prev: list[np.ndarray | None] = [None] * len(loads)
 
     def evaluate(x: np.ndarray) -> dict[str, Any]:
-        key = x.tobytes()
+        key = x.tobytes() + np.float64(beta.beta).tobytes()
         if cache["key"] == key:
             return cache["value"]
         x_phys = physical(x)
-        results, system = solve_cases(
+        results, systems = solve_cases(
             mesh, material, thickness, loads, fixed_node_set, densities=x_phys,
             penal=params.penal, ke_all=ke_all, solver=solver, x0=u_prev,
             prescribed=prescribed, return_system=True,
@@ -253,12 +268,13 @@ def optimize_mma(
                     )
             elif lim.kind == "displacement":
                 d, dd = responses.displacement(
-                    mesh, system, results[lim.case], ke_all, lim.selector, x_phys, params.penal
+                    mesh, systems[lim.case], results[lim.case], ke_all, lim.selector, x_phys,
+                    params.penal,
                 )
                 value, grad = abs(d), np.sign(d) * dd
             else:
                 value, grad, _ = responses.stress_pnorm(
-                    mesh, material, system, results[lim.case], ke_all, x_phys,
+                    mesh, material, systems[lim.case], results[lim.case], ke_all, x_phys,
                     params.penal, q=lim.q, p=lim.p,
                 )
             # normalised: value / bound - 1 <= 0
@@ -286,6 +302,8 @@ def optimize_mma(
             "solver_iterations": ev["solver_iterations"],
             "max_violation": float(violation),
         }
+        if beta.final:
+            record["beta"] = beta.beta
         clock["t0"] = time.perf_counter()
         history.append(record)
         if on_iteration is not None:
@@ -306,9 +324,13 @@ def optimize_mma(
         for _ in range(params.max_iterations):
             ev = evaluate(x)
             change, violation = log(x, ev)
-            if len(history) > 1 and change < params.tolerance and violation <= 1e-3:
+            if len(history) > 1 and change < params.tolerance and violation <= 1e-3 \
+                    and beta.at_final:
                 converged = True
                 break
+            if len(history) > 1 and beta.step(change, params.tolerance):
+                mma = MMAState(n)  # a sharper projection: a new problem for the asymptotes
+                ev = evaluate(x)
             f0, df0 = scaled_objective(ev)
             g = np.array([gv for _, gv, _ in ev["limits"]])
             dg = np.array([gd for _, _, gd in ev["limits"]]).reshape(len(g), n)

@@ -2019,7 +2019,7 @@ LBRACKET = Path(__file__).resolve().parents[1] / "examples" / "lbracket"
 
 
 def _responses_at(mesh, load, fixed, x, presc, ke):
-    res, system = solve_cases(mesh, Material(), 1.0, [load], fixed, densities=x, ke_all=ke,
+    res, (system,) = solve_cases(mesh, Material(), 1.0, [load], fixed, densities=x, ke_all=ke,
                               prescribed=presc, return_system=True)
     top = np.flatnonzero(mesh.nodes[:, 0] == mesh.nodes[:, 0].max())
     sel = R.displacement_selector(mesh, top, 1)
@@ -2152,7 +2152,7 @@ def test_the_stress_limited_lbracket_lowers_the_peak_stress(tmp_path):
 
     def pnorm(run_dir):
         x = np.load(run_dir / "optimization" / "density.npz")["densities"]
-        res, system = solve_cases(mesh, Material(), 5.0, [load], None, densities=x,
+        res, (system,) = solve_cases(mesh, Material(), 5.0, [load], None, densities=x,
                                   ke_all=ke, prescribed=presc, return_system=True)
         return R.stress_pnorm(mesh, Material(), system, res[0], ke, x, 3.0)[0]
 
@@ -2198,3 +2198,235 @@ def test_limit_blocks_check_their_fields():
         ComplianceLimit(-1.0)
     with pytest.raises(ValueError):
         Limit("stress", 1.0, "s")  # needs a case
+
+
+# --------------------------------------------------------------------------
+# load cases with their own constraints
+# --------------------------------------------------------------------------
+def test_each_case_can_have_its_own_supports():
+    """Per-case prescribed maps solve like separate runs; cases held on the
+    same DOFs share one system; the weighted compliance gradient still
+    matches central differences."""
+    mesh = _brick_grid(4, 2, 1)
+    left = np.flatnonzero(mesh.nodes[:, 0] == 0.0)
+    right = np.flatnonzero(mesh.nodes[:, 0] == 4.0)
+    clamp = {int(d): 0.0 for d in node_dofs(left, 3)}
+    tip = int(right[np.argmax(mesh.nodes[right, 1])])
+    load = LoadCase(node=tip, fy=-50.0)
+    propped = {**clamp, **{3 * int(n) + 1: 0.0 for n in right}}
+    settled = {**clamp, **{3 * int(n) + 1: -0.01 for n in right}}
+    rho = np.random.default_rng(2).uniform(0.3, 1.0, mesh.n_elements)
+    maps = [clamp, propped, settled, clamp]
+    res, systems = solve_cases(mesh, Material(), 1.0, [load] * 4, None, densities=rho,
+                               prescribed=maps, return_system=True)
+    for r, m in zip(res, maps):
+        alone = solve(mesh, Material(), 1.0, load, None, densities=rho, prescribed=m)
+        assert np.allclose(r.u, alone.u, rtol=1e-10, atol=1e-14)
+        assert r.compliance == pytest.approx(alone.compliance, rel=1e-10)
+    assert systems[0] is systems[3] and systems[1] is systems[2]
+    assert systems[0] is not systems[1]
+    # the prop takes load: the propped tip moves least
+    assert abs(res[1].u[3 * tip + 1]) < 1e-12 < abs(res[0].u[3 * tip + 1])
+
+    def weighted(r):
+        out = solve_cases(mesh, Material(), 1.0, [load] * 3, None, densities=r,
+                          prescribed=maps[:3])
+        return R.compliance(out, [1.0, 0.5, 2.0], r, 3.0)
+
+    _, grad, _ = weighted(rho)
+    eye = np.eye(mesh.n_elements) * 1e-6
+    fd = np.array([(weighted(rho + e)[0] - weighted(rho - e)[0]) / 2e-6 for e in eye])
+    assert np.abs(fd - grad).max() < 1e-6 * np.abs(grad).max()
+    with pytest.raises(ValueError, match="3 maps for 4"):
+        solve_cases(mesh, Material(), 1.0, [load] * 4, None, prescribed=maps[:3])
+
+
+def _span() -> str:
+    return _plate(60.0, 10.0, "{'left': cq.Vertex.makeVertex(0, 0, 0), "
+                  "'mid': cq.Vertex.makeVertex(30, 0, 0), "
+                  "'right': cq.Vertex.makeVertex(60, 0, 0), 'deck': edges('>Y')}")
+
+
+def test_a_case_settles_a_support_only_in_that_case(tmp_path):
+    """A two-span beam: in 'deck' the middle support holds, in 'settled' it
+    drops.  Each case's result equals a run with those supports alone."""
+    spec = MeshSpec(nelx=30, nely=5)
+    deck = Force("deck", (0.0, -600.0))
+    shared = [Fix("left"), Fix("right", dofs="y")]
+    _, both = _run_part(
+        tmp_path / "both", _span(), spec, constraints=shared,
+        load_cases=[Case("deck", [deck], constraints=[Fix("mid", dofs="y")]),
+                    Case("settled", [deck], weight=0.5,
+                         constraints=[Displace("mid", uy=-0.02)])],
+    )
+    _, held = _run_part(tmp_path / "held", _span(), spec,
+                        constraints=shared + [Fix("mid", dofs="y")], loads=[deck])
+    _, sunk = _run_part(tmp_path / "sunk", _span(), spec,
+                        constraints=shared + [Displace("mid", uy=-0.02)], loads=[deck])
+    cases = {c["name"]: c for c in both["solve"]["cases"]}
+    assert cases["deck"]["compliance"] == pytest.approx(held["solve"]["compliance"], rel=1e-10)
+    assert cases["settled"]["compliance"] == pytest.approx(sunk["solve"]["compliance"], rel=1e-10)
+    assert both["solve"]["compliance"] == pytest.approx(
+        held["solve"]["compliance"] + 0.5 * sunk["solve"]["compliance"], rel=1e-10)
+    # the case's value wins over the study's on the same component
+    _, over = _run_part(tmp_path / "over", _span(), spec,
+                        constraints=shared + [Fix("mid", dofs="y")],
+                        load_cases=[Case("settled", [deck],
+                                         constraints=[Displace("mid", uy=-0.02)])])
+    assert over["solve"]["compliance"] == pytest.approx(sunk["solve"]["compliance"], rel=1e-10)
+
+
+def test_cases_may_bring_all_the_supports_and_a_case_may_have_no_forces(tmp_path):
+    """No study-wide constraints: each case holds the part its own way; a
+    case driven by a prescribed displacement alone has compliance -u_p.r_p
+    = -(twice its strain energy), which the optimizer makes stiffer."""
+    spec = MeshSpec(nelx=30, nely=5)
+    cases = [
+        Case("service", [Force("deck", (0.0, -600.0))],
+             constraints=[Fix("left"), Fix("right", dofs="y")]),
+        Case("jacked", constraints=[Fix("left"), Fix("right"), Displace("mid", uy=0.01)]),
+    ]
+    _, s = _run_part(tmp_path, _span(), spec, constraints=[], load_cases=cases,
+                     optimize_design=True, simp=SimpParams(max_iterations=10, filter_radius=2.0))
+    jacked = s["solve"]["cases"][1]
+    assert jacked["compliance"] < 0
+    opt = s["optimization"]
+    assert opt["case_compliances"][1] < 0
+    assert opt["case_compliances"][1] > jacked["compliance"]  # 40% of the material, less stiff
+    html = build_site(run_dir=tmp_path, site_dir=tmp_path / "site").read_text()
+    assert "case &#x27;jacked&#x27; only: &#x27;mid&#x27;" in html
+
+
+def test_a_case_whose_supports_leave_a_motion_free_is_named(tmp_path):
+    with pytest.raises(ValueError, match="in case 'loose'"):
+        _run_part(tmp_path, _span(), MeshSpec(nelx=12, nely=2), constraints=[],
+                  load_cases=[
+                      Case("held", [Force("deck", (0.0, -1.0))],
+                           constraints=[Fix("left"), Fix("right", dofs="y")]),
+                      Case("loose", [Force("deck", (0.0, -1.0))],
+                           constraints=[Fix("left", dofs="y"), Fix("right", dofs="y")]),
+                  ])
+
+
+@pytest.mark.parametrize(
+    "body, message",
+    [
+        ("load_cases=[LoadCase('a', [Force('tip', (0.0, -1.0, 0.0))])]", "every load case"),
+        ("constraints=[Fix('wall')], load_cases=[LoadCase('a', constraints=[Fix('wall')])]",
+         "Displace"),
+        ("constraints=[Fix('wall')], load_cases=[LoadCase('a', [Force('tip', (0.0, -1.0, 0.0))],"
+         " constraints=[Force('tip', (0.0, 1.0, 0.0))])]", "constraints takes"),
+    ],
+)
+def test_case_constraints_are_checked(tmp_path, body, message):
+    (tmp_path / "part.py").write_text(_part())
+    study = tmp_path / "study.py"
+    study.write_text(f"from topocombo.study import *\nstudy = Study(part='part.py', {body})\n")
+    with pytest.raises(ValueError, match=message):
+        load_study(study)
+
+
+# --------------------------------------------------------------------------
+# Heaviside projection
+# --------------------------------------------------------------------------
+from topocombo.mma import design_map  # noqa: E402
+from topocombo.optimize import Continuation, project  # noqa: E402
+
+BRIDGE = Path(__file__).resolve().parents[1] / "examples" / "bridge"
+
+
+def test_projection_keeps_the_ends_and_its_slope_is_exact():
+    x = np.linspace(0.0, 1.0, 41)
+    for beta in (1.0, 8.0, 64.0):
+        y, dy = project(x, beta, 0.3)
+        assert y[0] == pytest.approx(0.0, abs=1e-15) and y[-1] == pytest.approx(1.0)
+        assert np.all(np.diff(y) >= 0)  # it saturates to 0 and 1 for a large beta
+        fd = (project(x + 1e-7, beta, 0.3)[0] - project(x - 1e-7, beta, 0.3)[0]) / 2e-7
+        assert np.allclose(dy, fd, rtol=1e-5, atol=1e-8)
+    sharp, _ = project(np.array([0.2, 0.4]), 256.0, 0.3)
+    assert sharp == pytest.approx([0.0, 1.0], abs=1e-9)
+    assert project(x, 0.0)[0] is x  # beta 0: no projection
+
+
+def test_beta_doubles_on_schedule_or_when_the_design_settles():
+    beta = Continuation(SimpParams(projection=8.0, projection_every=3, optimizer="mma"))
+    seen = [beta.beta]
+    for change in (0.5, 0.5, 0.5, 0.001, 0.5, 0.5, 0.5, 0.001):
+        beta.step(change, 0.01)
+        seen.append(beta.beta)
+    assert seen == [1, 1, 1, 2, 4, 4, 4, 8, 8]
+    assert beta.at_final
+    off = Continuation(SimpParams())
+    assert off.beta == 0.0 and off.at_final and not off.step(0.0, 0.01)
+
+
+def test_the_gradient_chain_through_filter_and_projection_is_exact(small_mbb):
+    """d(compliance)/d(design) through the density filter and a sharp
+    projection, with held elements, against central differences."""
+    m, presc, load = small_mbb["mesh"], small_mbb["presc"], small_mbb["load"]
+    params = SimpParams(filter_radius=1.5, projection=8.0, optimizer="mma")
+    beta = Continuation(params)
+    beta.beta = 8.0
+    passive = np.zeros(m.n_elements, bool)
+    solid = np.zeros(m.n_elements, bool)
+    passive[:3], solid[-3:] = True, True
+    physical, to_design = design_map(m, params, passive, solid, beta)
+    ke = element_stiffnesses(m, Material(), 1.0)
+
+    def objective(x):
+        xp = physical(x)
+        res = solve_cases(m, Material(), 1.0, [load], None, densities=xp, ke_all=ke,
+                          prescribed=presc)
+        c, g, _ = R.compliance(res, [1.0], xp, 3.0)
+        return c, to_design(g)
+
+    x = np.random.default_rng(3).uniform(0.3, 0.7, m.n_elements)
+    _, grad = objective(x)
+    picks = np.random.default_rng(4).choice(m.n_elements, 12, replace=False)
+    for e in picks:
+        d = np.zeros(m.n_elements)
+        d[e] = 1e-4  # smaller steps drown in roundoff (the compliance is ~100 N.mm)
+        fd = (objective(x + d)[0] - objective(x - d)[0]) / 2e-4
+        assert fd == pytest.approx(grad[e], rel=1e-6, abs=1e-9 * np.abs(grad).max())
+
+
+def test_projection_makes_mma_designs_black_and_white(small_mbb):
+    m, presc, load = small_mbb["mesh"], small_mbb["presc"], small_mbb["load"]
+    base = dict(filter_radius=1.5, filter_type="density", max_iterations=400, optimizer="mma")
+    grey = optimize_mma(m, Material(), 1.0, [(1.0, load)], SimpParams(**base), prescribed=presc)
+    crisp = optimize_mma(m, Material(), 1.0, [(1.0, load)],
+                         SimpParams(**base, projection=16.0, projection_every=30),
+                         prescribed=presc)
+    assert crisp.converged and crisp.history[-1]["beta"] == 16.0
+    assert crisp.volume_fraction == pytest.approx(0.5, abs=1e-3)
+    assert crisp.measure_of_discreteness() < 5.0 < grey.measure_of_discreteness()
+    assert crisp.compliance < grey.compliance  # grey is penalised stiffness spent
+
+
+def test_projection_is_refused_where_it_cannot_run():
+    with pytest.raises(ValueError, match="needs optimizer='mma'"):
+        SimpParams(projection=8.0, optimizer="oc")
+    with pytest.raises(ValueError, match="needs optimizer='mma'"):
+        SimpParams(projection=8.0, optimizer="nlopt")
+    with pytest.raises(ValueError, match=">= 1"):
+        SimpParams(projection=0.5)
+    with pytest.raises(ValueError, match="eta"):
+        SimpParams(projection_eta=1.0)
+
+
+def test_the_bridge_example_settles_its_pier_in_one_case(tmp_path):
+    """The published bridge: per-case supports, MMA with projection."""
+    _, s = run_loaded(load_study(BRIDGE / "study.py"), tmp_path, echo=False)
+    cases = {c["name"]: c for c in s["solve"]["cases"]}
+    # the settled pier carries less of the deck, so the deck bends more
+    assert cases["settled"]["compliance"] > cases["traffic"]["compliance"]
+    opt = s["optimization"]
+    assert opt["converged"] and opt["optimizer"] == "mma"
+    assert opt["measure_of_discreteness"] < 5.0
+    assert opt["volume_fraction"] == pytest.approx(0.4, abs=1e-3)
+    log = (tmp_path / "pipeline.log").read_text()
+    assert "case 'settled': constraint on 'middle' (1 nodes): uy = -0.05" in log
+    assert "Heaviside projection" in log
+    html = build_site(run_dir=tmp_path, site_dir=tmp_path / "site").read_text()
+    assert "Heaviside projection" in html
+    assert "case &#x27;settled&#x27; only: &#x27;middle&#x27;" in html

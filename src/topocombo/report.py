@@ -1156,8 +1156,9 @@ def _study_inputs(params: dict[str, Any], summary: dict[str, Any], run: dict[str
         kind = {"clamped": "clamped", "held": "held", "prescribed": "prescribed"}.get(
             c.get("type", "clamped"), c.get("type")
         )
+        case = f"case '{c['case']}' only: " if c.get("case") else ""
         fix_rows += [
-            (f"'{name}': {c.get('kind', '')} region".replace(":  region", ""),
+            (f"{case}'{name}': {c.get('kind', '')} region".replace(":  region", ""),
              f"{_nodes(sets.get(name))}, {kind}"),
             ("displacement " + _fmt_axes("u", axes) + " (mm)",
              "(" + ", ".join(
@@ -1258,12 +1259,14 @@ def render_html(
     def _holds(c: dict[str, Any]) -> str:
         name = _e(c.get("region") or c.get("node_set", "fixed"))
         if c.get("type", "clamped") == "clamped":
-            return f"{name} is clamped (hatched)"
+            only = f" in case '{_e(c['case'])}'" if c.get("case") else ""
+            return f"{name} is clamped{only} (hatched)"
         comps = ", ".join(
             f"{k} = {_fmt(v)}" for k, v in (c.get("displacements") or {}).items()
         )
         glyph = "" if c.get("type") == "prescribed" else " (triangles)"
-        return f"{name} holds {comps}{glyph}"
+        only = f" in case '{_e(c['case'])}'" if c.get("case") else ""
+        return f"{name} holds {comps}{only}{glyph}"
 
     load_names = list(dict.fromkeys(
         f.get("region") or f.get("node_set", "load") for f in bcs.get("loads", [])
@@ -1418,7 +1421,14 @@ def render_html(
                 f" p = {_e(simp.get('penal', 3))}, density filter of radius"
                 f" {_e(simp.get('filter_radius', ''))} mm, updated by the Method of Moving"
                 " Asymptotes on exact gradients (adjoint solves for displacement and"
-                " stress limits).</p>"
+                " stress limits)."
+                + (
+                    " The filtered densities are pushed to 0 or 1 by a Heaviside projection"
+                    f" about {_e(simp.get('projection_eta', 0.5))}, its sharpness beta doubled"
+                    f" from 1 to {_e(_fmt(simp['projection']))} as the design settles."
+                    if simp.get("projection") else ""
+                )
+                + "</p>"
             )
             + _optimization_cards(optimization, solve)
             + _limits_table(optimization)

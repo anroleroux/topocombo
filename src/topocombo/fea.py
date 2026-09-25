@@ -397,28 +397,31 @@ def solve_cases(
     ke_all: np.ndarray | None = None,
     solver: str = "auto",
     x0: Sequence[np.ndarray | None] | None = None,
-    prescribed: Mapping[int, float] | None = None,
+    prescribed: Mapping[int, float] | Sequence[Mapping[int, float] | None] | None = None,
     return_system: bool = False,
-) -> list[FEResult] | tuple[list[FEResult], "LinearSystem"]:
-    """Linear-elastic solves of several load cases on one stiffness matrix.
+) -> list[FEResult] | tuple[list[FEResult], list["LinearSystem"]]:
+    """Linear-elastic solves of several load cases.
 
-    With ``return_system`` it also returns the :class:`LinearSystem` — the
-    constrained stiffness and its factorisation — for adjoint solves.
+    With ``return_system`` it also returns each case's :class:`LinearSystem`
+    — the constrained stiffness and its factorisation — for adjoint solves.
 
     ``densities`` (if given) applies SIMP scaling.  Plane stress on a 2D mesh
     (with ``thickness``), full 3D elasticity on a 3D one.
 
     Constraints are every DOF of ``fixed_node_set`` held at zero plus the
-    ``prescribed`` DOF -> displacement map, shared by all cases.  Each case is
-    solved by partitioning, ``K_ff u_f = f_f - K_fp u_p``.  Its compliance is
+    ``prescribed`` DOF -> displacement map: one map shared by all cases, or a
+    sequence with one map per case (a support that settles in one case, a
+    jack that pushes in another).  Cases held on the same DOFs share one
+    constrained stiffness and one factorisation.  Each case is solved by
+    partitioning, ``K_ff u_f = f_f - K_fp u_p``.  Its compliance is
     ``f . u - u_p . r_p`` — the work of the loads less that of the reactions
     at prescribed DOFs, i.e. minus twice the potential energy at equilibrium.
     It is ``f . u`` without prescribed displacements, and its sensitivity to
     an element's stiffness is ``-u_e^T dk_e u_e`` either way, so the SIMP
     loop needs no special case.
 
-    ``solver`` is ``"direct"`` (sparse LU, factorised once for all cases),
-    ``"cg"`` (conjugate gradients preconditioned by smoothed-aggregation
+    ``solver`` is ``"direct"`` (sparse LU, factorised once per constrained
+    set), ``"cg"`` (conjugate gradients preconditioned by smoothed-aggregation
     algebraic multigrid, built on the rigid-body modes) or ``"auto"``: direct
     up to :data:`DIRECT_MAX_DOFS` free DOFs, CG above.  ``x0`` (one entry per
     case) warm-starts CG — the SIMP loop passes the previous displacements.
@@ -428,37 +431,45 @@ def solve_cases(
     scale = None if densities is None else simp_scaling(densities, penal)
 
     k = assemble_stiffness(mesh, ke_all, scale)
-    fixed, values = constrained_dofs(mesh, fixed_node_set, prescribed)
-    loose = rigid_body_free(mesh, fixed)
-    if loose:
-        raise ValueError(
-            f"the constraints leave {loose} rigid-body motion(s) free "
-            "(translations or rotations that deform nothing): hold more components"
-        )
-    free = np.setdiff1d(np.arange(mesh.n_dofs), fixed, assume_unique=True)
-    k_ff = k[free][:, free]
-    k_fp = k[free][:, fixed] if np.any(values) else None
-    used = _choose_solver(solver, free.size)
-    factor = None
+    per_case = _per_case(prescribed, len(loads))
+    systems: dict[bytes, LinearSystem] = {}
     dofs = element_dofs(mesh.cells, mesh.dofs_per_node)
-    results = []
+    results, case_systems = [], []
     for index, load in enumerate(loads):
+        fixed, values = constrained_dofs(mesh, fixed_node_set, per_case[index])
+        system = systems.get(fixed.tobytes())
+        if system is None:
+            loose = rigid_body_free(mesh, fixed)
+            if loose:
+                raise ValueError(
+                    f"the constraints leave {loose} rigid-body motion(s) free "
+                    "(translations or rotations that deform nothing): hold more components"
+                )
+            free = np.setdiff1d(np.arange(mesh.n_dofs), fixed, assume_unique=True)
+            system = LinearSystem(mesh=mesh, free=free, k_ff=k[free][:, free],
+                                  solver=_choose_solver(solver, free.size), fixed=fixed)
+            systems[fixed.tobytes()] = system
+        free = system.free
         f = force_vector(mesh, load)
         u = np.zeros(mesh.n_dofs)
         u[fixed] = values
-        rhs = f[free] - (k_fp @ values if k_fp is not None else 0.0)
-        case_used, iterations = used, 0
-        if used == "amg-cg":
+        rhs = f[free]
+        if np.any(values):
+            if system.k_fp is None:
+                system.k_fp = k[free][:, fixed]
+            rhs = rhs - system.k_fp @ values
+        case_used, iterations = system.solver, 0
+        if system.solver == "amg-cg":
             start = None if not x0 or x0[index] is None else np.asarray(x0[index])[free]
-            solution, iterations = _amg_cg(mesh, free, k_ff, rhs, start)
+            solution, iterations = _amg_cg(mesh, free, system.k_ff, rhs, start)
             if solution is None:  # CG did not converge: fall back to the direct solve
                 case_used = "direct (after CG failed)"
             else:
                 u[free] = solution
         if case_used.startswith("direct"):
-            if factor is None:
-                factor = spla.splu(k_ff.tocsc())
-            u[free] = factor.solve(rhs)
+            if system.factor is None:
+                system.factor = spla.splu(system.k_ff.tocsc())
+            u[free] = system.factor.solve(rhs)
 
         residual = k @ u - f  # the reactions on constrained DOFs
         ue = u[dofs]  # (n_elements, nodes_per_cell * dofs_per_node)
@@ -477,9 +488,22 @@ def solve_cases(
             solver=case_used,
             solver_iterations=iterations,
         ))
+        case_systems.append(system)
     if return_system:
-        return results, LinearSystem(mesh=mesh, free=free, k_ff=k_ff, factor=factor, solver=used)
+        return results, case_systems
     return results
+
+
+def _per_case(
+    prescribed: Mapping[int, float] | Sequence[Mapping[int, float] | None] | None, n: int,
+) -> list[Mapping[int, float] | None]:
+    """One prescribed-displacement map per case, from a shared map or a list."""
+    if prescribed is None or isinstance(prescribed, Mapping):
+        return [prescribed] * n
+    maps = list(prescribed)
+    if len(maps) != n:
+        raise ValueError(f"prescribed has {len(maps)} maps for {n} load cases")
+    return maps
 
 
 @dataclass
@@ -492,6 +516,8 @@ class LinearSystem:
     k_ff: sp.spmatrix
     factor: Any = None
     solver: str = "direct"
+    fixed: np.ndarray | None = None
+    k_fp: sp.spmatrix | None = None
 
     def solve(self, rhs: np.ndarray) -> np.ndarray:
         """``K lambda = rhs`` with lambda = 0 on constrained DOFs (the adjoint

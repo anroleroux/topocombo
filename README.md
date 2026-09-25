@@ -324,7 +324,8 @@ tests/          mesh invariants, solver verification, optimizer invariants, 2D <
 docs/           the 3D migration plan
 examples/       designs as part.py + study.py (`--study`): cantilever (hex8), bracket (tet10,
                 two load cases, passive rings), mbb (symmetry and roller supports), lbracket
-                (lightest design within a stress limit, MMA)
+                (lightest design within a stress limit, MMA), bridge (a pier that settles
+                in one load case; MMA with Heaviside projection)
 ```
 
 ## Status
@@ -409,11 +410,16 @@ A study's supports, loads and non-design regions are built from these blocks
 | `Fix(region, dofs="xyz")` | holds components at zero: all of them clamps; `dofs="x"` is a symmetry plane normal to x, `dofs="y"` a roller sliding along x |
 | `Displace(region, ux=…, uy=…, uz=…)` | prescribes components (mm); those left out are free |
 | `Force(region, (Fx, Fy[, Fz]))` | a total force spread over the region |
-| `LoadCase(name, [Force, …], weight=1)` | forces acting together; `Study(load_cases=[…])` optimises the weighted sum of the cases' compliances (or `loads=[…]` for one case) |
+| `LoadCase(name, [Force, …], weight=1, constraints=[…])` | forces acting together, plus supports of this case alone; `Study(load_cases=[…])` optimises the weighted sum of the cases' compliances (or `loads=[…]` for one case) |
 | `Passive(region, state="solid" \| "void", within=0)` | keeps elements out of the design: those whose centre is inside a solid region, or within `within` mm of a face, edge or point — a ring round a bore, a pad on a face |
 
-Constraints hold in every load case. Before anything is solved the pipeline
-refuses constraints that leave a rigid-body motion free (it checks the rank
+`Study(constraints=[…])` hold in every load case; a case's own
+`constraints` add to them for that case only — a pier that settles, a jack
+that pushes, a part held one way in service and another in handling — and on
+a component both hold, the case's value wins. `Study.constraints` may be left
+empty when every case brings its own supports, and a case may have no forces
+when a `Displace` in it moves something. Before anything is solved the
+pipeline refuses constraints (in any case) that leave a rigid-body motion free (it checks the rank
 of the rigid-body modes on the constrained DOFs, so a symmetry edge alone
 fails: the part can still slide along it), regions that hold the same node's
 component at two values, forces or supports on solid regions, and solid
@@ -424,8 +430,9 @@ the loads less the work the prescribed supports do, which is minus twice the
 potential energy at equilibrium. It is `f . u` when nothing is prescribed,
 and its sensitivity is still `-p x^(p-1) u_e^T k0_e u_e` — checked against
 central differences with a force and a pull acting together — so the
-optimizer needs no special case. Load cases share one factorisation of the
-stiffness matrix per iteration.
+optimizer needs no special case. Load cases held on the same DOFs share one
+factorisation of the stiffness matrix per iteration; a case with supports of
+its own gets its own (and its own adjoint solves for limits on it).
 
 Checks:
 
@@ -496,6 +503,55 @@ minimum-compliance design of the same volume reaches 366.6 MPa at its worst
 element; the stress-limited one 224.4 MPa, 39% lower, for 7% more
 compliance (672 against 626 N·mm).
 
-Next: load cases with their own prescribed displacements, Heaviside
-projection to push MMA's density-filtered designs further towards black and
-white, and the CalculiX swap-in for the solver once the loop is trusted.
+### Per-case supports and Heaviside projection
+
+The density filter MMA needs leaves a grey band a filter radius wide round
+every member (Mnd 20–37% on the examples). `SimpParams(projection=16)` passes
+the filtered densities through a smoothed Heaviside step about
+`projection_eta` (0.5),
+
+    x_bar = (tanh(beta eta) + tanh(beta (x - eta))) / (tanh(beta eta) + tanh(beta (1 - eta)))
+
+which keeps 0 and 1 and, as beta grows, sends the rest to one or the other.
+Starting sharp would freeze the first guess, so beta starts at 1 and doubles
+every `projection_every` (40) iterations, or sooner once the design settles,
+up to the value given; MMA's asymptotes restart at each step, and the run
+only counts as converged at the final beta. The gradient runs back through
+the projection and the filter (checked against central differences, with
+held elements); `optimizer="auto"` picks MMA when projection is on. OC is
+refused: its fixed-point update cycles on a sharp projection — on the MBB
+beam a few elements flipped between 0 and 1 for 400 iterations, at move
+limits 0.2, 0.05 and 0.02 alike — and NLopt cannot raise beta between its
+own iterations.
+
+| half MBB, 60 x 20, density filter r = 1.5 | compliance (N·mm) | Mnd | iterations |
+| --- | --- | --- | --- |
+| OC | 1041.9 | 26.9% | 126 |
+| MMA | 1003.2 | 19.7% | 121 |
+| MMA, projection to beta 16 | 900.3 | 0.6% | 216 |
+
+The crisp design is also the stiffer one: at p = 3 a grey element carries
+the volume of its density but only its cube of the stiffness.
+
+**Bridge** (`examples/bridge/`, published at `bridge/`): a 120 x 20 mm deck
+(120 x 20 quads, 5 mm thick) pinned at the left end, on rollers at the right
+end and at mid-span, 2 kN spread along the top. Two cases share the load and
+the end supports: in `traffic` the middle pier holds (`Fix` in that case);
+in `settled` it is held 0.05 mm lower (`Displace` in that case), so it takes
+less of the load and the spans carry more. At 40% of the material, with
+MMA and projection to beta 16, it converges in 322 iterations (13 s) to Mnd
+3.2% and 141.8 N·mm (17.8 in traffic, 124.0 settled): a truss, with the
+deck as its top chord, a bottom chord in each span, and diagonals fanning
+into the pier and the end supports. Without projection MMA
+ends at 152.6 N·mm and Mnd 37.4%; OC with the sensitivity filter at 150.3
+and 32.5%.
+
+Each case's result equals a run with that case's supports alone (to 1e-10),
+and a support's value in a case overrides the study's on the same component.
+
+One more fix came with this: the density filter's chain rule in the OC loop
+used `H` where it needs `H^T`. On a uniform grid `H` is symmetric and nothing
+changes; on a body-fitted mesh the weights include element sizes, so it is
+not, and the gradient was slightly off (MMA already used `H^T`).
+
+Next: the CalculiX swap-in for the solver once the loop is trusted.

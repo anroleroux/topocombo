@@ -3,9 +3,10 @@
     python -m topocombo.cli all --study examples/lbracket/study.py
 
 Minimum volume subject to a von Mises stress limit — a problem Optimality
-Criteria cannot pose, so it runs on NLopt's MMA.  The stress is bounded
-through a p-norm of the element stresses, relaxed by density ("qp": a void
-element's stress fades with it), a smooth bound on the largest stress.
+Criteria cannot pose, so it runs on MMA (the Method of Moving Asymptotes).
+The stress is bounded through a p-norm of the element stresses, relaxed by
+density ("qp": a void element's stress fades with it), a smooth bound on the
+largest stress.
 """
 from topocombo.study import Fix, Force, Material, Mesh, SimpParams, Study, StressLimit
 

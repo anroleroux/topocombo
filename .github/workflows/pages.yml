@@ -41,30 +41,36 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
-      # Four example studies, each a CadQuery part with named regions plus a
+      # Five example studies, each a CadQuery part with named regions plus a
       # study script; the reports print both.  The cantilever (hexahedra,
       # clamped) is the main page; the bracket (not a prism: quadratic
       # tetrahedra, two load cases, passive solid rings) is at bracket/; the
       # half MBB beam (symmetry and roller supports) is at mbb/; the L-bracket
-      # (the lightest design within a stress limit, by MMA) at lbracket/.
+      # (the lightest design within a stress limit, by MMA) at lbracket/; the
+      # bridge (a pier that settles in one load case, MMA with Heaviside
+      # projection) at bridge/.
       - name: Run the pipeline and render the reports
         run: |
           python -m topocombo.cli all --study examples/cantilever/study.py \
             --out results/cantilever --site site \
             --nav "bracket (tet10)=bracket/" --nav "MBB beam (symmetry)=mbb/" \
-            --nav "L-bracket (stress, MMA)=lbracket/"
+            --nav "L-bracket (stress, MMA)=lbracket/" --nav "bridge (settling pier)=bridge/"
           python -m topocombo.cli all --study examples/bracket/study.py \
             --out results/bracket --site site/bracket \
             --nav "cantilever (hex8)=../" --nav "MBB beam (symmetry)=../mbb/" \
-            --nav "L-bracket (stress, MMA)=../lbracket/"
+            --nav "L-bracket (stress, MMA)=../lbracket/" --nav "bridge (settling pier)=../bridge/"
           python -m topocombo.cli all --study examples/mbb/study.py \
             --out results/mbb --site site/mbb \
             --nav "cantilever (hex8)=../" --nav "bracket (tet10)=../bracket/" \
-            --nav "L-bracket (stress, MMA)=../lbracket/"
+            --nav "L-bracket (stress, MMA)=../lbracket/" --nav "bridge (settling pier)=../bridge/"
           python -m topocombo.cli all --study examples/lbracket/study.py \
             --out results/lbracket --site site/lbracket \
             --nav "cantilever (hex8)=../" --nav "bracket (tet10)=../bracket/" \
-            --nav "MBB beam (symmetry)=../mbb/"
+            --nav "MBB beam (symmetry)=../mbb/" --nav "bridge (settling pier)=../bridge/"
+          python -m topocombo.cli all --study examples/bridge/study.py \
+            --out results/bridge --site site/bridge \
+            --nav "cantilever (hex8)=../" --nav "bracket (tet10)=../bracket/" \
+            --nav "MBB beam (symmetry)=../mbb/" --nav "L-bracket (stress, MMA)=../lbracket/"
 
       - name: Upload run artifacts
         uses: actions/upload-artifact@v4

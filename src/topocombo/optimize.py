@@ -37,6 +37,11 @@ class SimpParams:
     tolerance: float = 0.01  # max density change that counts as converged
     e_min: float = 1e-9
     filter_type: str = "sensitivity"  # "sensitivity" (Sigmund) or "density"
+    #: "oc" (Optimality Criteria: minimum compliance under the volume only),
+    #: "mma" (Method of Moving Asymptotes: any objective and limits; density
+    #: filter), "nlopt" (NLopt's MMA) or "auto": OC where it applies, MMA
+    #: otherwise
+    optimizer: str = "auto"
 
     def __post_init__(self) -> None:
         if not 0.0 < self.volume_fraction <= 1.0:
@@ -47,6 +52,10 @@ class SimpParams:
             raise ValueError("filter_radius must be positive")
         if self.filter_type not in ("density", "sensitivity"):
             raise ValueError("filter_type must be 'density' or 'sensitivity'")
+        if self.optimizer not in ("auto", "oc", "mma", "nlopt"):
+            raise ValueError("optimizer must be 'auto', 'oc', 'mma' or 'nlopt'")
+        if not isinstance(self.max_iterations, int) or self.max_iterations < 1:
+            raise ValueError("max_iterations must be a whole number >= 1")
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -63,6 +72,9 @@ class OptResult:
     converged: bool
     history: list[dict[str, float]] = field(default_factory=list)
     case_compliances: list[float] = field(default_factory=list)  # per load case, last iteration
+    limits: list[dict[str, Any]] = field(default_factory=list)  # each limit's final value (MMA)
+    optimizer: str = "oc"
+    objective: str = "compliance"
 
     def measure_of_discreteness(self) -> float:
         """Mnd (%): 0 = fully black-and-white, 100 = every element at 0.5."""
@@ -76,6 +88,9 @@ class OptResult:
             "iterations": self.iterations,
             "converged": self.converged,
             "case_compliances": list(self.case_compliances),
+            "optimizer": self.optimizer,
+            "objective": self.objective,
+            "limits": list(self.limits),
             "measure_of_discreteness": self.measure_of_discreteness(),
             "density_min": float(self.densities.min()),
             "density_max": float(self.densities.max()),

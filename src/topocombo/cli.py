@@ -38,7 +38,7 @@ def _hole(text: str) -> tuple[float, float, float]:
 _STUDY_SETS = (
     "dim", "length", "height", "thickness", "width", "holes", "nelx", "nely", "nelz",
     "mesh_mode", "mesh_size", "youngs", "poisson", "load", "volfrac", "penal", "rmin",
-    "filter_type", "max_iter", "tol", "element", "solver",
+    "filter_type", "max_iter", "tol", "element", "solver", "optimizer",
 )
 
 
@@ -127,6 +127,13 @@ def _add_model_args(p: argparse.ArgumentParser) -> None:
         type=int,
         default=1,
         help="3D only: elements through the width (default: 1, keeps runs light)",
+    )
+    p.add_argument(
+        "--optimizer",
+        choices=("auto", "oc", "mma", "nlopt"),
+        default="auto",
+        help="Optimality Criteria, MMA or NLopt's MMA (both with the density filter)"
+        " (default: auto, which is OC for the parametric beam's minimum compliance)",
     )
     p.add_argument(
         "--solver",
@@ -289,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
             filter_type=args.filter_type,
             max_iterations=args.max_iter,
             tolerance=args.tol,
+            optimizer=args.optimizer,
         )
         run(
             domain=domain,

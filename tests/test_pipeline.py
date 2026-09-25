@@ -2006,3 +2006,195 @@ def test_report_draws_rollers_for_partial_supports(tmp_path):
     html = build_site(run_dir=tmp_path / "mbb", site_dir=tmp_path / "site").read_text()
     assert 'class="roll"' in html and "rollers / symmetry: 21 ux, 1 uy" in html
     assert "Symmetry holds ux = 0" in html
+
+
+# --------------------------------------------------------------------------
+# MMA: exact gradients, the MMA step, objectives and limits
+# --------------------------------------------------------------------------
+from topocombo import responses as R  # noqa: E402
+from topocombo.mma import Limit, MMAState, mma_step, optimize_mma  # noqa: E402
+from topocombo.study import ComplianceLimit, DisplacementLimit, StressLimit  # noqa: E402
+
+LBRACKET = Path(__file__).resolve().parents[1] / "examples" / "lbracket"
+
+
+def _responses_at(mesh, load, fixed, x, presc, ke):
+    res, system = solve_cases(mesh, Material(), 1.0, [load], fixed, densities=x, ke_all=ke,
+                              prescribed=presc, return_system=True)
+    top = np.flatnonzero(mesh.nodes[:, 0] == mesh.nodes[:, 0].max())
+    sel = R.displacement_selector(mesh, top, 1)
+    c, gc, _ = R.compliance(res, [1.0], x, 3.0)
+    d, gd = R.displacement(mesh, system, res[0], ke, sel, x, 3.0)
+    s, gs, _ = R.stress_pnorm(mesh, Material(), system, res[0], ke, x, 3.0)
+    return np.array([c, d, s]), np.array([gc, gd, gs])
+
+
+@pytest.mark.parametrize("three_d", [False, True], ids=["quad4", "hex8"])
+def test_response_gradients_match_central_differences(three_d):
+    """Compliance, a displacement and the stress p-norm, with a force and a
+    prescribed pull together: every adjoint gradient against finite differences."""
+    if three_d:
+        mesh = _brick_grid(4, 2, 1)
+    else:
+        xs, ys = np.meshgrid(np.arange(5.0), np.arange(3.0), indexing="ij")
+        nodes = np.column_stack([xs.ravel(), ys.ravel()])
+        cells = np.array([[i * 3 + j, (i + 1) * 3 + j, (i + 1) * 3 + j + 1, i * 3 + j + 1]
+                          for i in range(4) for j in range(2)])
+        mesh = Mesh(nodes, cells, {}, "quad")
+    d = mesh.dofs_per_node
+    mesh.node_sets["left"] = np.flatnonzero(mesh.nodes[:, 0] == 0.0)
+    right = np.flatnonzero(mesh.nodes[:, 0] == 4.0)
+    tip = int(right[np.argmax(mesh.nodes[right, 1])])
+    load = LoadCase(node=tip, fy=-50.0)
+    presc = {d * int(right[0]): 0.002}
+    ke = element_stiffnesses(mesh, Material(), 1.0)
+    x = np.random.default_rng(4).uniform(0.2, 1.0, mesh.n_elements)
+    _, grads = _responses_at(mesh, load, "left", x, presc, ke)
+    fd = np.zeros_like(grads)
+    for e in range(mesh.n_elements):
+        step = np.zeros(mesh.n_elements)
+        step[e] = 1e-6
+        plus, _ = _responses_at(mesh, load, "left", x + step, presc, ke)
+        minus, _ = _responses_at(mesh, load, "left", x - step, presc, ke)
+        fd[:, e] = (plus - minus) / 2e-6
+    for g, f in zip(grads, fd):
+        assert np.abs(g - f).max() < 1e-6 * np.abs(f).max()
+
+
+def test_mma_step_solves_a_small_constrained_problem():
+    """min x1 + x2 subject to 1/x1 + 1/x2 <= 4: the answer is (0.5, 0.5)."""
+    state, x = MMAState(2), np.array([1.0, 1.0])
+    lo, hi = np.full(2, 0.1), np.ones(2)
+    for _ in range(30):
+        g = np.array([(1 / x).sum() / 4 - 1])
+        x = mma_step(state, x, x.sum(), np.ones(2), g, np.array([-1 / x**2 / 4]), lo, hi, 0.2)
+    assert x == pytest.approx([0.5, 0.5], abs=1e-4)
+
+
+@pytest.fixture(scope="module")
+def small_mbb():
+    """A 24 x 8 half MBB beam as a mesh, load and constraint map."""
+    mesh = _brick_grid(24, 8, 1)
+    left = np.flatnonzero(mesh.nodes[:, 0] == 0.0)
+    corner = int(np.flatnonzero((mesh.nodes[:, 0] == 24.0) & (mesh.nodes[:, 1] == 0.0))[0])
+    presc = {3 * int(n): 0.0 for n in left}
+    presc |= {3 * corner + 1: 0.0}
+    presc |= {3 * int(n) + 2: 0.0 for n in range(mesh.n_nodes)}  # plane: uz = 0 everywhere
+    top = int(np.flatnonzero((mesh.nodes[:, 0] == 0.0) & (mesh.nodes[:, 1] == 8.0)
+                             & (mesh.nodes[:, 2] == 0.0))[0])
+    return {"mesh": mesh, "presc": presc, "load": LoadCase(node=top, fy=-100.0)}
+
+
+def test_mma_matches_oc_on_minimum_compliance(small_mbb):
+    """Same problem, same density filter: MMA lands no worse than OC."""
+    m, presc, load = small_mbb["mesh"], small_mbb["presc"], small_mbb["load"]
+    params = SimpParams(filter_radius=1.5, filter_type="density", max_iterations=200)
+    oc = optimize(m, Material(), 1.0, None, None, params, cases=[(1.0, load)], prescribed=presc)
+    mma = optimize_mma(m, Material(), 1.0, [(1.0, load)], params, prescribed=presc)
+    assert mma.converged and mma.optimizer == "mma"
+    assert mma.volume_fraction == pytest.approx(0.5, abs=1e-3)
+    assert mma.compliance < oc.compliance * 1.01
+
+
+def test_minimum_volume_under_a_compliance_limit(small_mbb):
+    m, presc, load = small_mbb["mesh"], small_mbb["presc"], small_mbb["load"]
+    full = solve(m, Material(), 1.0, load, None, prescribed=presc).compliance
+    params = SimpParams(filter_radius=1.5, max_iterations=200)
+    r = optimize_mma(m, Material(), 1.0, [(1.0, load)], params, objective="volume",
+                     limits=[Limit("compliance", 3.0 * full, "compliance")], prescribed=presc)
+    assert r.converged
+    assert r.compliance <= 3.0 * full * 1.001  # the limit holds ...
+    assert r.compliance >= 3.0 * full * 0.99  # ... and is active: no volume left on the table
+    assert r.volume_fraction < 0.6
+
+
+def test_a_displacement_limit_is_met_and_active(small_mbb):
+    m, presc, load = small_mbb["mesh"], small_mbb["presc"], small_mbb["load"]
+    params = SimpParams(filter_radius=1.5, max_iterations=200, volume_fraction=0.5)
+    free = optimize_mma(m, Material(), 1.0, [(1.0, load)], params, prescribed=presc)
+    # the mid-height of the free end, pulled down by the design
+    probe = np.flatnonzero((m.nodes[:, 0] == 24.0) & (m.nodes[:, 1] == 8.0))
+    sel = R.displacement_selector(m, probe, 1)
+    free_u = abs(sel @ solve(m, Material(), 1.0, load, None, densities=free.densities,
+                             prescribed=presc).u)
+    bound = 0.9 * free_u
+    r = optimize_mma(m, Material(), 1.0, [(1.0, load)], params, prescribed=presc,
+                     limits=[Limit("displacement", bound, "tip", case=0, selector=sel)])
+    u = abs(sel @ solve(m, Material(), 1.0, load, None, densities=r.densities, prescribed=presc).u)
+    assert u <= bound * 1.001
+    assert r.limits[1]["satisfied"] and r.compliance >= free.compliance * 0.999
+
+
+def test_the_stress_limited_lbracket_lowers_the_peak_stress(tmp_path):
+    """A coarse L-bracket, lightest design within a stress limit, against the
+    minimum-compliance design of the same volume: the limit holds and the
+    peak stress is lower."""
+    loaded = load_study(LBRACKET / "study.py")
+    coarse = dataclasses.replace(loaded, study=dataclasses.replace(
+        loaded.study, mesh=StudyMesh(mode="body-fitted", size=2.5),
+        optimize=SimpParams(optimizer="mma", filter_radius=5.0, max_iterations=200),
+    ))
+    _, s = run_loaded(coarse, tmp_path / "stress", echo=False)
+    opt = s["optimization"]
+    stress = [lim for lim in opt["limits"] if lim["kind"] == "stress"][0]
+    assert stress["satisfied"] and opt["volume_fraction"] < 0.6
+    same = dataclasses.replace(coarse, study=dataclasses.replace(
+        coarse.study, objective="compliance", limits=(),
+        optimize=SimpParams(optimizer="mma", filter_radius=5.0, max_iterations=200,
+                            volume_fraction=opt["volume_fraction"]),
+    ))
+    _, c = run_loaded(same, tmp_path / "compliance", echo=False)
+    mesh = load_mesh(tmp_path / "stress" / "mesh" / "beam.msh")
+    data = np.load(tmp_path / "stress" / "mesh" / "mesh.npz")
+    presc = {2 * int(n) + k: 0.0 for n in data["fixed_nodes"] for k in range(2)}
+    load = LoadCase(node=tuple(int(n) for n in data["load_nodes"]), fy=-1500.0)
+    ke = element_stiffnesses(mesh, Material(), 5.0)
+
+    def pnorm(run_dir):
+        x = np.load(run_dir / "optimization" / "density.npz")["densities"]
+        res, system = solve_cases(mesh, Material(), 5.0, [load], None, densities=x,
+                                  ke_all=ke, prescribed=presc, return_system=True)
+        return R.stress_pnorm(mesh, Material(), system, res[0], ke, x, 3.0)[0]
+
+    assert pnorm(tmp_path / "stress") < pnorm(tmp_path / "compliance")
+    html = build_site(run_dir=tmp_path / "stress", site_dir=tmp_path / "site").read_text()
+    assert "Method of Moving" in html and "stress p-norm (load)" in html
+
+
+def test_the_nlopt_driver_runs_the_same_problem(small_mbb):
+    m, presc, load = small_mbb["mesh"], small_mbb["presc"], small_mbb["load"]
+    params = SimpParams(filter_radius=1.5, max_iterations=150)
+    r = optimize_mma(m, Material(), 1.0, [(1.0, load)], params, prescribed=presc,
+                     driver="nlopt")
+    assert r.optimizer == "nlopt" and r.volume_fraction == pytest.approx(0.5, abs=1e-3)
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        ("objective='volume'", "needs limits"),
+        ("limits=[StressLimit(100.0, case='gust')]", "unknown load case"),
+        ("limits=[StressLimit(100.0)], optimize=SimpParams(optimizer='oc')", "OC takes"),
+    ],
+)
+def test_a_study_with_impossible_limits_is_refused(tmp_path, extra, message):
+    body = ("constraints=[Fix('wall')], loads=[Force('tip', (0.0, -1.0, 0.0))], " + extra)
+    (tmp_path / "part.py").write_text(_part())
+    study = tmp_path / "study.py"
+    study.write_text(
+        "from topocombo.study import *\n"
+        f"study = Study(part='part.py', {body})\n"
+    )
+    with pytest.raises(ValueError, match=message):
+        load_study(study)
+
+
+def test_limit_blocks_check_their_fields():
+    with pytest.raises(ValueError):
+        StressLimit(0.0)
+    with pytest.raises(ValueError):
+        DisplacementLimit("a", "w", 1.0)
+    with pytest.raises(ValueError):
+        ComplianceLimit(-1.0)
+    with pytest.raises(ValueError):
+        Limit("stress", 1.0, "s")  # needs a case

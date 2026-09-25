@@ -862,6 +862,27 @@ def _solve_cards(solve: dict[str, Any]) -> str:
     )
 
 
+def _limits_table(opt: dict[str, Any]) -> str:
+    """The optimisation's limits and where the design ended against each."""
+    limits = [lim for lim in opt.get("limits") or [] if lim.get("kind") != "volume"]
+    if not limits:
+        return ""
+    how = {"mma": "MMA", "nlopt": "NLopt's MMA", "oc": "Optimality Criteria"}.get(
+        opt.get("optimizer", "oc"), opt.get("optimizer")
+    )
+    rows = [
+        (f"{lim['label']}", f"{_fmt(float(lim['value']))} of {_fmt(float(lim['bound']))}"
+                            f" ({'met' if lim.get('satisfied') else 'EXCEEDED'})")
+        for lim in limits
+    ]
+    return (
+        f"<p class='lede'>Optimised with {_e(how)}, minimising {_e(opt.get('objective'))}"
+        " subject to these limits (a stress limit bounds a p-norm of the element stresses,"
+        " a smooth stand-in for the largest):</p>"
+        + _kv_table(rows)
+    )
+
+
 def _optimization_cards(opt: dict[str, Any], solve: dict[str, Any]) -> str:
     ratio = opt.get("compliance_ratio_to_full_density")
     return _cards(
@@ -875,7 +896,9 @@ def _optimization_cards(opt: dict[str, Any], solve: dict[str, Any]) -> str:
             (
                 "Material used",
                 f"{opt.get('volume_fraction', 0) * 100:.1f}%",
-                "of the design domain, the volume constraint",
+                "of the design domain, minimised within the limits"
+                if opt.get("objective") == "volume"
+                else "of the design domain, the volume constraint",
             ),
             (
                 "Iterations",
@@ -1385,11 +1408,20 @@ def render_html(
             )
         optimization_section = (
             "<h2>Topology optimization</h2>"
-            "<p class='lede'>SIMP compliance minimisation under a volume constraint:"
-            f" p = {_e(simp.get('penal', 3))}, {_e(simp.get('filter_type', ''))} filter of radius"
-            f" {_e(simp.get('filter_radius', ''))} mm, Optimality Criteria update with a"
-            f" {_e(simp.get('move_limit', ''))} move limit.</p>"
+            + (
+                "<p class='lede'>SIMP compliance minimisation under a volume constraint:"
+                f" p = {_e(simp.get('penal', 3))}, {_e(simp.get('filter_type', ''))} filter of"
+                f" radius {_e(simp.get('filter_radius', ''))} mm, Optimality Criteria update with"
+                f" a {_e(simp.get('move_limit', ''))} move limit.</p>"
+                if optimization.get("optimizer", "oc") == "oc" else
+                f"<p class='lede'>SIMP, minimising {_e(optimization.get('objective'))}:"
+                f" p = {_e(simp.get('penal', 3))}, density filter of radius"
+                f" {_e(simp.get('filter_radius', ''))} mm, updated by the Method of Moving"
+                " Asymptotes on exact gradients (adjoint solves for displacement and"
+                " stress limits).</p>"
+            )
             + _optimization_cards(optimization, solve)
+            + _limits_table(optimization)
             + density_fig
             + topology_fig
             + charts

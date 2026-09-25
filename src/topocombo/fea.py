@@ -398,8 +398,12 @@ def solve_cases(
     solver: str = "auto",
     x0: Sequence[np.ndarray | None] | None = None,
     prescribed: Mapping[int, float] | None = None,
-) -> list[FEResult]:
+    return_system: bool = False,
+) -> list[FEResult] | tuple[list[FEResult], "LinearSystem"]:
     """Linear-elastic solves of several load cases on one stiffness matrix.
+
+    With ``return_system`` it also returns the :class:`LinearSystem` — the
+    constrained stiffness and its factorisation — for adjoint solves.
 
     ``densities`` (if given) applies SIMP scaling.  Plane stress on a 2D mesh
     (with ``thickness``), full 3D elasticity on a 3D one.
@@ -473,7 +477,38 @@ def solve_cases(
             solver=case_used,
             solver_iterations=iterations,
         ))
+    if return_system:
+        return results, LinearSystem(mesh=mesh, free=free, k_ff=k_ff, factor=factor, solver=used)
     return results
+
+
+@dataclass
+class LinearSystem:
+    """The constrained stiffness of one solve, kept for adjoint solves: the
+    same matrix with any right-hand side, zero at the constrained DOFs."""
+
+    mesh: Mesh
+    free: np.ndarray
+    k_ff: sp.spmatrix
+    factor: Any = None
+    solver: str = "direct"
+
+    def solve(self, rhs: np.ndarray) -> np.ndarray:
+        """``K lambda = rhs`` with lambda = 0 on constrained DOFs (the adjoint
+        of a response whose derivative with respect to u is ``rhs``)."""
+        out = np.zeros(self.mesh.n_dofs)
+        r = np.asarray(rhs)[self.free]
+        if not np.any(r):
+            return out
+        if self.solver == "amg-cg":
+            solution, _ = _amg_cg(self.mesh, self.free, self.k_ff, r, None)
+            if solution is not None:
+                out[self.free] = solution
+                return out
+        if self.factor is None:
+            self.factor = spla.splu(self.k_ff.tocsc())
+        out[self.free] = self.factor.solve(r)
+        return out
 
 
 #: Above this many free DOFs, ``solver="auto"`` switches from the direct sparse

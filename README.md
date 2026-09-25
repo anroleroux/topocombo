@@ -11,7 +11,7 @@ Explore topology optimization (SIMP-based compliance minimization) on a cantilev
 - **CAD (geometry)** — [CadQuery](https://github.com/CadQuery/cadquery): parametric definition of the design domain (beam dimensions, aspect ratio, load/support regions), scripted in Python.
 - **Mesher** — [Gmsh](https://gmsh.info/): structured (transfinite) or body-fitted quadrilateral / hexahedral meshing, and tetrahedral meshing of any solid, driven via its Python API.
 - **FEA solver** — custom solver with Q4 plane-stress quads, H8 solid hexahedra and T4 / T10 tetrahedra (numpy/scipy: sparse stiffness assembly, a direct solve or multigrid-preconditioned CG via [PyAMG](https://github.com/pyamg/pyamg)), implemented in `src/topocombo/fea.py` and `src/topocombo/elements.py`. Chosen over an external solver initially so the optimizer has direct, in-memory access to element stiffness matrices and displacement fields for sensitivity analysis. [CalculiX](http://www.calculix.de/) is the planned later alternative for a verified, general-purpose solver.
-- **Optimizer** — SIMP (Solid Isotropic Material with Penalization) loop, implemented in `src/topocombo/optimize.py`: density update via Optimality Criteria (with [NLopt](https://nlopt.readthedocs.io/)'s MMA as a planned alternative), with sensitivity or density filtering to avoid checkerboarding. The per-iteration coupling (FEA solve → compliance + sensitivity → filter → update) is custom code.
+- **Optimizer** — SIMP (Solid Isotropic Material with Penalization) loop, implemented in `src/topocombo/optimize.py` and `src/topocombo/mma.py`: density update via Optimality Criteria, or the Method of Moving Asymptotes for any objective and limits (displacement, stress, compliance, minimum volume) on exact adjoint gradients (`src/topocombo/responses.py`; [NLopt](https://nlopt.readthedocs.io/)'s MMA as an alternative driver), with sensitivity or density filtering to avoid checkerboarding. The per-iteration coupling (FEA solve → compliance + sensitivity → filter → update) is custom code.
 - **Visualization (decoupled)**:
   - [PyVista](https://pyvista.org/) — scripted plotting of density fields and results, run as a separate process/script against exported data, not called from within the optimization loop.
   - [Blender](https://www.blender.org/) (optional) — presentation-quality rendering of optimized geometry, consuming exported mesh data independently via its Python API (`bpy`) or manual import.
@@ -25,7 +25,7 @@ Explore topology optimization (SIMP-based compliance minimization) on a cantilev
    - Assemble stiffness matrix, solve FEA (custom Q4 plane-stress / H8 / T4 / T10 solid solver).
    - Compute compliance and sensitivities.
    - Apply density/sensitivity filter.
-   - Update design variables (OC or NLopt-MMA).
+   - Update design variables (OC or MMA).
    - Check convergence.
 4. Print iteration metrics (compliance, volume fraction, design change) to terminal.
 5. Periodically write results to disk: density field + mesh (e.g. `.vtu` via `meshio`, or `.npy`) and a scalar log (`log.csv`).
@@ -311,6 +311,8 @@ src/topocombo/
   fea.py        linear-elastic solve on any registered element: cached assembly, loads,
                 direct or multigrid-CG solve
   optimize.py   SIMP loop: neighbourhood filter, OC update, convergence, log.csv
+  responses.py  compliance, volume, displacement and p-norm stress, with adjoint gradients
+  mma.py        the Method of Moving Asymptotes (and NLopt's): any objective, any limits
   pipeline.py   the geometry -> mesh -> solve -> optimize run, terminal-driven
   runlog.py     structured, timed logging of a run
   topology.py   thresholded design -> closed STL surface (for Blender)
@@ -321,7 +323,8 @@ src/topocombo/
 tests/          mesh invariants, solver verification, optimizer invariants, 2D <-> 3D checks
 docs/           the 3D migration plan
 examples/       designs as part.py + study.py (`--study`): cantilever (hex8), bracket (tet10,
-                two load cases, passive rings), mbb (symmetry and roller supports)
+                two load cases, passive rings), mbb (symmetry and roller supports), lbracket
+                (lightest design within a stress limit, MMA)
 ```
 
 ## Status
@@ -446,7 +449,53 @@ converges in 34 iterations (about 45 s): the ring and pad stay, and the arm
 becomes a box section, since the sideways case needs stiffness across the
 width as well as down it.
 
-Next: NLopt-MMA as an alternative to the OC update (and the constraints OC
-cannot take, such as stress or displacement limits), load cases with their
-own prescribed displacements, and the CalculiX swap-in for the solver once
-the loop is trusted.
+### Objectives and limits: MMA
+
+Optimality Criteria solves one problem: minimum compliance under a volume
+fraction. A study can now pose others:
+
+| setting | meaning |
+| --- | --- |
+| `Study(objective="compliance")` | the default: minimise the (weighted) compliance under `SimpParams.volume_fraction` and any limits |
+| `Study(objective="volume")` | the lightest design that meets the limits |
+| `ComplianceLimit(max, case=None)` | compliance of one case, or the weighted sum, at most `max` N·mm |
+| `DisplacementLimit(region, "y", max, case=None)` | the mean displacement component over a region at most `max` mm in size, in each case or one |
+| `StressLimit(max, case=None, p=8, q=0.5)` | von Mises stress at most `max` MPa, through a p-norm of the element stresses relaxed by `x^q` |
+| `SimpParams(optimizer="auto" \| "oc" \| "mma" \| "nlopt")` | `auto` is OC for plain minimum compliance, MMA otherwise |
+
+Every response has an exact gradient (`responses.py`): compliance is
+self-adjoint; a displacement or the stress norm costs one adjoint solve on
+the state solve's factorisation. Each gradient — including the stress norm
+with a prescribed displacement acting — agrees with central differences to
+about 1e-8, in 2D and 3D.
+
+**MMA** (`mma.py`) is written here from Svanberg's 1987 paper, as topology
+optimisation uses it: moving asymptotes, the move limit, elastic
+constraints, and the subproblem solved through its dual (one variable per
+limit, L-BFGS-B). It needs true gradients, so it runs with the density
+filter; elements held solid or void are fixed by their bounds. On a small
+analytic problem it converges to the exact answer; on the half MBB beam with
+the same density filter it reaches 1003.2 N·mm, against 1041.9 for OC — and
+NLopt's MMA 1003.1.
+
+NLopt's MMA (`optimizer="nlopt"`, the optional `nlopt` extra) was the plan,
+and it matches on smooth problems, but it has no move limit: on the
+stress-limited L-bracket its first steps emptied the part (the stress norm
+at 7e8 MPa), and from a full start its cautious first step tripped its own
+stopping test. The MMA here, with a move limit, does not. Stress limits need
+a small one: 0.2 still runs away, 0.05 converges, 0.02 crawls, so with a
+stress limit the pipeline caps it at 0.05 and says so.
+
+**L-bracket** (`examples/lbracket/`, published at `lbracket/`): the standard
+test of stress constraints — a 100 x 100 mm square with its upper-right
+60 x 60 mm cut away, clamped along the top of the leg and loaded (1.5 kN) on
+the arm's end; 6400 body-fitted quads, 5 mm thick. The lightest design with
+the stress norm at most 350 MPa keeps 31.1% of the material and converges in
+289 iterations (about 65 s), the norm ending on the limit. The
+minimum-compliance design of the same volume reaches 366.6 MPa at its worst
+element; the stress-limited one 224.4 MPa, 39% lower, for 7% more
+compliance (672 against 626 N·mm).
+
+Next: load cases with their own prescribed displacements, Heaviside
+projection to push MMA's density-filtered designs further towards black and
+white, and the CalculiX swap-in for the solver once the loop is trusted.

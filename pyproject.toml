@@ -19,7 +19,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+dev = ["pytest>=7.4", "nlopt>=2.7"]
+nlopt = ["nlopt>=2.7"]  # optimizer="nlopt": NLopt's MMA
 viz = ["pyvista>=0.43"]
 
 [project.scripts]

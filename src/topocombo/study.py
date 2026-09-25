@@ -28,6 +28,7 @@ from .optimize import SimpParams
 
 __all__ = [
     "Study", "Mesh", "Fix", "Displace", "Force", "LoadCase", "Passive", "Material", "SimpParams",
+    "ComplianceLimit", "DisplacementLimit", "StressLimit",
     "load_study", "run_study", "run_loaded",
 ]
 
@@ -206,6 +207,60 @@ class Passive:
 
 
 @dataclass(frozen=True)
+class ComplianceLimit:
+    """Compliance (N·mm) at most ``max``: of one load case, or with ``case``
+    None the weighted sum over the cases."""
+
+    max: float
+    case: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.max > 0:
+            raise ValueError("ComplianceLimit.max must be positive")
+
+
+@dataclass(frozen=True)
+class DisplacementLimit:
+    """The mean ``component`` ("x", "y" or "z") displacement over a region's
+    nodes at most ``max`` mm in size, in one load case or (``case`` None) in
+    each."""
+
+    region: str
+    component: str
+    max: float
+    case: str | None = None
+
+    def __post_init__(self) -> None:
+        _region_name("DisplacementLimit", self.region)
+        if self.component not in ("x", "y", "z"):
+            raise ValueError("DisplacementLimit.component is 'x', 'y' or 'z'")
+        if not self.max > 0:
+            raise ValueError("DisplacementLimit.max must be positive")
+
+
+@dataclass(frozen=True)
+class StressLimit:
+    """Von Mises stress (MPa) at most ``max``, in one load case or (``case``
+    None) in each — through a p-norm of the element stresses relaxed by
+    ``x^q``, a smooth bound on the largest one (see
+    :func:`topocombo.responses.stress_pnorm`)."""
+
+    max: float
+    case: str | None = None
+    p: float = 8.0
+    q: float = 0.5
+
+    def __post_init__(self) -> None:
+        if not self.max > 0:
+            raise ValueError("StressLimit.max must be positive")
+        if not self.p >= 1 or not 0 < self.q <= 1:
+            raise ValueError("StressLimit takes p >= 1 and 0 < q <= 1")
+
+
+LIMITS = (ComplianceLimit, DisplacementLimit, StressLimit)
+
+
+@dataclass(frozen=True)
 class Study:
     """Everything about a run except the geometry, which ``part`` points to
     (a CadQuery script, relative to the study file).
@@ -228,9 +283,13 @@ class Study:
     solver: str = "auto"
     load_cases: tuple[LoadCase, ...] = ()
     passive: tuple[Passive, ...] = ()
+    #: what the optimizer minimises: "compliance" (under the volume fraction
+    #: and any limits) or "volume" (the lightest design within the limits)
+    objective: str = "compliance"
+    limits: tuple[ComplianceLimit | DisplacementLimit | StressLimit, ...] = ()
 
     def __post_init__(self) -> None:
-        for name in ("constraints", "loads", "load_cases", "passive"):
+        for name in ("constraints", "loads", "load_cases", "passive", "limits"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
         if not self.constraints or not all(
             isinstance(c, (Fix, Displace)) for c in self.constraints
@@ -256,6 +315,22 @@ class Study:
             raise ValueError("Study.thickness must be positive")
         if self.solver not in SOLVERS:
             raise ValueError(f"Study.solver must be one of {', '.join(SOLVERS)}")
+        if self.objective not in ("compliance", "volume"):
+            raise ValueError("Study.objective is 'compliance' or 'volume'")
+        if not all(isinstance(lim, LIMITS) for lim in self.limits):
+            raise ValueError(
+                "Study.limits takes ComplianceLimit, DisplacementLimit or StressLimit entries"
+            )
+        if self.objective == "volume" and not self.limits:
+            raise ValueError("objective='volume' needs limits: the lightest design within what?")
+        names = {c.name for c in self.cases}
+        unknown = [lim.case for lim in self.limits if lim.case is not None and lim.case not in names]
+        if unknown:
+            raise ValueError(f"Study.limits name unknown load case(s): {', '.join(unknown)}")
+        if (self.limits or self.objective != "compliance") and self.optimize is not None \
+                and self.optimize.optimizer == "oc":
+            raise ValueError("limits and a volume objective need optimizer='mma' (or 'auto'); "
+                             "OC takes minimum compliance under the volume only")
 
     @property
     def cases(self) -> tuple[LoadCase, ...]:
@@ -271,6 +346,7 @@ class Study:
         names = (
             [c.region for c in self.constraints] + [f.region for f in self.forces]
             + [p.region for p in self.passive]
+            + [lim.region for lim in self.limits if isinstance(lim, DisplacementLimit)]
         )
         return list(dict.fromkeys(names))
 
@@ -339,6 +415,8 @@ def run_loaded(loaded: LoadedStudy, out_dir: Path, echo: bool = True,
         constraints=s.constraints,
         load_cases=s.cases,
         passive_regions=s.passive,
+        objective=s.objective,
+        limits=s.limits,
         study=loaded,
         echo=echo,
         solver=s.solver,

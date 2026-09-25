@@ -12,6 +12,7 @@ plotted or rendered here.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -43,12 +44,17 @@ from .optimize import (
     save_design,
     save_history,
 )
+from .mma import Limit, optimize_mma
 from .regions import embed_points, node_shares, region_dim, region_nodes
+from .responses import displacement_selector
 from .runlog import RunLog
 from .study import Displace, Fix, Force, LoadCase as StudyCase, Passive
 from .topology import save_topology_stl
 
 _REGION_KIND = {0: "vertex", 1: "edge", 2: "face", 3: "solid"}
+#: MMA's move limit with a stress limit: a larger one lets the design empty out
+#: (measured on the L-bracket: 0.2 runs away, 0.05 converges, 0.02 crawls)
+STRESS_MOVE = 0.05
 
 
 def _element_size(domain: Domain, spec: MeshSpec | MeshSpec3D) -> list[float]:
@@ -103,6 +109,33 @@ def _boundary_conditions(
     }
 
 
+def _driver_limits(limits: Sequence[Any], cases: Sequence[StudyCase], mesh: Any) -> list[Limit]:
+    """The study's limits as MMA constraints, one per load case where a limit
+    applies to every case."""
+    names = [c.name for c in cases]
+    out: list[Limit] = []
+    for lim in limits:
+        kind = type(lim).__name__
+        if kind == "ComplianceLimit":
+            idx = None if lim.case is None else names.index(lim.case)
+            out.append(Limit("compliance", lim.max, f"compliance ({lim.case or 'weighted'})", case=idx))
+            continue
+        targets = range(len(cases)) if lim.case is None else [names.index(lim.case)]
+        for i in targets:
+            if kind == "DisplacementLimit":
+                comp = "xyz".index(lim.component)
+                if comp >= mesh.dim:
+                    raise ValueError(f"a {mesh.dim}D part has no {lim.component} displacement")
+                out.append(Limit(
+                    "displacement", lim.max, f"|u{lim.component}| at '{lim.region}' ({names[i]})",
+                    case=i, selector=displacement_selector(mesh, mesh.node_sets[lim.region], comp),
+                ))
+            else:
+                out.append(Limit("stress", lim.max, f"stress p-norm ({names[i]})", case=i,
+                                 p=lim.p, q=lim.q))
+    return out
+
+
 def _clamped_nodes(mesh: Any, prescribed: dict[int, float]) -> np.ndarray:
     """Nodes with every component held at zero (drawn as a clamp; the rest of
     the constrained nodes as supports that let something move)."""
@@ -139,6 +172,8 @@ def run(
     solver: str = "auto",
     load_cases: Sequence[StudyCase] | None = None,
     passive_regions: Sequence[Passive] = (),
+    objective: str = "compliance",
+    limits: Sequence[Any] = (),
 ) -> tuple[RunLog, dict[str, Any]]:
     """Mesh the domain, solve it at full density, then run the SIMP loop.
 
@@ -164,7 +199,11 @@ def run(
     if not constraints or not cases:
         raise ValueError("a run needs constraints and loads on the part's named regions")
     forces = [f for case in cases for f in case.loads]
-    bc_names = list(dict.fromkeys([c.region for c in constraints] + [f.region for f in forces]))
+    limits = list(limits)
+    limit_regions = [lim.region for lim in limits if hasattr(lim, "region")]
+    bc_names = list(dict.fromkeys(
+        [c.region for c in constraints] + [f.region for f in forces] + limit_regions
+    ))
     unknown = [n for n in bc_names + [p.region for p in passive_regions] if n not in regions]
     if unknown:
         raise ValueError(
@@ -212,6 +251,8 @@ def run(
         ],
         "boundary_conditions": _boundary_conditions(domain, constraints, cases, regions),
         "passive": [p.as_dict() for p in passive_regions],
+        "objective": objective,
+        "limits": [{"kind": type(lim).__name__, **dataclasses.asdict(lim)} for lim in limits],
         "regions": {name: _region_summary(shape) for name, shape in regions.items()},
         "simp": simp.as_dict(),
         "solver": solver,
@@ -656,12 +697,37 @@ def run(
                         f"vol = {record['volume_fraction']:.4f}  "
                         f"change = {record['change']:.4f}  "
                         f"Mnd = {record['measure_of_discreteness']:5.1f}%"
+                        + (f"  limits {record['max_violation']:+.3f}"
+                           if "max_violation" in record else "")
                     )
                 if snapshot_every and it % snapshot_every == 0:
                     save_density_field(
                         mesh, densities, snapshots_dir / f"density_iter_{it:04d}.vtu"
                     )
 
+            optimizer = simp.optimizer
+            if optimizer == "auto":
+                optimizer = "oc" if objective == "compliance" and not limits else "mma"
+            if optimizer == "oc" and (limits or objective != "compliance"):
+                raise ValueError("limits or a volume objective need optimizer='mma'")
+            if optimizer in ("mma", "nlopt"):
+                if simp.filter_type == "sensitivity":
+                    log.log("MMA needs true gradients: using the density filter")
+                simp = dataclasses.replace(simp, filter_type="density")
+                driver_limits = _driver_limits(limits, cases, mesh)
+                if any(lim.kind == "stress" for lim in driver_limits) and simp.move_limit > STRESS_MOVE:
+                    log.log(
+                        f"stress limits: move limit {simp.move_limit:g} -> {STRESS_MOVE:g} (the "
+                        "p-norm is ruled by a few elements; larger steps outrun MMA's model)"
+                    )
+                    simp = dataclasses.replace(simp, move_limit=STRESS_MOVE)
+                log.log(
+                    f"optimizer: {'MMA' if optimizer == 'mma' else 'NLopt MMA'}, minimising {objective}"
+                    + ("" if objective == "volume" else f" with volume <= {simp.volume_fraction:g}")
+                    + "".join(f"; {lim.label} <= {lim.bound:g}" for lim in driver_limits)
+                )
+            else:
+                log.log("optimizer: Optimality Criteria")
             if solid.any():
                 log.log(f"{int(solid.sum())} elements held solid, {int(passive.sum())} held void")
             if len(cases) > 1:
@@ -669,20 +735,33 @@ def run(
                     "objective: the weighted sum of the load cases' compliances ("
                     + " + ".join(f"{c.weight:g} x {c.name}" for c in cases) + ")"
                 )
-            design = optimize(
-                mesh=mesh,
-                material=material,
-                thickness=depth,
-                load=None,
-                fixed_node_set=None,
-                params=simp,
-                on_iteration=on_iteration,
-                passive=passive,
-                solver=solver,
-                cases=[(case.weight, loads_c) for case, loads_c in zip(cases, nodal)],
-                prescribed=prescribed,
-                solid=solid,
-            )
+            weighted = [(case.weight, loads_c) for case, loads_c in zip(cases, nodal)]
+            if optimizer in ("mma", "nlopt"):
+                design = optimize_mma(
+                    mesh, material, depth, weighted, simp, objective=objective,
+                    limits=driver_limits, prescribed=prescribed, passive=passive, solid=solid,
+                    solver=solver, on_iteration=on_iteration, driver=optimizer,
+                )
+                for lim in design.limits:
+                    log.log(
+                        f"limit {lim['label']}: {lim['value']:.6g} of {lim['bound']:g} "
+                        f"({'met' if lim['satisfied'] else 'EXCEEDED'})"
+                    )
+            else:
+                design = optimize(
+                    mesh=mesh,
+                    material=material,
+                    thickness=depth,
+                    load=None,
+                    fixed_node_set=None,
+                    params=simp,
+                    on_iteration=on_iteration,
+                    passive=passive,
+                    solver=solver,
+                    cases=weighted,
+                    prescribed=prescribed,
+                    solid=solid,
+                )
             reduction = (design.compliance / total) if total else float("nan")
             if len(cases) > 1:
                 for case, c_value in zip(cases, design.case_compliances):
@@ -694,7 +773,7 @@ def run(
             log.log(
                 f"compliance {design.compliance:.4f} N*mm at {design.volume_fraction:.3f} "
                 f"volume fraction ({reduction:.2f}x the full-density compliance, "
-                f"with {simp.volume_fraction:g} of the material)"
+                f"with {design.volume_fraction:.3g} of the material)"
             )
             log.log(
                 f"measure of discreteness Mnd = {design.measure_of_discreteness():.1f}% "

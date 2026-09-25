@@ -19,7 +19,7 @@ from typing import Any
 import meshio
 import numpy as np
 
-from .geometry import BeamDomain, BeamDomain3D
+from .geometry import Domain
 from .meshing import PHYS_FIXED, PHYS_LOAD
 
 
@@ -277,7 +277,7 @@ FITTED_EDGE_RATIO_MAX = 4.0
 
 
 def check_mesh(
-    mesh: Mesh, domain: BeamDomain | BeamDomain3D, expected_elements: int | None
+    mesh: Mesh, domain: Domain, expected_elements: int | None
 ) -> dict[str, Any]:
     """Validate the mesh against the design domain; return a quality summary.
 
@@ -287,7 +287,7 @@ def check_mesh(
     shape (cutouts removed) and for element quality instead.
     """
     fitted = expected_elements is None
-    if isinstance(domain, BeamDomain3D):
+    if domain.dim == 3:
         extent = np.array([domain.length, domain.height, domain.width])
         domain_measure = domain.material_volume if fitted else domain.volume
     else:

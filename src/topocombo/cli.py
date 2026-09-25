@@ -6,12 +6,11 @@ import argparse
 import sys
 from pathlib import Path
 
-from .geometry import BeamDomain, BeamDomain3D, load_cad_config
+from .geometry import BeamDomain, BeamDomain3D, CadDomain, Domain
 from .meshing import MESH_MODES, MeshSpec, MeshSpec3D
 
-#: CadQuery inputs and their defaults.  The flags default to None so an
-#: explicit flag can be told apart from a value read from --cad-config:
-#: flag > config file > these defaults.
+#: Inputs of the parametric beam and their defaults.  The flags default to None
+#: so a flag that --cad-script makes meaningless can be rejected.
 CAD_DEFAULTS = {
     "dim": 2, "length": 60.0, "height": 20.0, "thickness": 1.0, "width": 1.0, "holes": (),
 }
@@ -28,11 +27,12 @@ def _hole(text: str) -> tuple[float, float, float]:
 
 def _add_cad_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
-        "--cad-config",
+        "--cad-script",
         type=Path,
         default=None,
-        help="JSON or TOML file with the CadQuery inputs (dim, length, height, thickness,"
-        " width, holes); flags given on the command line override it",
+        help="CadQuery script that assigns the part to `result`: a face in the x-y plane"
+        " (2D) or a solid prismatic along z (3D), bounding box starting at the origin."
+        " Replaces the parametric beam flags below (--thickness still applies in 2D)",
     )
     p.add_argument(
         "--dim",
@@ -59,26 +59,30 @@ def _add_cad_args(p: argparse.ArgumentParser) -> None:
         action="append",
         default=None,
         metavar="X,Y,D",
-        help="circular cutout through z, diameter D centred at (X, Y) in mm; repeatable,"
-        " and replaces any holes from --cad-config (default: none)",
+        help="circular cutout through z, diameter D centred at (X, Y) in mm; repeatable"
+        " (default: none)",
     )
 
 
 def _resolve_cad_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    """Fill the CadQuery inputs in ``args``: flag, else config file, else default."""
-    config: dict = {}
-    if args.cad_config is not None:
-        try:
-            config = load_cad_config(args.cad_config)
-        except (OSError, ValueError) as exc:
-            parser.error(f"--cad-config: {exc}")
+    """Fill the parametric beam inputs in ``args`` with their defaults; with
+    --cad-script the script is the geometry, so its flags are rejected."""
+    if args.cad_script is not None:
+        given = [k for k in CAD_DEFAULTS if k != "thickness" and getattr(args, k) is not None]
+        if given:
+            flags = ", ".join("--hole" if k == "holes" else f"--{k}" for k in given)
+            parser.error(f"--cad-script defines the geometry; drop {flags}")
     for key, default in CAD_DEFAULTS.items():
         if getattr(args, key) is None:
-            setattr(args, key, config.get(key, default))
+            setattr(args, key, default)
 
 
-def _domain(parser: argparse.ArgumentParser, args: argparse.Namespace) -> BeamDomain | BeamDomain3D:
+def _domain(parser: argparse.ArgumentParser, args: argparse.Namespace) -> Domain:
     try:
+        if args.cad_script is not None:
+            domain = CadDomain.from_file(args.cad_script, thickness=args.thickness)
+            args.dim = domain.dim
+            return domain
         if args.dim == 3:
             return BeamDomain3D(
                 length=args.length, height=args.height, width=args.width, holes=args.holes
@@ -86,7 +90,7 @@ def _domain(parser: argparse.ArgumentParser, args: argparse.Namespace) -> BeamDo
         return BeamDomain(
             length=args.length, height=args.height, thickness=args.thickness, holes=args.holes
         )
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         parser.error(str(exc))
 
 
@@ -230,7 +234,6 @@ def main(argv: list[str] | None = None) -> int:
             load_fy=args.load,
             simp=simp,
             optimize_design=not args.no_optimize,
-            cad_config=args.cad_config,
         )
 
     if args.command in ("report", "all"):

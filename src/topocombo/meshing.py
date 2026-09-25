@@ -35,7 +35,7 @@ from typing import Any, Iterator
 
 import gmsh
 
-from .geometry import BeamDomain, BeamDomain3D
+from .geometry import Domain
 
 #: Physical group names written into the .msh file.
 PHYS_DOMAIN = "design_domain"
@@ -88,7 +88,7 @@ class MeshSpec:
     def n_nodes(self) -> int | None:
         return (self.nelx + 1) * (self.nely + 1) if self.structured else None
 
-    def element_size(self, domain: BeamDomain | BeamDomain3D) -> float:
+    def element_size(self, domain: Domain) -> float:
         """The target edge length of a body-fitted mesh."""
         return self.size or min(domain.length / self.nelx, domain.height / self.nely)
 
@@ -131,7 +131,7 @@ class MeshSpec3D:
     def n_nodes(self) -> int | None:
         return (self.nelx + 1) * (self.nely + 1) * (self.nelz + 1) if self.structured else None
 
-    def element_size(self, domain: BeamDomain | BeamDomain3D) -> float:
+    def element_size(self, domain: Domain) -> float:
         """The target in-plane edge length of a body-fitted mesh (``nelz`` layers in z)."""
         return self.size or min(domain.length / self.nelx, domain.height / self.nely)
 
@@ -147,7 +147,7 @@ class MeshSpec3D:
         }
 
 
-def _classify_curves(domain: BeamDomain) -> dict[str, list[int]]:
+def _classify_curves(domain: Domain) -> dict[str, list[int]]:
     """Sort the boundary curves of the imported face into named edges."""
     groups: dict[str, list[int]] = {"left": [], "right": [], "bottom": [], "top": []}
     for dim, tag in gmsh.model.getEntities(1):
@@ -210,7 +210,7 @@ def _write_msh(msh_path: Path) -> None:
 
 
 def generate_quad_mesh(
-    domain: BeamDomain,
+    domain: Domain,
     spec: MeshSpec,
     brep_path: Path,
     out_dir: Path,
@@ -252,7 +252,7 @@ def generate_quad_mesh(
     return msh_path, gmsh_log
 
 
-def _classify_box(domain: BeamDomain3D) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+def _classify_box(domain: Domain) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
     """Sort the 12 edges of the box by direction and its 6 faces by position.
 
     Edges are keyed ``x``/``y``/``z`` (the axis they run along); faces are keyed
@@ -291,7 +291,7 @@ def _classify_box(domain: BeamDomain3D) -> tuple[dict[str, list[int]], dict[str,
 
 
 def generate_hex_mesh(
-    domain: BeamDomain3D,
+    domain: Domain,
     spec: MeshSpec3D,
     brep_path: Path,
     out_dir: Path,
@@ -357,17 +357,17 @@ def _surfaces_at_x(x: float) -> list[int]:
 
 
 def generate_fitted_mesh(
-    domain: BeamDomain | BeamDomain3D,
+    domain: Domain,
     spec: MeshSpec | MeshSpec3D,
     brep_path: Path,
     out_dir: Path,
     log: Any = None,
 ) -> tuple[Path, list[str]]:
-    """Mesh the CAD profile in ``brep_path`` (a planar x-y face, cutouts and all)
+    """Mesh the CAD profile in ``brep_path`` (any planar x-y face, cutouts and all)
     into unstructured quads — or, for a 3D domain, extrude those quads through
     the width into ``spec.nelz`` layers of hexahedra.  Returns (msh path, gmsh log).
     """
-    three_d = isinstance(domain, BeamDomain3D)
+    three_d = domain.dim == 3
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     msh_path = out_dir / "beam.msh"
@@ -387,8 +387,8 @@ def generate_fitted_mesh(
         if log is not None:
             log.log(
                 f"imported {brep_path.name}: 1 surface, {n_curves} curves "
-                f"({n_curves - len(fixed) - len(loaded) - 2} on cutouts), free edge split at "
-                f"y = {domain.height / 2:g}"
+                f"({len(fixed)} clamped at x = 0, {len(loaded)} loaded at x = {domain.length:g}), "
+                f"free edge split at y = {domain.height / 2:g}"
             )
             log.log(
                 f"unstructured quads: target size {size:g} mm, frontal-Delaunay "

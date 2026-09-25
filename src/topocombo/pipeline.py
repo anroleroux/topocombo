@@ -1,8 +1,9 @@
 """The main flow — geometry, mesh, solve, SIMP — as one terminal-driven run.
 
-The domain decides the dimension: a :class:`BeamDomain` runs the 2D
-plane-stress quad pipeline, a :class:`BeamDomain3D` the solid hex pipeline
-with the tip load spread along a line across the width.  Everything is
+The domain decides the dimension: a 2D domain (:class:`BeamDomain`, or a
+:class:`CadDomain` whose script builds a face) runs the plane-stress quad
+pipeline, a 3D one (:class:`BeamDomain3D`, or a script that builds a solid) the
+solid hex pipeline with the tip load spread along a line across the width.  Everything is
 written to a run directory; nothing is plotted or rendered here.
 """
 
@@ -20,7 +21,7 @@ from .fea import (
     solve as fea_solve,
     timoshenko_tip_deflection,
 )
-from .geometry import BeamDomain, BeamDomain3D, export_domain
+from .geometry import CadDomain, Domain, export_domain
 from .mesh_io import (
     check_mesh,
     find_node,
@@ -51,7 +52,7 @@ from .topology import save_topology_stl
 
 
 def run(
-    domain: BeamDomain | BeamDomain3D,
+    domain: Domain,
     spec: MeshSpec | MeshSpec3D,
     out_dir: Path,
     material: Material | None = None,
@@ -60,14 +61,10 @@ def run(
     optimize_design: bool = True,
     snapshot_every: int = 10,
     echo: bool = True,
-    cad_config: Path | None = None,
 ) -> tuple[RunLog, dict[str, Any]]:
-    """Mesh the domain, solve it at full density, then run the SIMP loop.
-
-    ``cad_config`` is only recorded: the file the domain's parameters were read
-    from, if any (see :func:`topocombo.geometry.load_cad_config`).
-    """
-    three_d = isinstance(domain, BeamDomain3D)
+    """Mesh the domain, solve it at full density, then run the SIMP loop."""
+    three_d = domain.dim == 3
+    scripted = isinstance(domain, CadDomain)
     if three_d != isinstance(spec, MeshSpec3D):
         raise TypeError("a 3D domain needs a MeshSpec3D, a 2D domain a MeshSpec")
     out_dir = Path(out_dir)
@@ -101,11 +98,20 @@ def run(
     log.tool("scipy", scipy.__version__)
 
     with log.step("geometry", "1. Define parametric geometry (CadQuery)"):
-        if three_d:
+        if scripted:
+            log.log(f"CadQuery input: {domain.path or 'a script'} (any geometry, as code)")
             log.log(
-                f"design domain {domain.length} x {domain.height} x {domain.width} mm box "
-                f"(aspect ratio {domain.aspect_ratio:.2f})"
+                f"bounding box {domain.length:g} x {domain.height:g}"
+                + (f" x {domain.width:g}" if three_d else "")
+                + f" mm (aspect ratio {domain.aspect_ratio:.2f})"
+                + ("" if three_d else f", out-of-plane thickness {domain.thickness:g} mm")
             )
+        if three_d:
+            if not scripted:
+                log.log(
+                    f"design domain {domain.length} x {domain.height} x {domain.width} mm box "
+                    f"(aspect ratio {domain.aspect_ratio:.2f})"
+                )
             (x0, y0, z0), (_, _, z1) = domain.load_line
             log.log(
                 f"clamped face: x = 0; tip load along x = {x0:g}, y = {y0:g}, "
@@ -117,11 +123,12 @@ def run(
             )
             cad_record = {"solid_volume": solid.Volume()}
         else:
-            log.log(
-                f"design domain {domain.length} x {domain.height} mm "
-                f"(aspect ratio {domain.aspect_ratio:.2f}), "
-                f"out-of-plane thickness {domain.thickness} mm"
-            )
+            if not scripted:
+                log.log(
+                    f"design domain {domain.length} x {domain.height} mm "
+                    f"(aspect ratio {domain.aspect_ratio:.2f}), "
+                    f"out-of-plane thickness {domain.thickness} mm"
+                )
             log.log(f"clamped edge: x = 0; tip load applied at {domain.load_point}")
             face = domain.face()
             log.log(
@@ -130,10 +137,17 @@ def run(
             cad_record = {"face_area": face.Area()}
         for x, y, d in domain.holes:
             log.log(f"cutout through z: diameter {d:g} mm at x = {x:g}, y = {y:g}")
-        if cad_config is not None:
-            log.log(f"CAD parameters read from {cad_config}")
+        if scripted:
+            cut = domain.area - domain.material_area
+            log.log(
+                f"x-y profile: {domain.material_area:.3f} of {domain.area:.3f} mm^2 envelope"
+                + (f" ({cut:.3f} mm^2 cut away)" if domain.has_cutouts else " (fills its bounding box)")
+            )
         exported = export_domain(domain, out_dir / "cad")
-        log.log("built by running the generated CadQuery script (shown in the report)")
+        log.log(
+            "built by running the CadQuery script (shown in the report)" if scripted
+            else "built by running the generated CadQuery script (shown in the report)"
+        )
         descriptions = {
             "script": "design domain, the CadQuery script that built it (runs in CQ-editor)",
             "brep": "design domain, BREP format",
@@ -147,7 +161,6 @@ def run(
             **cad_record,
             **domain.as_dict(),
             cad_script=domain.cadquery_script(),
-            cad_config=None if cad_config is None else str(cad_config),
         )
 
     cells_word = "hexahedra" if three_d else "quadrilaterals"
@@ -159,10 +172,10 @@ def run(
                 f"transfinite grid: {grid} = {spec.n_elements} {cells_word}, "
                 f"{spec.n_nodes} nodes expected"
             )
-            if domain.holes:
+            if domain.has_cutouts:
                 log.log(
-                    "the structured grid covers the whole envelope; elements inside the "
-                    "cutouts are held void by the optimizer"
+                    "the structured grid covers the whole envelope; elements outside the "
+                    "part (inside its cutouts) are held void by the optimizer"
                 )
             mesher = generate_hex_mesh if three_d else generate_quad_mesh
             brep = exported.get("envelope", exported["brep"])
@@ -170,15 +183,13 @@ def run(
             mesher = generate_fitted_mesh
             if three_d:  # the hexes are extruded from a mesh of the x-y profile
                 brep = out_dir / "cad" / "design_profile.brep"
-                BeamDomain(
-                    length=domain.length, height=domain.height, holes=domain.holes
-                ).face().exportBrep(str(brep))
+                domain.profile().exportBrep(str(brep))
                 log.artifact(brep, "x-y profile of the design domain, BREP — what Gmsh meshes")
             else:
                 brep = exported["brep"]
             log.log(
                 "body-fitted: the mesh follows the CAD boundary, cutouts included"
-                if domain.holes else "body-fitted: the mesh follows the CAD boundary"
+                if domain.has_cutouts else "body-fitted: the mesh follows the CAD boundary"
             )
         msh_path, _ = mesher(
             domain=domain,
@@ -318,7 +329,7 @@ def run(
             f"Timoshenko beam theory: {beam['total']:.6g} mm "
             f"(bending {beam['bending']:.4g} + shear {beam['shear']:.4g}) "
             f"-> {rel * 100:.2f}% difference"
-            + (" (beam theory ignores the cutouts)" if domain.holes else "")
+            + (" (beam theory ignores the cutouts)" if domain.has_cutouts else "")
         )
         log.log(
             f"equilibrium: ||KU - F|| on free DOFs = {result.equilibrium_residual:.3e}, "

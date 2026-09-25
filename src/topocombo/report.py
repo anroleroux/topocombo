@@ -880,8 +880,9 @@ def _cad_section(
         return ""
     domain = params.get("domain", {})
     three_d = params.get("dim") == 3
+    scripted = domain.get("source") == "script"
     rows: list[tuple[str, Any]] = [
-        ("dimension", "3D solid box" if three_d else "2D planar face"),
+        ("dimension", ("3D solid" if scripted else "3D solid box") if three_d else "2D planar face"),
         ("length L, along x (mm)", domain.get("length")),
         ("height H, along y (mm)", domain.get("height")),
     ]
@@ -892,23 +893,31 @@ def _cad_section(
         rows.append(("thickness, solver only (mm)", domain.get("thickness")))
         rows.append(("area (mm\u00b2)", geometry.get("face_area", domain.get("area"))))
     holes = domain.get("holes") or []
-    rows.append((
-        "cutouts through z (x, y, \u2300 mm)",
-        "; ".join(f"({x:g}, {y:g}, \u2300{d:g})" for x, y, d in holes) if holes else "none",
-    ))
-    rows.append(("parameters from", geometry.get("cad_config") or "command-line flags / defaults"))
+    if scripted:
+        rows.append(("x-y profile area (mm\u00b2)", domain.get("material_area")))
+        rows.append(("geometry from", domain.get("script_path") or "a CadQuery script"))
+    else:
+        rows.append((
+            "cutouts through z (x, y, \u2300 mm)",
+            "; ".join(f"({x:g}, {y:g}, \u2300{d:g})" for x, y, d in holes) if holes else "none",
+        ))
+        rows.append(("parameters from", "command-line flags / defaults"))
+    cut_away = holes or (
+        scripted and (domain.get("material_area") or 0) < (domain.get("area") or 0) * (1 - 1e-6)
+    )
 
     image = ""
     if cad_image is not None:
-        shape = "box" if three_d else "planar face"
+        shape = ("solid" if scripted else "box") if three_d else "planar face"
         image = (
             f"<figure><img src='{_e(cad_image)}' alt='Shaded view of the CadQuery design"
             f" domain: a {_e(domain.get('length'))} by {_e(domain.get('height'))} mm {shape}'>"
             "<figcaption>The CadQuery output, read back from <code>design_domain.brep</code> and"
             " rendered by <code>topocombo.cadview</code>"
             + (
-                ". Gmsh meshes its envelope; the elements inside the cutouts are held void."
-                if holes else " — the exact shape Gmsh meshed."
+                ". The structured grid covers its envelope and holds the elements outside the"
+                " part void; the body-fitted mesh follows it exactly."
+                if cut_away else " — the exact shape Gmsh meshed."
             )
             + "</figcaption>"
             "</figure>"
@@ -925,11 +934,18 @@ def _cad_section(
         )
     return (
         "<h2>Geometry (CadQuery)</h2>"
-        "<p class='lede'>The design domain is built by running a generated CadQuery script, so"
-        " the input to CAD is explicit and reproducible: the parameters on the left are written"
-        " into the script below, which also opens as-is in CQ-editor. Set them with flags or a"
-        " <code>--cad-config</code> JSON / TOML file.</p>"
-        f"<div class='cad'>{table}{image}</div>"
+        + (
+            "<p class='lede'>The design domain is code: the CadQuery script below builds the"
+            " part, and every later stage reads the shape it produced — its bounding box, its"
+            " x-y profile and whatever it cut away — rather than any parameters. It opens as-is"
+            " in CQ-editor; pass another one with <code>--cad-script</code>.</p>"
+            if scripted else
+            "<p class='lede'>The design domain is built by running a generated CadQuery script,"
+            " so the input to CAD is explicit and reproducible: the parameters on the left are"
+            " written into the script below, which also opens as-is in CQ-editor. For any other"
+            " geometry, write the script yourself and pass it with <code>--cad-script</code>.</p>"
+        )
+        + f"<div class='cad'>{table}{image}</div>"
         + code
     )
 
@@ -1000,9 +1016,9 @@ def render_html(
         )
     if summary.get("passive_elements"):
         mesh_caption += (
-            f" The {_e(summary['passive_elements'])} elements whose centres fall inside the"
-            " dashed CAD cutout are drawn empty: the grid still covers them, but the optimizer"
-            " holds them void."
+            f" The {_e(summary['passive_elements'])} elements whose centres fall "
+            + ("inside the dashed CAD cutout" if domain.get("holes") else "outside the CAD part")
+            + " are drawn empty: the grid still covers them, but the optimizer holds them void."
         )
 
     chips = [f"run {run.get('started_at', '')}", f"{run.get('duration_s', 0):.2f} s total"]

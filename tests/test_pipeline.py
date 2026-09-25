@@ -1086,7 +1086,7 @@ def test_density_figure_adds_top_and_end_views_only_for_deep_meshes(tmp_path):
 import html as html_lib  # noqa: E402
 
 from topocombo.cadview import _weld, feature_edges, render_triangles, shape_triangles  # noqa: E402
-from topocombo.geometry import load_cad_config, run_cadquery_script  # noqa: E402
+from topocombo.geometry import CadDomain, run_cadquery_script  # noqa: E402
 
 
 @pytest.mark.parametrize(
@@ -1110,48 +1110,6 @@ def test_the_exported_script_rebuilds_the_domain(domain, tmp_path):
 def test_a_script_without_a_result_is_rejected():
     with pytest.raises(ValueError, match="result"):
         run_cadquery_script("import cadquery as cq\nbox = cq.Workplane().box(1, 1, 1)\n")
-
-
-def test_cad_config_reads_json_and_toml(tmp_path):
-    (tmp_path / "a.json").write_text('{"cad": {"dim": 3, "length": 30, "width": 2.5}}')
-    (tmp_path / "b.toml").write_text("dim = 2\nheight = 8\nthickness = 0.5\n")
-    assert load_cad_config(tmp_path / "a.json") == {"dim": 3, "length": 30.0, "width": 2.5}
-    assert load_cad_config(tmp_path / "b.toml") == {"dim": 2, "height": 8.0, "thickness": 0.5}
-
-
-@pytest.mark.parametrize(
-    "text, message",
-    [
-        ('{"lenght": 30}', "unknown CAD parameter"),
-        ('{"length": -1}', "positive"),
-        ('{"height": "20"}', "number"),
-        ('{"dim": 4}', "dim"),
-        ("[1, 2]", "table"),
-    ],
-)
-def test_cad_config_rejects_bad_input(tmp_path, text, message):
-    path = tmp_path / "cad.json"
-    path.write_text(text)
-    with pytest.raises(ValueError, match=message):
-        load_cad_config(path)
-
-
-def test_cli_flags_override_the_cad_config(tmp_path, capsys):
-    config = tmp_path / "cad.toml"
-    config.write_text("[cad]\ndim = 3\nlength = 9\nheight = 3\nwidth = 2\n")
-    out = tmp_path / "cad"
-    assert cli_main(["cad", "--cad-config", str(config), "--width", "4", "--out", str(out)]) == 0
-    script = (out / "design_domain.py").read_text()
-    assert "length = 9.0" in script and "width = 4.0" in script
-    assert (out / "design_domain.png").read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
-    assert "cq.Workplane" in capsys.readouterr().out
-
-
-def test_cli_rejects_a_bad_cad_config(tmp_path):
-    config = tmp_path / "cad.json"
-    config.write_text('{"lenght": 9}')
-    with pytest.raises(SystemExit):
-        cli_main(["cad", "--cad-config", str(config), "--out", str(tmp_path / "cad")])
 
 
 def test_a_box_has_twelve_feature_edges():
@@ -1226,17 +1184,6 @@ def test_void_mask_picks_the_centroids_inside_the_cutout():
     domain = BeamDomain(holes=[HOLE])
     centroids = np.array([[20.0, 10.0], [24.9, 10.0], [25.1, 10.0], [50.0, 10.0]])
     assert domain.void_mask(centroids).tolist() == [True, True, False, False]
-
-
-def test_cad_config_reads_hole_tables(tmp_path):
-    path = tmp_path / "cad.toml"
-    path.write_text("[cad]\ndim = 3\n[[cad.holes]]\nx = 20\ny = 10\ndiameter = 10\n")
-    assert load_cad_config(path) == {"dim": 3, "holes": (HOLE,)}
-    (tmp_path / "cad.json").write_text('{"holes": [[20, 10, 10]]}')
-    assert load_cad_config(tmp_path / "cad.json") == {"holes": (HOLE,)}
-    (tmp_path / "bad.json").write_text('{"holes": [{"x": 20, "y": 10, "d": 10}]}')
-    with pytest.raises(ValueError, match="unknown: d"):
-        load_cad_config(tmp_path / "bad.json")
 
 
 def test_passive_elements_stay_void_and_the_volume_holds():
@@ -1376,3 +1323,105 @@ def test_cli_runs_a_body_fitted_mesh(tmp_path):
     assert run_json["params"]["mesh"]["mode"] == "body-fitted"
     assert run_json["params"]["mesh"]["size"] == 0.5
     assert (out / "cad" / "design_profile.brep").exists()
+
+
+# --------------------------------------------------------------------------
+# geometry as code: any CadQuery script (--cad-script)
+# --------------------------------------------------------------------------
+from pathlib import Path  # noqa: E402
+
+EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "cantilever3d.py"
+
+
+def _holed_box(y: float, length: float = 60.0, height: float = 20.0, d: float = 10.0) -> str:
+    return (
+        "import cadquery as cq\n"
+        f"result = cq.Workplane('XY').box({length}, {height}, 1.0, centered=False)\n"
+        f"result = result.cut(cq.Workplane('XY').center({length / 3}, {y}).circle({d / 2})"
+        ".extrude(3.0, both=True))\n"
+    )
+
+
+def test_the_example_script_builds_the_published_part():
+    domain = CadDomain.from_file(EXAMPLE)
+    assert domain.dim == 3 and domain.path == str(EXAMPLE)
+    assert (domain.length, domain.height, domain.width) == pytest.approx((60.0, 20.0, 1.0))
+    # the hole at y = -10 lies wholly below the beam: the cut removes nothing
+    assert domain.material_volume == pytest.approx(1200.0)
+    assert not domain.has_cutouts
+    assert domain.cadquery_script() == EXAMPLE.read_text()
+
+
+def test_a_script_notch_is_read_from_the_shape():
+    domain = CadDomain(_holed_box(0.0))  # a half-hole bitten out of the bottom edge
+    assert domain.has_cutouts
+    assert domain.material_area == pytest.approx(1200.0 - np.pi * 25.0 / 2)
+    assert domain.material_volume == pytest.approx(domain.material_area)
+    assert domain.envelope().volume == pytest.approx(1200.0)
+    centroids = np.array([[20.0, 0.5, 0.5], [20.0, 10.0, 0.5], [40.0, 0.5, 0.5]])
+    assert domain.void_mask(centroids).tolist() == [True, False, False]
+    assert domain.load_line == ((60.0, 10.0, 0.0), (60.0, 10.0, 1.0))
+
+
+def test_a_script_face_is_a_2d_domain():
+    source = (
+        "import cadquery as cq\n"
+        "result = cq.Workplane('XY').rect(12.0, 4.0, centered=False).extrude(1.0)"
+        ".faces('<Z').val()\n"
+    )
+    domain = CadDomain(source, thickness=2.0)
+    assert domain.dim == 2 and domain.thickness == 2.0
+    assert domain.area == pytest.approx(48.0) and not domain.has_cutouts
+    assert domain.load_point == pytest.approx((12.0, 2.0))
+
+
+@pytest.mark.parametrize(
+    "body, message",
+    [
+        ("result = cq.Workplane('XY').box(6, 2, 1)", "origin"),
+        ("result = cq.Workplane('XY').box(6, 2, 1, centered=False).edges('|X').fillet(0.2)",
+         "prism"),
+        ("result = cq.Workplane('XY').polyline([(0, 0), (6, 0), (6, 0.5), (3, 2), (0, 2)])"
+         ".close().extrude(1)", "load point"),
+        ("result = cq.Workplane('XY').box(2, 2, 1, centered=False)"
+         ".add(cq.Workplane('XY').box(2, 2, 1, centered=False).translate((4, 0, 0)).val())",
+         "one connected"),
+        ("box = cq.Workplane('XY').box(6, 2, 1)", "result"),
+    ],
+    ids=["off-origin", "not-a-prism", "no-load-edge", "two-solids", "no-result"],
+)
+def test_a_script_the_pipeline_cannot_mesh_is_rejected(body, message):
+    with pytest.raises(ValueError, match=message):
+        CadDomain("import cadquery as cq\n" + body + "\n")
+
+
+@pytest.mark.parametrize("mode", ["structured", "body-fitted"])
+def test_cli_runs_any_cad_script(mode, tmp_path):
+    script = tmp_path / "notched.py"
+    script.write_text(_holed_box(0.0, length=12.0, height=4.0, d=2.0))
+    out = tmp_path / mode
+    code = cli_main([
+        "all", "--cad-script", str(script), "--nelx", "24", "--nely", "8", "--mesh", mode,
+        "--max-iter", "5", "--out", str(out), "--site", str(tmp_path / f"site-{mode}"),
+    ])
+    assert code == 0
+    run_json = json.loads((out / "run.json").read_text())
+    assert run_json["params"]["dim"] == 3
+    assert run_json["params"]["domain"]["script_path"] == str(script)
+    steps = {step["name"]: step.get("data", {}) for step in run_json["steps"]}
+    assert steps["validation"]["all_checks_passed"]
+    assert steps["solve"]["reaction_y"] == pytest.approx(1000.0, rel=1e-9)
+    assert (out / "cad" / "design_domain.py").read_text() == script.read_text()
+    if mode == "structured":  # the grid cells in the notch are held void
+        passive = np.load(out / "mesh" / "mesh.npz")["passive"]
+        assert passive.sum() == steps["validation"]["passive_elements"] > 0
+        densities = np.load(out / "optimization" / "density.npz")["densities"]
+        assert np.all(densities[passive] == 0.0)
+    html = (tmp_path / f"site-{mode}" / "index.html").read_text()
+    assert "--cad-script" in html and str(script) in html
+
+
+def test_cli_rejects_beam_flags_with_a_cad_script(tmp_path):
+    with pytest.raises(SystemExit):
+        cli_main(["cad", "--cad-script", str(EXAMPLE), "--length", "30",
+                  "--out", str(tmp_path / "cad")])

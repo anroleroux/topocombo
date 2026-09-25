@@ -319,8 +319,6 @@ def load_study(path: Path) -> LoadedStudy:
 
 def run_study(path: Path, out_dir: Path, echo: bool = True) -> tuple[Any, dict[str, Any]]:
     """Load ``study.py`` and run the pipeline on it."""
-    from .pipeline import run
-
     return run_loaded(load_study(path), out_dir, echo=echo)
 
 

@@ -349,6 +349,9 @@ def save_mesh(
     passive: np.ndarray | None = None,
     fixed_nodes: np.ndarray | None = None,
     load_vector: Any = None,
+    solid: np.ndarray | None = None,
+    clamped_nodes: np.ndarray | None = None,
+    held: np.ndarray | None = None,
 ) -> dict[str, Path]:
     """Write the solver-facing ``mesh.npz`` and the visualisation-facing ``mesh.vtu``.
 
@@ -374,6 +377,12 @@ def save_mesh(
         arrays["fixed_nodes"] = np.asarray(fixed_nodes, dtype=int)
     if load_vector is not None:  # the total force, for drawing its direction
         arrays["load_vector"] = np.asarray(load_vector, dtype=float)
+    if solid is not None:  # elements held solid (passive keep-in regions)
+        arrays["solid"] = np.asarray(solid, dtype=bool)
+    if clamped_nodes is not None:  # nodes with every component held at zero
+        arrays["clamped_nodes"] = np.asarray(clamped_nodes, dtype=int)
+    if held is not None:  # (len(fixed_nodes), dim): which components each one holds
+        arrays["held"] = np.asarray(held, dtype=bool)
 
     npz = out_dir / "mesh.npz"
     np.savez_compressed(npz, **arrays)

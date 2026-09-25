@@ -257,22 +257,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{kind}: {path}")
 
     if args.command in ("run", "all") and loaded is not None:
-        from .optimize import SimpParams
-        from .pipeline import run
+        from .study import run_loaded
 
-        s = loaded.study
-        run(
-            domain=loaded.domain,
-            spec=loaded.spec,
-            out_dir=args.out,
-            material=s.material,
-            simp=s.optimize or SimpParams(),
-            optimize_design=s.optimize is not None and not args.no_optimize,
-            constraints=s.constraints,
-            loads=s.loads,
-            study=loaded,
-            solver=s.solver,
-        )
+        run_loaded(loaded, args.out, optimize=not args.no_optimize)
     elif args.command in ("run", "all"):
         from .fea import Material
         from .optimize import SimpParams

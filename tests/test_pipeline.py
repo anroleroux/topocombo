@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import numpy as np
@@ -1414,12 +1415,10 @@ def test_a_part_face_is_a_2d_domain():
          ".add(cq.Workplane('XY').box(2, 2, 1, centered=False).translate((4, 0, 0)).val())",
          "one connected"),
         ("box = cq.Workplane('XY').box(6, 2, 1)", "result"),
-        ("result = cq.Workplane('XY').box(6, 2, 1, centered=False)\nregions = {'all': result}",
-         "vertices, edges or faces"),
         ("result = cq.Workplane('XY').box(6, 2, 1, centered=False)\n"
          "regions = {'none': result.faces('%SPHERE')}", "selects nothing"),
     ],
-    ids=["off-origin", "two-solids", "no-result", "solid-region", "empty-region"],
+    ids=["off-origin", "two-solids", "no-result", "empty-region"],
 )
 def test_a_part_the_pipeline_cannot_use_is_rejected(body, message):
     with pytest.raises(ValueError, match=message):
@@ -1430,7 +1429,7 @@ def test_a_part_the_pipeline_cannot_use_is_rejected(body, message):
     "body, message",
     [
         ("constraints=[], loads=[Force('tip', (0, -1, 0))]", "at least one Fix"),
-        ("constraints=[Fix('wall')], loads=[]", "exactly one Force"),
+        ("constraints=[Fix('wall')], loads=[]", "either loads"),
         ("constraints=[Fix('base')], loads=[Force('tip', (0, -1, 0))]", "base not defined"),
         ("constraints=[Fix('wall')], loads=[Force('tip', (0, -1))]", "2 components"),
         ("constraints=[Fix('wall')], loads=[Force('tip', (0, -1, 0))], mesh=Mesh(mode='tet')",
@@ -1723,11 +1722,11 @@ def test_hex8_refuses_a_part_that_is_not_a_prism_and_tet10_meshes_it(tmp_path):
     with pytest.raises(ValueError, match="tet10"):
         run(domain=loaded.domain, spec=StudyMesh(mode="body-fitted").spec(3),
             out_dir=tmp_path / "hex", constraints=loaded.study.constraints,
-            loads=loaded.study.loads, echo=False)
+            load_cases=loaded.study.cases[:1], echo=False)
     _, summary = run(
         domain=loaded.domain, spec=StudyMesh(element="tet10", size=4.0).spec(3),
         out_dir=tmp_path / "tet", constraints=loaded.study.constraints,
-        loads=loaded.study.loads, simp=SimpParams(volume_fraction=0.3, max_iterations=4,
+        load_cases=loaded.study.cases[:1], simp=SimpParams(volume_fraction=0.3, max_iterations=4,
                                                   filter_radius=6.0),
         echo=False,
     )
@@ -1804,3 +1803,206 @@ def test_reports_link_to_each_other(coarse_run, tmp_path):
     html = build_site(run_dir=coarse_run["dir"], site_dir=tmp_path / "site",
                       nav=[("bracket (tet10)", "bracket/")]).read_text()
     assert "<a class='chip' href='bracket/'>bracket (tet10)</a>" in html
+
+
+# --------------------------------------------------------------------------
+# general boundary conditions: components, prescribed displacements, load
+# cases, passive regions
+# --------------------------------------------------------------------------
+from topocombo.fea import rigid_body_free, solve_cases  # noqa: E402
+from topocombo.study import Displace, LoadCase as Case, Passive, run_loaded  # noqa: E402
+
+MBB = Path(__file__).resolve().parents[1] / "examples" / "mbb"
+
+
+def _plate(length, height, regions: str) -> str:
+    return (
+        "import cadquery as cq\n"
+        f"result = cq.Workplane('XY').rect({length}, {height}, centered=False).extrude(1.0)"
+        ".faces('<Z').val()\n"
+        "edges = lambda sel: cq.Workplane('XY').add(result).edges(sel)\n"
+        f"regions = {regions}\n"
+    )
+
+
+def _run_part(tmp_path, source, spec, **kw):
+    domain = CadDomain(source)
+    kw.setdefault("optimize_design", False)
+    return run(domain=domain, spec=spec, out_dir=tmp_path, echo=False, **kw)
+
+
+@pytest.mark.parametrize(
+    "make, message",
+    [
+        (lambda: Fix("a", dofs="xw"), "dofs"),
+        (lambda: Fix("a", dofs=""), "dofs"),
+        (lambda: Displace("a"), "at least one"),
+        (lambda: Case("c", []), "Force"),
+        (lambda: Case("c", [Force("a", (0, 1))], weight=0), "weight"),
+        (lambda: Passive("a", state="grey"), "solid"),
+        (lambda: Passive("a", within=-1), "within"),
+    ],
+)
+def test_boundary_condition_blocks_check_their_fields(make, message):
+    with pytest.raises(ValueError, match=message):
+        make()
+
+
+def test_fix_and_displace_pick_components():
+    assert Fix("a").components(2) == {0: 0.0, 1: 0.0}
+    assert Fix("a", dofs="y").components(3) == {1: 0.0}
+    assert Displace("a", uy=-0.1).components(2) == {1: -0.1}
+    with pytest.raises(ValueError, match="no z"):
+        Fix("a", dofs="z").components(2)
+
+
+def test_rigid_body_check_counts_the_free_motions(coarse_run):
+    mesh = load_mesh(coarse_run["dir"] / "mesh" / "beam.msh")
+    left = np.flatnonzero(mesh.nodes[:, 0] == 0.0)
+    assert rigid_body_free(mesh, np.sort(np.concatenate([2 * left, 2 * left + 1]))) == 0
+    assert rigid_body_free(mesh, 2 * left) == 1  # ux on a line: it can still slide in y
+    corner = left[np.argmin(mesh.nodes[left, 1])]
+    assert rigid_body_free(mesh, np.array([2 * corner, 2 * corner + 1])) == 1  # can spin
+
+
+def test_half_mbb_by_symmetry_is_half_the_full_beam(tmp_path):
+    """Symmetry (ux only) and a roller (uy only) on the half beam give exactly
+    half the full beam's compliance, pinned and rolling at its corners."""
+    half = _plate(24.0, 8.0, "{'sym': edges('<X'), 'roller': cq.Vertex.makeVertex(24, 0, 0), "
+                  "'load': cq.Vertex.makeVertex(0, 8, 0)}")
+    full = _plate(48.0, 8.0, "{'pin': cq.Vertex.makeVertex(0, 0, 0), "
+                  "'roller': cq.Vertex.makeVertex(48, 0, 0), 'load': cq.Vertex.makeVertex(24, 8, 0)}")
+    _, h = _run_part(tmp_path / "h", half, MeshSpec(nelx=24, nely=8),
+                     constraints=[Fix("sym", dofs="x"), Fix("roller", dofs="y")],
+                     loads=[Force("load", (0.0, -500.0))])
+    _, f = _run_part(tmp_path / "f", full, MeshSpec(nelx=48, nely=8),
+                     constraints=[Fix("pin"), Fix("roller", dofs="y")],
+                     loads=[Force("load", (0.0, -1000.0))])
+    assert f["solve"]["compliance"] == pytest.approx(2 * h["solve"]["compliance"], rel=1e-9)
+    assert h["solve"]["reactions"] == pytest.approx([0.0, 500.0], abs=1e-6)
+
+
+def test_the_mbb_example_reaches_the_textbook_compliance(tmp_path):
+    """Sigmund's 99-line MBB (60 x 20, volfrac 0.5, p = 3, r = 1.5) ends near
+    c = 203 for E = 1 and a unit load; ours, rescaled by F^2 / E, lands there."""
+    _, summary = run_loaded(load_study(MBB / "study.py"), tmp_path / "mbb", echo=False)
+    opt = summary["optimization"]
+    assert opt["converged"]
+    normalised = opt["compliance"] * 210_000.0 / 1000.0**2
+    assert normalised == pytest.approx(203.0, rel=0.01)
+
+
+def test_constraints_that_leave_a_motion_free_are_refused(tmp_path):
+    half = _plate(24.0, 8.0, "{'sym': edges('<X'), 'load': cq.Vertex.makeVertex(0, 8, 0)}")
+    with pytest.raises(ValueError, match="free to move"):
+        _run_part(tmp_path, half, MeshSpec(nelx=12, nely=4),
+                  constraints=[Fix("sym", dofs="x")], loads=[Force("load", (0.0, -1.0))])
+
+
+def test_conflicting_constraints_are_refused(tmp_path):
+    part = _plate(12.0, 4.0, "{'left': edges('<X'), 'tip': cq.Vertex.makeVertex(12, 2, 0)}")
+    with pytest.raises(ValueError, match="hold node"):
+        _run_part(tmp_path, part, MeshSpec(nelx=12, nely=4),
+                  constraints=[Fix("left"), Displace("left", ux=0.1)],
+                  loads=[Force("tip", (0.0, -1.0))])
+
+
+def test_a_prescribed_stretch_gives_the_bar_reaction(tmp_path):
+    """A bar pulled by a prescribed end displacement, free to contract: the
+    reaction is E A delta / L exactly, and compliance f.u - u_p.r_p is minus
+    the work the support does, -delta * reaction."""
+    part = _plate(10.0, 2.0, "{'left': edges('<X'), 'corner': cq.Vertex.makeVertex(0, 0, 0), "
+                  "'right': edges('>X')}")
+    _, s = _run_part(tmp_path, part, MeshSpec(nelx=10, nely=2),
+                     constraints=[Fix("left", dofs="x"), Fix("corner", dofs="y"),
+                                  Displace("right", ux=0.01)],
+                     loads=[Force("corner", (0.0, 0.0))])
+    reaction = 210_000.0 * 2.0 * 0.01 / 10.0  # E * (H * t) * delta / L
+    assert s["solve"]["reactions"][0] == pytest.approx(0.0, abs=1e-6)  # the two ends balance
+    assert s["solve"]["compliance"] == pytest.approx(-0.01 * reaction, rel=1e-9)
+
+
+def test_compliance_sensitivity_holds_with_prescribed_displacements():
+    """d/dx of f.u - u_p.r_p is -p x^(p-1) u_e^T k0 u_e, as for loads alone:
+    checked against central differences with a force and a pull together."""
+    mesh = _brick_grid(4, 2, 1)
+    left = np.flatnonzero(mesh.nodes[:, 0] == 0.0)
+    right = np.flatnonzero(mesh.nodes[:, 0] == 4.0)
+    mesh.node_sets["left"] = left
+    pull = {3 * int(n): 0.01 for n in right}
+    tip = int(right[np.argmax(mesh.nodes[right, 1])])
+    load = LoadCase(node=tip, fy=-50.0)
+    rho = np.random.default_rng(1).uniform(0.3, 1.0, mesh.n_elements)
+
+    def compliance(r):
+        return solve(mesh, Material(), 1.0, load, "left", densities=r, prescribed=pull).compliance
+
+    res = solve(mesh, Material(), 1.0, load, "left", densities=rho, prescribed=pull)
+    dc = -3.0 * rho**2 * (1 - 1e-9) * res.element_compliance_unscaled
+    eye = np.eye(mesh.n_elements) * 1e-6
+    fd = np.array([(compliance(rho + e) - compliance(rho - e)) / 2e-6 for e in eye])
+    assert np.abs(fd - dc).max() < 1e-6 * np.abs(dc).max()
+
+
+def test_load_cases_share_one_factorisation_and_weights_add_up(tmp_path):
+    mesh = _brick_grid(4, 2, 1)
+    mesh.node_sets["left"] = np.flatnonzero(mesh.nodes[:, 0] == 0.0)
+    tip = int(np.flatnonzero((mesh.nodes[:, 0] == 4.0))[0])
+    down, side = LoadCase(node=tip, fy=-10.0), LoadCase(node=tip, fz=5.0)
+    both = solve_cases(mesh, Material(), 1.0, [down, side, [down, side]], "left")
+    # linear: the case with both forces is the sum of the two
+    assert np.allclose(both[2].u, both[0].u + both[1].u, rtol=1e-9, atol=1e-15)
+    # two identical cases at half weight each design exactly like one case
+    params = SimpParams(max_iterations=5, filter_radius=1.5)
+    one = optimize(mesh, Material(), 1.0, down, "left", params)
+    two = optimize(mesh, Material(), 1.0, None, "left", params,
+                   cases=[(0.5, down), (0.5, down)])
+    assert np.allclose(one.densities, two.densities)
+    assert two.case_compliances == pytest.approx([one.compliance] * 2)
+
+
+def test_passive_solid_elements_stay_solid_and_the_volume_holds():
+    mesh = _brick_grid(8, 4, 1)
+    mesh.node_sets["left"] = np.flatnonzero(mesh.nodes[:, 0] == 0.0)
+    tip = int(np.flatnonzero((mesh.nodes[:, 0] == 8.0) & (mesh.nodes[:, 1] == 2.0))[0])
+    solid = np.zeros(mesh.n_elements, dtype=bool)
+    solid[-4:] = True  # the column at the tip
+    design = optimize(mesh, Material(), 1.0, LoadCase(node=tip, fy=-10.0), "left",
+                      SimpParams(max_iterations=8, filter_radius=1.5), solid=solid)
+    assert np.all(design.densities[solid] == 1.0)
+    assert design.volume_fraction == pytest.approx(0.5, abs=1e-6)
+    with pytest.raises(ValueError, match="nothing is left"):
+        optimize(mesh, Material(), 1.0, LoadCase(node=tip, fy=-10.0), "left",
+                 SimpParams(volume_fraction=0.1), solid=np.ones(mesh.n_elements, bool))
+
+
+def test_the_bracket_study_has_two_cases_and_two_passive_rings(tmp_path):
+    loaded = load_study(BRACKET / "study.py")
+    assert [c.name for c in loaded.study.cases] == ["hang", "sway"]
+    assert {p.region for p in loaded.study.passive} == {"pin", "wall"}
+    small = dataclasses.replace(
+        loaded, study=dataclasses.replace(
+            loaded.study, mesh=StudyMesh(element="tet10", size=4.0),
+            optimize=SimpParams(volume_fraction=0.3, max_iterations=3, filter_radius=6.0),
+        ),
+    )
+    _, summary = run_loaded(small, tmp_path / "bracket", echo=False)
+    cases = summary["solve"]["cases"]
+    assert [c["name"] for c in cases] == ["hang", "sway"]
+    assert cases[0]["reactions"] == pytest.approx([0, 1000, 0], abs=1e-6)
+    assert cases[1]["reactions"] == pytest.approx([0, 0, 300], abs=1e-6)
+    assert summary["passive_solid_elements"] > 0
+    densities = np.load(tmp_path / "bracket" / "optimization" / "density.npz")["densities"]
+    solid = np.load(tmp_path / "bracket" / "mesh" / "mesh.npz")["solid"]
+    assert np.all(densities[solid] == 1.0)
+    html = build_site(run_dir=tmp_path / "bracket", site_dir=tmp_path / "site").read_text()
+    assert "Passive regions" in html and "case &#x27;sway&#x27;" in html
+
+
+def test_report_draws_rollers_for_partial_supports(tmp_path):
+    _, _ = run_loaded(dataclasses.replace(
+        load_study(MBB / "study.py"),
+    ), tmp_path / "mbb", echo=False, optimize=False)
+    html = build_site(run_dir=tmp_path / "mbb", site_dir=tmp_path / "site").read_text()
+    assert 'class="roll"' in html and "rollers / symmetry: 21 ux, 1 uy" in html
+    assert "Symmetry holds ux = 0" in html

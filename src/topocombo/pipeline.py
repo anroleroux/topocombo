@@ -21,7 +21,8 @@ from .fea import (
     LoadCase,
     Material,
     element_stiffnesses,
-    solve as fea_solve,
+    rigid_body_free,
+    solve_cases,
     timoshenko_tip_deflection,
 )
 from .geometry import BEAM_FIXED, BEAM_LOAD, CadDomain, Domain, export_domain
@@ -44,10 +45,10 @@ from .optimize import (
 )
 from .regions import embed_points, node_shares, region_dim, region_nodes
 from .runlog import RunLog
-from .study import Fix, Force
+from .study import Displace, Fix, Force, LoadCase as StudyCase, Passive
 from .topology import save_topology_stl
 
-_REGION_KIND = {0: "vertex", 1: "edge", 2: "face"}
+_REGION_KIND = {0: "vertex", 1: "edge", 2: "face", 3: "solid"}
 
 
 def _element_size(domain: Domain, spec: MeshSpec | MeshSpec3D) -> list[float]:
@@ -74,7 +75,8 @@ def _region_summary(shape: Any) -> dict[str, Any]:
 
 
 def _boundary_conditions(
-    domain: Domain, constraints: Sequence[Fix], loads: Sequence[Force], regions: dict[str, Any]
+    domain: Domain, constraints: Sequence[Fix | Displace], cases: Sequence[StudyCase],
+    regions: dict[str, Any],
 ) -> dict[str, Any]:
     """The displacement constraints and forces the solve applies, by region."""
     axes = "xyz"[: domain.dim]
@@ -83,7 +85,7 @@ def _boundary_conditions(
             {
                 **c.as_dict(),
                 **_region_summary(regions[c.region]),
-                "displacements": {f"u{a}": 0.0 for a in axes},
+                "displacements": {f"u{axes[i]}": v for i, v in c.components(domain.dim).items()},
             }
             for c in constraints
         ],
@@ -91,11 +93,34 @@ def _boundary_conditions(
             {
                 **f.as_dict(),
                 **_region_summary(regions[f.region]),
+                "case": case.name,
+                "weight": case.weight,
                 "force": {f"f{a}": v for a, v in zip(axes, f.vector)},
             }
-            for f in loads
+            for case in cases
+            for f in case.loads
         ],
     }
+
+
+def _clamped_nodes(mesh: Any, prescribed: dict[int, float]) -> np.ndarray:
+    """Nodes with every component held at zero (drawn as a clamp; the rest of
+    the constrained nodes as supports that let something move)."""
+    d = mesh.dofs_per_node
+    held = np.zeros((mesh.n_nodes, d), dtype=bool)
+    for dof, value in prescribed.items():
+        if value == 0.0:
+            held[dof // d, dof % d] = True
+    return np.flatnonzero(held.all(axis=1))
+
+
+def _held(mesh: Any, prescribed: dict[int, float]) -> np.ndarray:
+    """(n_nodes, dim): which displacement components each node has held."""
+    d = mesh.dofs_per_node
+    held = np.zeros((mesh.n_nodes, d), dtype=bool)
+    for dof in prescribed:
+        held[dof // d, dof % d] = True
+    return held
 
 
 def run(
@@ -108,40 +133,57 @@ def run(
     optimize_design: bool = True,
     snapshot_every: int = 10,
     echo: bool = True,
-    constraints: Sequence[Fix] | None = None,
+    constraints: Sequence[Fix | Displace] | None = None,
     loads: Sequence[Force] | None = None,
     study: Any = None,
     solver: str = "auto",
+    load_cases: Sequence[StudyCase] | None = None,
+    passive_regions: Sequence[Passive] = (),
 ) -> tuple[RunLog, dict[str, Any]]:
     """Mesh the domain, solve it at full density, then run the SIMP loop.
 
-    ``constraints`` and ``loads`` refer to the domain's named regions.  Left
-    out, the parametric beam uses its cantilever defaults: ``fixed`` clamped
-    and ``load_fy`` at ``load``.  ``study`` is the loaded study the run came
-    from (see :func:`topocombo.study.run_study`), recorded with the run.
+    ``constraints`` (:class:`Fix`, :class:`Displace`), the forces — ``loads``
+    for one case or ``load_cases`` for several — and ``passive_regions``
+    refer to the domain's named regions.  Left out, the parametric beam uses
+    its cantilever defaults: ``fixed`` clamped and ``load_fy`` at ``load``.
+    ``study`` is the loaded study the run came from (see
+    :func:`topocombo.study.run_study`), recorded with the run.
     """
     three_d = domain.dim == 3
     scripted = isinstance(domain, CadDomain)
     if three_d != isinstance(spec, MeshSpec3D):
         raise TypeError("a 3D domain needs a MeshSpec3D, a 2D domain a MeshSpec")
     regions = domain.regions()
-    if constraints is None and loads is None and not scripted:
+    if constraints is None and loads is None and load_cases is None and not scripted:
         constraints = [Fix(BEAM_FIXED)]
         loads = [Force(BEAM_LOAD, (0.0, load_fy, 0.0)[: domain.dim])]
-    if not constraints or not loads:
+    if loads and load_cases:
+        raise ValueError("give loads (one case) or load_cases, not both")
+    cases = list(load_cases) if load_cases else ([StudyCase("load", tuple(loads))] if loads else [])
+    passive_regions = list(passive_regions)
+    if not constraints or not cases:
         raise ValueError("a run needs constraints and loads on the part's named regions")
-    unknown = [n for n in [c.region for c in constraints] + [f.region for f in loads]
-               if n not in regions]
+    forces = [f for case in cases for f in case.loads]
+    bc_names = list(dict.fromkeys([c.region for c in constraints] + [f.region for f in forces]))
+    unknown = [n for n in bc_names + [p.region for p in passive_regions] if n not in regions]
     if unknown:
         raise ValueError(
             f"unknown region(s) {', '.join(unknown)}; the part defines "
             f"{', '.join(sorted(regions)) or 'none'}"
         )
-    if len(loads) != 1:
-        raise ValueError("exactly one Force for now")
-    force = loads[0]
-    if len(force.vector) != domain.dim:
-        raise ValueError(f"a {domain.dim}D part takes a {domain.dim}-component force")
+    solids = [n for n in bc_names if region_dim(regions[n]) == 3]
+    if solids:
+        raise ValueError(
+            f"region(s) {', '.join(solids)} are solids: constraints and forces act on "
+            "vertices, edges or faces (solid regions are for Passive)"
+        )
+    for f in forces:
+        if len(f.vector) != domain.dim:
+            raise ValueError(f"a {domain.dim}D part takes a {domain.dim}-component force")
+    for c in constraints:
+        c.components(domain.dim)  # a z component on a 2D part raises here
+    force = forces[0]  # the first force of the first case: what one-load summaries show
+    bc_regions = {n: regions[n] for n in bc_names}
     tetrahedral = getattr(spec, "tetrahedral", False)
     if three_d and not tetrahedral and not domain.is_prism:
         domain.profile()  # raises, saying why hexahedra cannot mesh this part
@@ -164,7 +206,12 @@ def run(
         "mesh": {**spec.as_dict(), "element_size": _element_size(domain, spec)},
         "material": material.as_dict(),
         "load": {f"f{a}": v for a, v in zip("xyz", force.vector)},
-        "boundary_conditions": _boundary_conditions(domain, constraints, loads, regions),
+        "load_cases": [
+            {"name": c.name, "weight": c.weight, "forces": [f.as_dict() for f in c.loads]}
+            for c in cases
+        ],
+        "boundary_conditions": _boundary_conditions(domain, constraints, cases, regions),
+        "passive": [p.as_dict() for p in passive_regions],
         "regions": {name: _region_summary(shape) for name, shape in regions.items()},
         "simp": simp.as_dict(),
         "solver": solver,
@@ -295,9 +342,9 @@ def run(
         if spec.structured:
             extra = {}
         elif tetrahedral:
-            extra = {"regions": regions}
+            extra = {"regions": bc_regions}
         else:
-            extra = {"points": embed_points(regions, domain.profile(), tol)}
+            extra = {"points": embed_points(bc_regions, domain.profile(), tol)}
         msh_path, _ = mesher(
             domain=domain,
             spec=spec,
@@ -312,34 +359,91 @@ def run(
 
     with log.step("validation", "3. Load the mesh and check it"):
         mesh = load_mesh(msh_path)
-        for name in dict.fromkeys([c.region for c in constraints] + [force.region]):
-            mesh.node_sets[name] = region_nodes(mesh.nodes, regions[name], tol)
-        load_nodes = mesh.node_sets[force.region]
-        if load_nodes.size == 0:
-            raise RuntimeError(f"region '{force.region}' has no mesh nodes to carry the load")
-        shares = node_shares(
-            mesh.nodes, mesh.cells, mesh.cell_type, load_nodes,
-            region_dim(regions[force.region]), force.region,
-        )
+        for name, shape in bc_regions.items():
+            mesh.node_sets[name] = region_nodes(mesh.nodes, shape, tol)
+        empty = [n for n in bc_names if mesh.node_sets[n].size == 0]
+        if empty:
+            raise RuntimeError(f"region(s) {', '.join(empty)} have no mesh nodes")
+        # every force as nodal loads (fea.LoadCase), grouped by load case
+        nodal: list[list[LoadCase]] = []
+        for case in cases:
+            nodal.append([])
+            for f in case.loads:
+                nodes_f = mesh.node_sets[f.region]
+                shares_f = node_shares(
+                    mesh.nodes, mesh.cells, mesh.cell_type, nodes_f,
+                    region_dim(regions[f.region]), f.region,
+                )
+                comps = dict(zip(("fx", "fy", "fz"), f.vector))
+                nodal[-1].append(
+                    LoadCase(node=tuple(int(n) for n in nodes_f),
+                             shares=tuple(float(v) for v in shares_f), **comps)
+                    if nodes_f.size > 1 else LoadCase(node=int(nodes_f[0]), **comps)
+                )
+        load = nodal[0][0]
+        load_nodes = load.nodes
         load_node = int(load_nodes[0])
+        # constraints: DOF -> held displacement, shared by every case
+        prescribed: dict[int, float] = {}
+        held_by: dict[int, str] = {}
+        for c in constraints:
+            for comp, value in c.components(domain.dim).items():
+                for n in mesh.node_sets[c.region]:
+                    dof = mesh.dofs_per_node * int(n) + comp
+                    if dof in prescribed and prescribed[dof] != value:
+                        raise ValueError(
+                            f"regions '{held_by[dof]}' and '{c.region}' hold node {int(n)}'s "
+                            f"u{'xyz'[comp]} at {prescribed[dof]:g} and {value:g}"
+                        )
+                    prescribed[dof], held_by[dof] = value, c.region
+        constrained = np.array(sorted(prescribed), dtype=int)
+        loose = rigid_body_free(mesh, constrained)
+        if loose:
+            raise ValueError(
+                f"the constraints leave the part free to move: {loose} rigid-body motion(s) "
+                "(translations or rotations) are not held; fix more components"
+            )
+        fixed_nodes = np.unique(constrained // mesh.dofs_per_node)
         summary = check_mesh(mesh, domain, expected_elements=spec.n_elements)
         summary["mesh_mode"] = spec.mode
         summary["load_node"] = load_node
         summary["load_nodes"] = [int(n) for n in load_nodes]
         summary["load_node_coords"] = [float(c) for c in mesh.nodes[load_node]]
         if spec.structured:
-            passive = domain.void_mask(element_centroids(mesh))
+            cutouts = domain.void_mask(element_centroids(mesh))
         else:  # the cutouts are not meshed at all
-            passive = np.zeros(mesh.n_elements, dtype=bool)
-        if passive.any():
+            cutouts = np.zeros(mesh.n_elements, dtype=bool)
+        if cutouts.any():
             measures = mesh.cell_measures()
             if three_d:
                 cut = domain.volume - domain.material_volume
             else:
                 cut = domain.area - domain.material_area
-            summary["passive_elements"] = int(passive.sum())
-            summary["passive_measure"] = float(measures[passive].sum())
+            summary["passive_elements"] = int(cutouts.sum())
+            summary["passive_measure"] = float(measures[cutouts].sum())
             summary["cutout_measure"] = float(cut)
+        # passive regions: held void (with the cutouts) or held solid
+        passive, solid = cutouts.copy(), np.zeros(mesh.n_elements, dtype=bool)
+        centroids = element_centroids(mesh)
+        for p_region in passive_regions:
+            picked = region_nodes(centroids, regions[p_region.region], max(p_region.within, tol))
+            if picked.size == 0:
+                raise RuntimeError(f"Passive('{p_region.region}') holds no elements: widen `within`")
+            (solid if p_region.state == "solid" else passive)[picked] = True
+            summary.setdefault("passive_regions", []).append(
+                {**p_region.as_dict(), "elements": int(picked.size)}
+            )
+        if np.any(solid & passive):
+            raise ValueError("some elements are in both a solid and a void passive region")
+        summary["passive_void_elements"] = int(passive.sum())
+        summary["passive_solid_elements"] = int(solid.sum())
+        summary["constrained_dofs"] = int(constrained.size)
+        summary["load_cases"] = [
+            {"name": case.name, "weight": case.weight,
+             "forces": [{"region": f.region, "nodes": int(mesh.node_sets[f.region].size),
+                         "vector": list(f.vector)} for f in case.loads]}
+            for case in cases
+        ]
 
         log.log(f"{summary['n_nodes']} nodes, {summary['n_elements']} {cells_word}, {summary['n_dofs']} DOFs")
         log.log(
@@ -355,18 +459,24 @@ def run(
         )
         for name, count in summary["node_sets"].items():
             log.log(f"node set '{name}': {count} nodes")
-        if passive.any():
+        if cutouts.any():
             log.log(
                 f"cutouts: {summary['passive_elements']} elements held void, "
                 f"{summary['passive_measure']:.4g} {unit} of grid vs "
                 f"{summary['cutout_measure']:.4g} {unit} in the CAD model "
                 "(the grid resolves a cutout to whole elements)"
             )
-        coords = ", ".join(f"{c:.3f}" for c in summary["load_node_coords"])
-        log.log(
-            f"load region '{force.region}': {load_nodes.size} node(s), "
-            f"first #{load_node} at ({coords})"
-        )
+        for p_info in summary.get("passive_regions", []):
+            log.log(
+                f"passive '{p_info['region']}' held {p_info['state']}: {p_info['elements']} "
+                f"elements within {p_info['within']:g} mm"
+            )
+        for case in summary["load_cases"]:
+            for f_info in case["forces"]:
+                log.log(
+                    f"load case '{case['name']}': force on '{f_info['region']}' "
+                    f"spread over {f_info['nodes']} node(s)"
+                )
         for name, passed in summary["checks"].items():
             log.log(f"  [{'PASS' if passed else 'FAIL'}] {name}")
         if not summary["all_checks_passed"]:
@@ -385,65 +495,64 @@ def run(
         paths = save_mesh(
             mesh, out_dir / "mesh", load_node=load_node, load_nodes=load_nodes,
             passive=passive if passive.any() else None,
-            fixed_nodes=np.unique(np.concatenate(
-                [mesh.node_sets[c.region] for c in constraints]
-            )),
+            fixed_nodes=fixed_nodes,
             load_vector=force.vector,
+            solid=solid if solid.any() else None,
+            clamped_nodes=_clamped_nodes(mesh, prescribed),
+            held=_held(mesh, prescribed)[fixed_nodes],
         )
         log.artifact(paths["npz"], f"nodes, {mesh.cell_type} connectivity and boundary node sets (numpy)")
         log.artifact(paths["vtu"], "mesh for PyVista / ParaView")
 
     with log.step("solve", f"5. Assemble and solve ({analysis}, full density)"):
-        components = dict(zip(("fx", "fy", "fz"), force.vector))
-        if load_nodes.size > 1:
-            load = LoadCase(
-                node=tuple(int(n) for n in load_nodes), shares=tuple(float(v) for v in shares),
-                **components,
-            )
-        else:
-            load = LoadCase(node=load_node, **components)
-        fixed_sets = [c.region for c in constraints]
-        n_fixed = int(np.unique(np.concatenate([mesh.node_sets[n] for n in fixed_sets])).size)
         log.log(
             f"material: E = {material.youngs_modulus:g} MPa, nu = {material.poisson_ratio:g}, "
             f"G = {material.shear_modulus:g} MPa"
         )
-        vector = ", ".join(f"{v:g}" for v in force.vector)
-        log.log(
-            f"constraints: {', '.join(repr(n) for n in fixed_sets)} clamped "
-            f"({n_fixed} nodes, {mesh.dofs_per_node * n_fixed} DOFs)"
-        )
-        shares_text = (
-            f" (shares {', '.join(f'{v:.3g}' for v in load.node_shares())})"
-            if 1 < load.nodes.size <= 6 else ""
-        )
-        log.log(
-            f"load: F = ({vector}) N on '{force.region}', spread over "
-            f"{load.nodes.size} node(s) by {_REGION_KIND[region_dim(regions[force.region])]}"
-            f" tributary share{shares_text}"
-        )
+        for c in constraints:
+            comps = c.components(domain.dim)
+            what = ", ".join(f"u{'xyz'[i]} = {v:g}" for i, v in comps.items())
+            log.log(
+                f"constraint on '{c.region}' ({mesh.node_sets[c.region].size} nodes): {what}"
+            )
+        log.log(f"{constrained.size} constrained DOFs; every rigid-body motion held")
+        for case, loads_c in zip(cases, nodal):
+            for f, lc in zip(case.loads, loads_c):
+                shares_text = (
+                    f" (shares {', '.join(f'{v:.3g}' for v in lc.node_shares())})"
+                    if 1 < lc.nodes.size <= 6 else ""
+                )
+                log.log(
+                    f"case '{case.name}' (weight {case.weight:g}): F = "
+                    f"({', '.join(f'{v:g}' for v in f.vector)}) N on '{f.region}', spread over "
+                    f"{lc.nodes.size} node(s) by {_REGION_KIND[region_dim(regions[f.region])]}"
+                    f" tributary share{shares_text}"
+                )
         ke_all = element_stiffnesses(mesh, material, depth)
         n_edof = ke_all.shape[1]
-        gauss = "x".join(["2"] * mesh.dim)
         log.log(
             f"assembled {ke_all.shape[0]} element stiffness matrices "
-            f"({n_edof}x{n_edof}, {gauss} Gauss)"
+            f"({n_edof}x{n_edof}, {len(mesh.element.quadrature[1])}-point quadrature)"
         )
-        result = fea_solve(
+        density0 = np.where(passive, 0.0, 1.0) if passive.any() else None
+        results = solve_cases(
             mesh=mesh,
             material=material,
             thickness=depth,
-            load=load,
-            fixed_node_set=fixed_sets,
-            densities=np.where(passive, 0.0, 1.0) if passive.any() else None,
+            loads=nodal,
+            prescribed=prescribed,
+            densities=density0,
             ke_all=ke_all,
             solver=solver,
         )
+        result = results[0]
+        weights = np.array([case.weight for case in cases])
+        total = float(weights @ [r.compliance for r in results])
         tip_uy = float(result.component(1)[load.nodes].mean())
         reactions = [float(result.component(i, "reactions").sum()) for i in range(mesh.dim)]
         reaction_y = reactions[1]
         # a reference only the parametric cantilever has: tip-loaded beam theory
-        beam = None if scripted else timoshenko_tip_deflection(
+        beam = None if scripted or len(forces) != 1 else timoshenko_tip_deflection(
             domain.length, domain.height, depth, material, load.fy
         )
         rel = abs(abs(tip_uy) - beam["total"]) / beam["total"] if beam else None
@@ -452,8 +561,28 @@ def run(
             f"multigrid-preconditioned CG, {result.solver_iterations} iterations"
             if result.solver == "amg-cg" else f"sparse {result.solver}"
         )
-        log.log(f"solved {result.n_free_dofs} free DOFs ({how})")
-        log.log(f"compliance F.U = {result.compliance:.6g} N*mm")
+        log.log(f"solved {result.n_free_dofs} free DOFs ({how})"
+                + (f", {len(cases)} load cases" if len(cases) > 1 else ""))
+        case_summaries = []
+        for case, r, loads_c in zip(cases, results, nodal):
+            applied = sum(np.array(lc.components(mesh.dim)) for lc in loads_c)
+            react = [float(r.component(i, "reactions").sum()) for i in range(mesh.dim)]
+            log.log(
+                f"case '{case.name}': compliance = {r.compliance:.6g} N*mm; reactions "
+                f"({', '.join(f'{v:.6g}' for v in react)}) N vs applied "
+                f"({', '.join(f'{0.0 - v:g}' for v in applied)}) N; "
+                f"||KU - F|| on free DOFs = {r.equilibrium_residual:.3e}"
+            )
+            case_summaries.append({
+                "name": case.name, "weight": case.weight, "compliance": r.compliance,
+                "reactions": react, "applied": [float(v) for v in applied],
+                "equilibrium_residual": r.equilibrium_residual,
+                "max_displacement": float(r.displacement_magnitude.max()),
+            })
+        if len(cases) > 1:
+            log.log(f"weighted compliance = {total:.6g} N*mm")
+        log.log(f"compliance F.U = {total:.6g} N*mm"
+                + (" (f.u - u_p.r_p: prescribed displacements do work)" if any(prescribed.values()) else ""))
         log.log(
             f"uy at the load = {tip_uy:.6g} mm"
             + (f" (mean over {load.nodes.size} nodes)" if load.nodes.size > 1 else "")
@@ -467,19 +596,20 @@ def run(
             )
         log.log(
             f"equilibrium: ||KU - F|| on free DOFs = {result.equilibrium_residual:.3e}, "
-            f"sum of reactions = ({', '.join(f'{v:.6g}' for v in reactions)}) N vs applied "
-            f"({', '.join(f'{0.0 - v:g}' for v in force.vector)}) N"
+            f"sum of reactions = ({', '.join(f'{v:.6g}' for v in reactions)}) N"
         )
         log.log(
             f"von Mises at centroids: {result.von_mises.min():.4g} – "
             f"{result.von_mises.max():.4g} MPa"
+            + (f" (case '{cases[0].name}')" if len(cases) > 1 else "")
         )
         log.log(
             "element compliances u_e^T k_e u_e sum to "
             f"{result.element_compliance.sum():.6g} N*mm — the SIMP sensitivity basis"
         )
         solve_summary = {
-            "compliance": result.compliance,
+            "compliance": total,
+            "cases": case_summaries,
             "tip_uy": tip_uy,
             "max_deflection": result.max_deflection(),
             "beam_theory": beam,
@@ -532,18 +662,31 @@ def run(
                         mesh, densities, snapshots_dir / f"density_iter_{it:04d}.vtu"
                     )
 
+            if solid.any():
+                log.log(f"{int(solid.sum())} elements held solid, {int(passive.sum())} held void")
+            if len(cases) > 1:
+                log.log(
+                    "objective: the weighted sum of the load cases' compliances ("
+                    + " + ".join(f"{c.weight:g} x {c.name}" for c in cases) + ")"
+                )
             design = optimize(
                 mesh=mesh,
                 material=material,
                 thickness=depth,
-                load=load,
-                fixed_node_set=fixed_sets,
+                load=None,
+                fixed_node_set=None,
                 params=simp,
                 on_iteration=on_iteration,
                 passive=passive,
                 solver=solver,
+                cases=[(case.weight, loads_c) for case, loads_c in zip(cases, nodal)],
+                prescribed=prescribed,
+                solid=solid,
             )
-            reduction = (design.compliance / result.compliance) if result.compliance else float("nan")
+            reduction = (design.compliance / total) if total else float("nan")
+            if len(cases) > 1:
+                for case, c_value in zip(cases, design.case_compliances):
+                    log.log(f"case '{case.name}': compliance {c_value:.6g} N*mm")
             log.log(
                 f"{'converged' if design.converged else 'stopped'} after "
                 f"{design.iterations} iterations"

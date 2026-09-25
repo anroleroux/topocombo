@@ -274,6 +274,7 @@ def mesh_svg(
         '.hole{fill:none;stroke:var(--text);stroke-width:1.4;stroke-dasharray:5 3}'
         '.bd{fill:none;stroke:var(--text);stroke-width:1.6}'
         '.sup{stroke:var(--text);stroke-width:1.6}'
+        '.roll{fill:none;stroke:var(--text);stroke-width:1.3}'
         '.ld{stroke:var(--fail);stroke-width:2.4;fill:var(--fail)}'
         '.lbl{fill:var(--muted);font:12px ui-monospace,monospace}'
         '</style>',
@@ -313,7 +314,32 @@ def mesh_svg(
             + '"/>'
         )
 
-    # clamped edge: hatching along the fixed boundary
+    # supports: a clamped edge is hatched; a node holding only some components
+    # gets a roller triangle on the side of each held in-plane component
+    clamped = data["clamped_nodes"] if "clamped_nodes" in data else fixed
+    if "held" in data and fixed.size:
+        centre = (nodes[:, :2].min(axis=0) + nodes[:, :2].max(axis=0)) / 2
+        partial = ~np.isin(fixed, clamped)
+        for node, held in zip(fixed[partial], data["held"][partial]):
+            x, y = px(nodes[node])
+            for axis in np.flatnonzero(held[:2]):
+                # the triangle sits outside the part, its tip on the node
+                side = -1.0 if nodes[node][axis] <= centre[axis] else 1.0
+                if axis == 0:
+                    bx = x + side * 9
+                    tri = f"{x:.2f},{y:.2f} {bx:.2f},{y - 5:.2f} {bx:.2f},{y + 5:.2f}"
+                else:
+                    by = y - side * 9  # screen y points down
+                    tri = f"{x:.2f},{y:.2f} {x - 5:.2f},{by:.2f} {x + 5:.2f},{by:.2f}"
+                parts.append(f'<polygon class="roll" points="{tri}"/>')
+        held_counts = data["held"][partial][:, :2].sum(axis=0)
+        if partial.any():
+            words = [f"{int(n)} u{a}" for a, n in zip("xy", held_counts) if n]
+            parts.append(
+                f'<text class="lbl" x="{pad:.2f}" y="{height - 12:.2f}" text-anchor="start">'
+                f'rollers / symmetry: {", ".join(words)}</text>'
+            )
+    fixed = clamped
     if fixed.size:
         fx, fy0 = px(nodes[fixed][np.argmin(nodes[fixed][:, 1])])
         _, fy1 = px(nodes[fixed][np.argmax(nodes[fixed][:, 1])])
@@ -340,7 +366,7 @@ def mesh_svg(
         anchor = "end" if near_right else "start"
         tx = lx - 8 if near_right else lx + 8
         parts.append(
-            f'<text class="lbl" x="{tx:.2f}" y="{ly - 40 * direction[1] - 6:.2f}" '
+            f'<text class="lbl" x="{tx:.2f}" y="{max(ly - 40 * direction[1] - 6, 14):.2f}" '
             f'text-anchor="{anchor}">F (node {load_node})</text>'
         )
 
@@ -1076,7 +1102,7 @@ def _study_inputs(params: dict[str, Any], summary: dict[str, Any], run: dict[str
             ))
     else:
         mesh_rows.append(("target element edge (mm)", size[0] if size else None))
-        if three_d:
+        if three_d and mesh.get("nelz") is not None:  # tetrahedra have no layers
             mesh_rows.append(("layers through the width", mesh.get("nelz")))
             if size and len(size) > 1:
                 mesh_rows.append(("layer thickness dz (mm)", size[1]))
@@ -1085,11 +1111,17 @@ def _study_inputs(params: dict[str, Any], summary: dict[str, Any], run: dict[str
 
     bcs = params.get("boundary_conditions") or {}
     load_rows: list[tuple[str, Any]] = []
-    for load in bcs.get("loads", []):
+    loads = bcs.get("loads", [])
+    several = len({ld.get("case", "load") for ld in loads}) > 1
+    for load in loads:
         force = load.get("force", {})
         name = load.get("region") or load.get("node_set", "load")
+        case = (
+            f"case '{load.get('case')}' (weight {_fmt(load.get('weight', 1.0))}): "
+            if several else ""
+        )
         load_rows += [
-            (f"'{name}': {load.get('kind', '')} region".replace(":  region", ""),
+            (f"{case}'{name}': {load.get('kind', '')} region".replace(":  region", ""),
              _nodes(sets.get(name))),
             ("force " + _fmt_axes("F", axes) + " (N, total)",
              _fmt_vec(force.get(f"f{a}", 0.0) for a in axes)),
@@ -1098,12 +1130,25 @@ def _study_inputs(params: dict[str, Any], summary: dict[str, Any], run: dict[str
     for c in bcs.get("constraints", []):
         name = c.get("region") or c.get("node_set", "fixed")
         disp = c.get("displacements", {})
+        kind = {"clamped": "clamped", "held": "held", "prescribed": "prescribed"}.get(
+            c.get("type", "clamped"), c.get("type")
+        )
         fix_rows += [
             (f"'{name}': {c.get('kind', '')} region".replace(":  region", ""),
-             f"{_nodes(sets.get(name))}, {c.get('type', 'clamped')}"),
+             f"{_nodes(sets.get(name))}, {kind}"),
             ("displacement " + _fmt_axes("u", axes) + " (mm)",
-             _fmt_vec(disp.get(f"u{a}", 0.0) for a in axes)),
+             "(" + ", ".join(
+                 _fmt(float(disp[f"u{a}"])) if f"u{a}" in disp else "free" for a in axes
+             ) + ")"),
         ]
+    passive_rows: list[tuple[str, Any]] = []
+    passive_info = {p.get("region"): p for p in summary.get("passive_regions", [])}
+    for p in params.get("passive") or []:
+        within = f", within {_fmt(float(p.get('within', 0.0)))} mm" if p.get("within") else ""
+        count = passive_info.get(p.get("region"), {}).get("elements", "?")
+        passive_rows.append(
+            (f"'{p.get('region')}': held {p.get('state')}{within}", f"{count} elements")
+        )
 
     def block(title: str, rows: list[tuple[str, Any]]) -> str:
         return f"<div><h3>{_e(title)}</h3>{_kv_table(rows)}</div>"
@@ -1131,6 +1176,7 @@ def _study_inputs(params: dict[str, Any], summary: dict[str, Any], run: dict[str
         + block("Mesh size", mesh_rows)
         + block("Loads", load_rows)
         + block("Displacement constraints", fix_rows)
+        + (block("Passive regions", passive_rows) if passive_rows else "")
         + "</div>"
         + code
     )
@@ -1186,10 +1232,26 @@ def render_html(
 
     bcs = params.get("boundary_conditions") or {}
     fixed_names = [c.get("region") or c.get("node_set", "fixed") for c in bcs.get("constraints", [])]
-    load_names = [f.get("region") or f.get("node_set", "load") for f in bcs.get("loads", [])]
+    def _holds(c: dict[str, Any]) -> str:
+        name = _e(c.get("region") or c.get("node_set", "fixed"))
+        if c.get("type", "clamped") == "clamped":
+            return f"{name} is clamped (hatched)"
+        comps = ", ".join(
+            f"{k} = {_fmt(v)}" for k, v in (c.get("displacements") or {}).items()
+        )
+        glyph = "" if c.get("type") == "prescribed" else " (triangles)"
+        return f"{name} holds {comps}{glyph}"
+
+    load_names = list(dict.fromkeys(
+        f.get("region") or f.get("node_set", "load") for f in bcs.get("loads", [])
+    ))
+    holds = "; ".join(_holds(c) for c in bcs.get("constraints", []))
     held = (
-        f"The hatched {'/'.join(_e(n) for n in fixed_names) or 'fixed'} region is clamped;"
-        f" the arrow marks the load on {'/'.join(_e(n) for n in load_names) or 'load'}."
+        (holds[:1].upper() + holds[1:]) if holds else "The fixed region is clamped"
+    ) + (
+        f"; the arrow marks the load on {'/'.join(_e(n) for n in load_names) or 'load'}"
+        + (" (first load case)" if len(params.get("load_cases") or []) > 1 else "")
+        + "."
     )
     every = f"every {noun}" + (" of the body-fitted mesh" if fitted else "")
     if three_d:

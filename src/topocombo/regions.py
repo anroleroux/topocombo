@@ -1,5 +1,7 @@
 """Named regions: where the constraints and loads act, picked in the CAD.
 
+(Solid regions are allowed too, for passive, non-design material only.)
+
 A region is any CadQuery geometry on the part's boundary — a vertex, edges or
 faces, taken from the part with a selector (``result.faces("<X")``) or built on
 its own (a line across a face, where a load should act).  Nothing here knows
@@ -23,13 +25,14 @@ import cadquery as cq
 
 from .elements import boundary_facets, element
 
-_KINDS = (cq.Vertex, cq.Edge, cq.Wire, cq.Face, cq.Shell)
+_KINDS = (cq.Vertex, cq.Edge, cq.Wire, cq.Face, cq.Shell, cq.Solid)
 
 
 def as_shape(value: Any, name: str) -> cq.Shape:
     """One shape from a region value: a ``cq.Workplane`` selection, a
-    ``cq.Shape`` or a list of them.  Solids are rejected — loads and
-    constraints act on the boundary."""
+    ``cq.Shape`` or a list of them.  Solids are accepted for passive
+    regions; loads and constraints act on the boundary, which the pipeline
+    checks."""
     if isinstance(value, cq.Workplane):
         items = value.vals()
     elif isinstance(value, (list, tuple)):
@@ -41,12 +44,13 @@ def as_shape(value: Any, name: str) -> cq.Shape:
     shapes: list[cq.Shape] = []
     for item in items:
         if isinstance(item, cq.Compound):
-            shapes.extend(item.Faces() or item.Edges() or item.Vertices())
+            shapes.extend(item.Solids() or item.Faces() or item.Edges() or item.Vertices())
         elif isinstance(item, _KINDS):
             shapes.append(item)
         else:
             raise ValueError(
-                f"region '{name}' must be vertices, edges or faces, not {type(item).__name__}"
+                f"region '{name}' must be vertices, edges, faces or solids, "
+                f"not {type(item).__name__}"
             )
     if not shapes:
         raise ValueError(f"region '{name}' selects nothing")
@@ -54,7 +58,9 @@ def as_shape(value: Any, name: str) -> cq.Shape:
 
 
 def region_dim(shape: cq.Shape) -> int:
-    """0 for vertices, 1 for edges, 2 for faces."""
+    """0 for vertices, 1 for edges, 2 for faces, 3 for solids."""
+    if shape.Solids():
+        return 3
     if shape.Faces():
         return 2
     if shape.Edges():

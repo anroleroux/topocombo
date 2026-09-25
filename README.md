@@ -137,8 +137,8 @@ fuses the regions into the solid). A force is spread over its region by the
 region's dimension — all on one node (a vertex), by tributary length (edges),
 or by tributary area (faces) — split over each piece's nodes by the element's
 consistent weights: evenly for linear elements, 1/6-2/3-1/6 along a quadratic
-edge, all on the mid-nodes of a 6-node triangle. `Fix` clamps every displacement component for
-now; one `Force` per study.
+edge, all on the mid-nodes of a 6-node triangle. Constraints, load cases and
+passive regions are described under *Boundary conditions* below.
 
 The part script is checked too, with a message naming the file: `result`
 must be one connected face or solid; its bounding box must start at the
@@ -320,7 +320,8 @@ src/topocombo/
   cli.py        `python -m topocombo.cli cad|run|report|all [--dim 3] [--study study.py]`
 tests/          mesh invariants, solver verification, optimizer invariants, 2D <-> 3D checks
 docs/           the 3D migration plan
-examples/       designs as part.py + study.py (`--study`)
+examples/       designs as part.py + study.py (`--study`): cantilever (hex8), bracket (tet10,
+                two load cases, passive rings), mbb (symmetry and roller supports)
 ```
 
 ## Status
@@ -375,14 +376,12 @@ Checks, besides the registry invariants every element meets:
   a 2 mm-wide beam at 1 mm, loaded 1/12-1/6-1/12 plus 1/3 per mid-node).
 
 `examples/bracket/` is a part hexahedra cannot mesh: a thick flange bolted to
-the wall and a narrower arm with a pin hole. The load (1 kN) hangs on the
-bore's cylindrical face, the flange's back face is clamped, and 30% of the
-material is kept. 2998 T10 at 2.5 mm (17k DOFs) converge in 64 iterations,
-about 75 s; the design keeps the flange's bolted corners, a truss in the arm
-and a ring round the pin. CI publishes it next to the cantilever, at
-`bracket/`, drawn by its front surface — a tet mesh has no layers to show, so
-each front-facing boundary facet takes its element's value — and in 3D as the
-thresholded STL.
+the wall and a narrower arm with a pin hole, meshed with 2998 T10 at 2.5 mm
+(17k DOFs). Its study (described under *Boundary conditions*) loads the pin
+two ways and keeps a ring round it and a pad on the wall solid. CI publishes
+it at `bracket/`, drawn by its front surface — a tet mesh has no layers to
+show, so each front-facing boundary facet takes its element's value — and in
+3D as the thresholded STL.
 
 **Solvers.** `Study.solver` (or `--solver`) is `direct` (sparse LU), `cg`
 (conjugate gradients preconditioned by smoothed-aggregation algebraic
@@ -397,11 +396,57 @@ pattern and the map from element entries into it are built once per mesh, so
 each iteration's assembly is one weighted `bincount` (0.08 s instead of 1.6 s
 at 55k DOFs).
 
-Next, in order:
+### Boundary conditions
 
-1. More general boundary conditions: constraints on chosen components and
-   prescribed displacements, several load cases, passive regions held solid,
-   and a second example that is not a cantilever.
+A study's supports, loads and non-design regions are built from these blocks
+(all in `topocombo.study`), each naming a region of the part:
 
-Then NLopt-MMA as an alternative to the OC update, and the CalculiX swap-in
-for the solver once the loop is trusted.
+| block | what it does |
+| --- | --- |
+| `Fix(region, dofs="xyz")` | holds components at zero: all of them clamps; `dofs="x"` is a symmetry plane normal to x, `dofs="y"` a roller sliding along x |
+| `Displace(region, ux=…, uy=…, uz=…)` | prescribes components (mm); those left out are free |
+| `Force(region, (Fx, Fy[, Fz]))` | a total force spread over the region |
+| `LoadCase(name, [Force, …], weight=1)` | forces acting together; `Study(load_cases=[…])` optimises the weighted sum of the cases' compliances (or `loads=[…]` for one case) |
+| `Passive(region, state="solid" \| "void", within=0)` | keeps elements out of the design: those whose centre is inside a solid region, or within `within` mm of a face, edge or point — a ring round a bore, a pad on a face |
+
+Constraints hold in every load case. Before anything is solved the pipeline
+refuses constraints that leave a rigid-body motion free (it checks the rank
+of the rigid-body modes on the constrained DOFs, so a symmetry edge alone
+fails: the part can still slide along it), regions that hold the same node's
+component at two values, forces or supports on solid regions, and solid
+passive regions that already take the whole volume fraction.
+
+With prescribed displacements, compliance is `f . u - u_p . r_p`: the work of
+the loads less the work the prescribed supports do, which is minus twice the
+potential energy at equilibrium. It is `f . u` when nothing is prescribed,
+and its sensitivity is still `-p x^(p-1) u_e^T k0_e u_e` — checked against
+central differences with a force and a pull acting together — so the
+optimizer needs no special case. Load cases share one factorisation of the
+stiffness matrix per iteration.
+
+Checks:
+
+* **Half MBB beam** (`examples/mbb/`, published at `mbb/`): the classic
+  benchmark, 60 x 20 quads, symmetry edge (`Fix(dofs="x")`) and a roller
+  (`Fix(dofs="y")`). It converges in 94 iterations to 967.5 N·mm, which is
+  203.2 in the benchmark's units (E = 1, unit load) — Sigmund's 99-line code
+  reports about 203 for the same settings — and to the textbook design.
+* A half beam by symmetry has exactly half the compliance of the full beam
+  on a pin and a roller (to 1e-9).
+* A bar pulled by a prescribed end displacement gives the reaction
+  `E A delta / L` exactly, and compliance `-delta x reaction`.
+* Two identical load cases at half weight design exactly like one.
+* Elements in a solid passive region stay at density 1 while the volume
+  constraint holds.
+
+**Bracket.** Two load cases — the pin pulled down (1 kN) and pushed sideways
+along z (300 N) — and two solid passive regions — a 2 mm ring round the bore
+(164 elements) and a 1.5 mm pad against the wall (266). At 30% volume it
+converges in 34 iterations (about 45 s): the ring and pad stay, and the arm
+becomes a box section, since the sideways case needs stiffness across the
+width as well as down it.
+
+Next: NLopt-MMA as an alternative to the OC update (and the constraints OC
+cannot take, such as stress or displacement limits), load cases with their
+own prescribed displacements, and the CalculiX swap-in for the solver once
+the loop is trusted.

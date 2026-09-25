@@ -41,16 +41,22 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
-      # Two example studies, each a CadQuery part with named regions plus a
-      # study script; the reports print both.  The cantilever (hexahedra) is
-      # the main page; the bracket, which is not a prism and so is meshed with
-      # quadratic tetrahedra, is published at bracket/.
+      # Three example studies, each a CadQuery part with named regions plus a
+      # study script; the reports print both.  The cantilever (hexahedra,
+      # clamped) is the main page; the bracket (not a prism: quadratic
+      # tetrahedra, two load cases, passive solid rings) is at bracket/; the
+      # half MBB beam (symmetry and roller supports) is at mbb/.
       - name: Run the pipeline and render the reports
         run: |
           python -m topocombo.cli all --study examples/cantilever/study.py \
-            --out results/cantilever --site site --nav "bracket (tet10)=bracket/"
+            --out results/cantilever --site site \
+            --nav "bracket (tet10)=bracket/" --nav "MBB beam (symmetry)=mbb/"
           python -m topocombo.cli all --study examples/bracket/study.py \
-            --out results/bracket --site site/bracket --nav "cantilever (hex8)=../"
+            --out results/bracket --site site/bracket \
+            --nav "cantilever (hex8)=../" --nav "MBB beam (symmetry)=../mbb/"
+          python -m topocombo.cli all --study examples/mbb/study.py \
+            --out results/mbb --site site/mbb \
+            --nav "cantilever (hex8)=../" --nav "bracket (tet10)=../bracket/"
 
       - name: Upload run artifacts
         uses: actions/upload-artifact@v4

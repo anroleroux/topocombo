@@ -15,13 +15,13 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import scipy.sparse as sp
 from scipy.spatial import cKDTree
 
-from .fea import LoadCase, Material, element_stiffnesses, simp_scaling, solve
+from .fea import Material, element_stiffnesses, solve_cases
 from .mesh_io import Mesh, vtk_points
 
 
@@ -62,6 +62,7 @@ class OptResult:
     iterations: int
     converged: bool
     history: list[dict[str, float]] = field(default_factory=list)
+    case_compliances: list[float] = field(default_factory=list)  # per load case, last iteration
 
     def measure_of_discreteness(self) -> float:
         """Mnd (%): 0 = fully black-and-white, 100 = every element at 0.5."""
@@ -74,6 +75,7 @@ class OptResult:
             "volume_fraction": self.volume_fraction,
             "iterations": self.iterations,
             "converged": self.converged,
+            "case_compliances": list(self.case_compliances),
             "measure_of_discreteness": self.measure_of_discreteness(),
             "density_min": float(self.densities.min()),
             "density_max": float(self.densities.max()),
@@ -131,10 +133,11 @@ def oc_update(
     volume_of: Callable[[np.ndarray], float],
     l2_start: float = 1e9,
     passive: np.ndarray | None = None,
+    solid: np.ndarray | None = None,
 ) -> np.ndarray:
     """Optimality Criteria step: bisect the Lagrange multiplier onto the volume.
 
-    Elements flagged ``passive`` are held at zero density throughout.
+    Elements flagged ``passive`` are held at zero density, ``solid`` at one.
     """
     l1, l2 = 0.0, l2_start
     x_new = x
@@ -145,6 +148,8 @@ def oc_update(
         x_new = np.clip(np.clip(x * ratio, x - move, x + move), 0.0, 1.0)
         if passive is not None:
             x_new[passive] = 0.0
+        if solid is not None:
+            x_new[solid] = 1.0
         if volume_of(x_new) > volume_fraction:
             l1 = lmid
         else:
@@ -156,24 +161,42 @@ def optimize(
     mesh: Mesh,
     material: Material,
     thickness: float,
-    load: LoadCase,
-    fixed_node_set: str | Sequence[str],
+    load: Any,
+    fixed_node_set: str | Sequence[str] | None,
     params: SimpParams | None = None,
     on_iteration: Callable[[dict[str, float], np.ndarray], None] | None = None,
     passive: np.ndarray | None = None,
     solver: str = "auto",
+    cases: Sequence[tuple[float, Any]] | None = None,
+    prescribed: Mapping[int, float] | None = None,
+    solid: np.ndarray | None = None,
 ) -> OptResult:
     """Minimise compliance subject to a volume constraint, returning the design.
 
+    The objective is ``load``'s compliance, or with ``cases`` — (weight, load)
+    pairs, ``load`` then ignored — the weighted sum of the cases' compliances;
+    each case's sensitivity is the same ``-p x^(p-1) u_e^T k0_e u_e``, so the
+    sum's is the weighted sum.  Constraints are ``fixed_node_set`` (clamped)
+    and ``prescribed`` (DOF -> displacement), see :func:`topocombo.fea.solve_cases`.
+
     ``passive`` (a boolean mask) marks non-design elements held void — the
-    cutouts of the CAD model.  The volume fraction stays relative to the whole
-    meshed envelope.  ``solver`` picks the linear solver (see
-    :func:`topocombo.fea.solve`); an iterative one starts each solve from the
-    previous iteration's displacements.
+    cutouts of the CAD model, or keep-out regions — and ``solid`` those held
+    solid.  The volume fraction stays relative to the whole meshed envelope,
+    and counts the solid ones.  ``solver`` picks the linear solver; an
+    iterative one starts each solve from the previous iteration's
+    displacements.
     """
     params = params or SimpParams()
     if passive is not None and not np.any(passive):
         passive = None
+    if solid is not None and not np.any(solid):
+        solid = None
+    if passive is not None and solid is not None and np.any(passive & solid):
+        raise ValueError("an element cannot be held both void and solid")
+    cases = list(cases) if cases else [(1.0, load)]
+    weights = np.array([float(w) for w, _ in cases])
+    if np.any(weights <= 0):
+        raise ValueError("load case weights must be positive")
 
     ke_all = element_stiffnesses(mesh, material, thickness)
     measures = mesh.cell_measures()
@@ -183,6 +206,14 @@ def optimize(
     x = np.full(mesh.n_elements, params.volume_fraction)
     if passive is not None:
         x[passive] = 0.0
+    if solid is not None:
+        held = float(measure_fraction[solid].sum())
+        if held >= params.volume_fraction:
+            raise ValueError(
+                f"the regions held solid take {held:.3f} of the volume, no less than the "
+                f"target fraction {params.volume_fraction:g}: nothing is left to design"
+            )
+        x[solid] = 1.0
     history: list[dict[str, float]] = []
     change = float("inf")
     converged = False
@@ -195,38 +226,44 @@ def optimize(
             design = np.asarray(h @ design).ravel() / hs
             if passive is not None:
                 design[passive] = 0.0
+            if solid is not None:
+                design[solid] = 1.0
         return design
 
     def volume_of(design: np.ndarray) -> float:
         return float(measure_fraction @ physical(design))
 
-    u_prev = None
+    u_prev: list[np.ndarray | None] = [None] * len(cases)
+    case_compliances: list[float] = []
     while iteration < params.max_iterations:
         iteration += 1
         t0 = time.perf_counter()
 
         x_phys = physical(x)
-        result = solve(
+        results = solve_cases(
             mesh=mesh,
             material=material,
             thickness=thickness,
-            load=load,
+            loads=[case for _, case in cases],
             fixed_node_set=fixed_node_set,
             densities=x_phys,
             penal=params.penal,
             ke_all=ke_all,
             solver=solver,
             x0=u_prev,
+            prescribed=prescribed,
         )
-        u_prev = result.u
-        compliance = result.compliance
+        u_prev = [r.u for r in results]
+        case_compliances = [r.compliance for r in results]
+        compliance = float(weights @ case_compliances)
 
-        # dc/dx_phys = -p x^(p-1) (1 - Emin) u_e^T k0 u_e
+        # dc/dx_phys = -p x^(p-1) (1 - Emin) sum_i w_i u_e,i^T k0 u_e,i
+        energy = sum(w * r.element_compliance_unscaled for w, r in zip(weights, results))
         dc = (
             -params.penal
             * np.power(np.maximum(x_phys, 1e-12), params.penal - 1.0)
             * (1.0 - params.e_min)
-            * result.element_compliance_unscaled
+            * energy
         )
         dv = measure_fraction.copy()
 
@@ -244,6 +281,7 @@ def optimize(
             move=params.move_limit,
             volume_of=volume_of,
             passive=passive,
+            solid=solid,
         )
         change = float(np.abs(x_new - x).max())
         x = x_new
@@ -256,7 +294,7 @@ def optimize(
             "change": change,
             "measure_of_discreteness": float(np.mean(4.0 * x_phys * (1.0 - x_phys)) * 100.0),
             "seconds": time.perf_counter() - t0,
-            "solver_iterations": result.solver_iterations,
+            "solver_iterations": sum(r.solver_iterations for r in results),
         }
         history.append(record)
         if on_iteration is not None:
@@ -273,6 +311,7 @@ def optimize(
         iterations=iteration,
         converged=converged,
         history=history,
+        case_compliances=case_compliances,
     )
 
 

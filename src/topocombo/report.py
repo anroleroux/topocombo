@@ -4,6 +4,8 @@ This is a downstream consumer of the artifacts written by
 :mod:`topocombo.pipeline` — it reads ``run.json`` and ``mesh.npz`` from disk and
 never imports the solver or the mesher.  The mesh figure is emitted as inline
 SVG so the published page needs no JavaScript, no CDN and no plotting library.
+The CAD pictures — the exported design domain and the optimized topology — are
+PNGs rendered next to the page by :mod:`topocombo.cadview`.
 """
 
 from __future__ import annotations
@@ -67,7 +69,19 @@ td.num, th.num { text-align: right; font-family: var(--mono); }
 .card .s { color: var(--muted); font-size: 0.8rem; }
 figure { margin: 0; background: var(--panel); border: 1px solid var(--border);
          border-radius: 10px; padding: 16px; }
-figure svg { width: 100%; height: auto; display: block; }
+figure svg, figure img { width: 100%; height: auto; display: block; }
+figure + figure { margin-top: 16px; }
+.cad { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 16px;
+       align-items: start; margin-bottom: 16px; }
+.cad table { margin: 0; }
+.cad td { overflow-wrap: anywhere; }
+pre code { padding: 0; background: none; font-size: inherit; }
+.script { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-bottom: 16px; }
+.script > .head { display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+                  background: var(--panel); border-bottom: 1px solid var(--border);
+                  font-size: 0.85rem; color: var(--muted); }
+.script > .head a { margin-left: auto; }
+@media (max-width: 760px) { .cad { grid-template-columns: minmax(0, 1fr); } }
 figcaption { color: var(--muted); font-size: 0.85rem; margin-top: 10px; }
 .step { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 14px; overflow: hidden; }
 .step > .head { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
@@ -177,10 +191,20 @@ def project_field(
 # --------------------------------------------------------------------------
 # mesh figure
 # --------------------------------------------------------------------------
-def mesh_svg(npz_path: Path, width: int = 900, pad: int = 46) -> str:
-    """Inline SVG of the quad mesh with the supports and the tip load marked."""
+def mesh_svg(
+    npz_path: Path,
+    width: int = 900,
+    pad: int = 46,
+    holes: list[list[float]] | tuple = (),
+) -> str:
+    """Inline SVG of the quad mesh with the supports and the tip load marked.
+
+    Elements held void (``passive`` in the npz) are drawn empty, with the CAD
+    cutouts in ``holes`` — (x, y, diameter) — outlined over them.
+    """
     data = np.load(npz_path)
-    nodes, quads, _ = _side_view(data["nodes"], data["cells"])
+    nodes, quads, drawn = _side_view(data["nodes"], data["cells"])
+    passive = data["passive"][drawn] if "passive" in data else np.zeros(len(quads), dtype=bool)
     fixed = data["set_fixed"] if "set_fixed" in data else np.empty(0, dtype=int)
     load_node = int(data["load_node"][0]) if "load_node" in data else None
 
@@ -200,6 +224,8 @@ def mesh_svg(npz_path: Path, width: int = 900, pad: int = 46) -> str:
         f'role="img" aria-label="Mesh of the cantilever beam design domain">',
         '<style>'
         '.el{fill:var(--accent-soft);stroke:var(--accent);stroke-width:0.6;stroke-opacity:0.55}'
+        '.pv{fill:none;stroke:var(--muted);stroke-width:0.6;stroke-opacity:0.35}'
+        '.hole{fill:none;stroke:var(--text);stroke-width:1.4;stroke-dasharray:5 3}'
         '.bd{fill:none;stroke:var(--text);stroke-width:1.6}'
         '.sup{stroke:var(--text);stroke-width:1.6}'
         '.ld{stroke:var(--fail);stroke-width:2.4;fill:var(--fail)}'
@@ -207,9 +233,19 @@ def mesh_svg(npz_path: Path, width: int = 900, pad: int = 46) -> str:
         '</style>',
     ]
 
-    for quad in quads:
+    for quad, void in zip(quads, passive):
         pts = " ".join(f"{x:.2f},{y:.2f}" for x, y in (px(nodes[i]) for i in quad))
-        parts.append(f'<polygon class="el" points="{pts}"/>')
+        cls = "pv" if void else "el"
+        parts.append(f'<polygon class="{cls}" points="{pts}"/>')
+    for hx, hy, hd in holes:
+        cx, cy = px(np.array([hx, hy]))
+        parts.append(
+            f'<circle class="hole" cx="{cx:.2f}" cy="{cy:.2f}" r="{hd / 2 * scale:.2f}"/>'
+        )
+        parts.append(
+            f'<text class="lbl" x="{cx:.2f}" y="{cy + hd / 2 * scale + 16:.2f}" '
+            f'text-anchor="middle">\u2300{hd:g} cutout</text>'
+        )
 
     # outline
     corners = [
@@ -430,6 +466,7 @@ def density_svg(
     pad: int = 46,
     n_steps: int = 7,
     max_height: int = 420,
+    structured: bool = True,
 ) -> str:
     """The optimized density field, one shading step per 1/7 of density.
 
@@ -437,6 +474,9 @@ def density_svg(
     the mean density through the width (side view), and, once the mesh is more
     than one element deep in a direction, the top and end views as well.  With
     one element through the width the side view is exactly the element field.
+    A body-fitted 3D mesh (unstructured in x-y, extruded in z) has no grid
+    columns across x or y, so it gets the side view only: each front element
+    shaded by the mean of the elements stacked behind it.
     """
     mesh_data = np.load(mesh_npz)
     nodes, cells = mesh_data["nodes"], mesh_data["cells"]
@@ -452,6 +492,20 @@ def density_svg(
             n_steps=n_steps,
             aria="Optimized density field of the cantilever beam",
             footer=footer,
+        )
+
+    if not structured:
+        xy, quads, front = _side_view(nodes, cells)
+        caption = PROJECTIONS["side"][3]
+        return _quad_field_svg(
+            nodes=xy,
+            quads=quads,
+            bins=_density_bins(_stack_means(nodes, cells, densities)[front], n_steps),
+            width=width,
+            pad=pad,
+            n_steps=n_steps,
+            aria=f"Optimized density, {caption}",
+            footer=f"{caption} — {footer}",
         )
 
     parts = []
@@ -476,6 +530,15 @@ def density_svg(
             )
         )
     return "\n".join(parts)
+
+
+def _stack_means(nodes: np.ndarray, cells: np.ndarray, field: np.ndarray) -> np.ndarray:
+    """Per element, the mean of ``field`` over the elements sharing its x-y
+    footprint — the stack through the width of an extruded hex mesh."""
+    keys = np.round(nodes[cells][:, :, :2].mean(axis=1), 6)
+    _, inverse = np.unique(keys, axis=0, return_inverse=True)
+    inverse = inverse.ravel()
+    return (np.bincount(inverse, weights=field) / np.bincount(inverse))[inverse]
 
 
 def _density_bins(values: np.ndarray, n_steps: int) -> np.ndarray:
@@ -727,7 +790,10 @@ def _stat_cards(summary: dict[str, Any], params: dict[str, Any]) -> str:
                 "Elements",
                 summary.get("n_elements", "-"),
                 f"{mesh.get('nelx', '?')} x {mesh.get('nely', '?')}"
-                + (f" x {mesh['nelz']} hexahedra" if "nelz" in mesh else " quads"),
+                + (f" x {mesh['nelz']} hexahedra" if "nelz" in mesh else " quads")
+                if mesh.get("mode", "structured") == "structured"
+                else "body-fitted "
+                + (f"hexahedra, {mesh['nelz']} layer(s) in z" if "nelz" in mesh else "quads"),
             ),
             (
                 "Nodes",
@@ -804,6 +870,77 @@ def _artifacts_html(run: dict[str, Any], copied: dict[str, str]) -> str:
     )
 
 
+def _cad_section(
+    geometry: dict[str, Any], params: dict[str, Any], copied: dict[str, str],
+    cad_image: str | None,
+) -> str:
+    """The CadQuery input (parameters and the script that ran) and its output."""
+    script = geometry.get("cad_script")
+    if not script and cad_image is None:
+        return ""
+    domain = params.get("domain", {})
+    three_d = params.get("dim") == 3
+    rows: list[tuple[str, Any]] = [
+        ("dimension", "3D solid box" if three_d else "2D planar face"),
+        ("length L, along x (mm)", domain.get("length")),
+        ("height H, along y (mm)", domain.get("height")),
+    ]
+    if three_d:
+        rows.append(("width W, along z (mm)", domain.get("width")))
+        rows.append(("volume (mm\u00b3)", geometry.get("solid_volume", domain.get("volume"))))
+    else:
+        rows.append(("thickness, solver only (mm)", domain.get("thickness")))
+        rows.append(("area (mm\u00b2)", geometry.get("face_area", domain.get("area"))))
+    holes = domain.get("holes") or []
+    rows.append((
+        "cutouts through z (x, y, \u2300 mm)",
+        "; ".join(f"({x:g}, {y:g}, \u2300{d:g})" for x, y, d in holes) if holes else "none",
+    ))
+    rows.append(("parameters from", geometry.get("cad_config") or "command-line flags / defaults"))
+
+    image = ""
+    if cad_image is not None:
+        shape = "box" if three_d else "planar face"
+        image = (
+            f"<figure><img src='{_e(cad_image)}' alt='Shaded view of the CadQuery design"
+            f" domain: a {_e(domain.get('length'))} by {_e(domain.get('height'))} mm {shape}'>"
+            "<figcaption>The CadQuery output, read back from <code>design_domain.brep</code> and"
+            " rendered by <code>topocombo.cadview</code>"
+            + (
+                ". Gmsh meshes its envelope; the elements inside the cutouts are held void."
+                if holes else " — the exact shape Gmsh meshed."
+            )
+            + "</figcaption>"
+            "</figure>"
+        )
+    table = f"<div>{_kv_table(rows)}</div>"
+    code = ""
+    if script:
+        link = copied.get("design_domain.py")
+        code = (
+            "<div class='script'><div class='head'>"
+            "<span><code>design_domain.py</code> — the CadQuery input, exactly as it ran</span>"
+            + (f"<a href='{_e(link)}' download>download</a>" if link else "")
+            + f"</div><pre><code>{_e(script)}</code></pre></div>"
+        )
+    return (
+        "<h2>Geometry (CadQuery)</h2>"
+        "<p class='lede'>The design domain is built by running a generated CadQuery script, so"
+        " the input to CAD is explicit and reproducible: the parameters on the left are written"
+        " into the script below, which also opens as-is in CQ-editor. Set them with flags or a"
+        " <code>--cad-config</code> JSON / TOML file.</p>"
+        f"<div class='cad'>{table}{image}</div>"
+        + code
+    )
+
+
+def _mesh_step_data(run: dict[str, Any]) -> dict[str, Any]:
+    for step in run.get("steps", []):
+        if step.get("name") == "meshing":
+            return step.get("data", {})
+    return {}
+
+
 def render_html(
     run: dict[str, Any],
     svg: str,
@@ -811,6 +948,8 @@ def render_html(
     solve_figure: tuple[str, list[float]] | None = None,
     density_figure: str | None = None,
     history: list[dict[str, float]] | None = None,
+    cad_image: str | None = None,
+    topology_image: str | None = None,
 ) -> str:
     params = run.get("params", {})
     domain = params.get("domain", {})
@@ -828,8 +967,11 @@ def render_html(
     summary: dict[str, Any] = {}
     solve: dict[str, Any] = {}
     optimization: dict[str, Any] = {}
+    geometry: dict[str, Any] = {}
     for step in run.get("steps", []):
-        if step.get("name") == "validation":
+        if step.get("name") == "geometry":
+            geometry = step.get("data", {})
+        elif step.get("name") == "validation":
             summary = step.get("data", {})
         elif step.get("name") == "solve":
             solve = step.get("data", {})
@@ -849,6 +991,19 @@ def render_html(
             f" (all {n_fixed} nodes, both DOFs); the tip load acts downwards at the"
             " mid-height node of the free edge."
         )
+    if summary.get("mesh_mode") == "body-fitted":
+        mesh_caption = mesh_caption.replace(
+            "every hexahedron", "every hexahedron of the body-fitted mesh"
+        ).replace("Every quad", "Every quad of the body-fitted mesh") + (
+            " The mesh follows the CAD boundary, so the dashed cutout is a real hole in it."
+            if params.get("domain", {}).get("holes") else ""
+        )
+    if summary.get("passive_elements"):
+        mesh_caption += (
+            f" The {_e(summary['passive_elements'])} elements whose centres fall inside the"
+            " dashed CAD cutout are drawn empty: the grid still covers them, but the optimizer"
+            " holds them void."
+        )
 
     chips = [f"run {run.get('started_at', '')}", f"{run.get('duration_s', 0):.2f} s total"]
     chips += [f"{name} {version}" for name, version in tools.items()]
@@ -859,8 +1014,13 @@ def render_html(
         ("beam height H (mm)", domain.get("height")),
         ("out-of-plane thickness (mm)", domain.get("thickness")),
         ("aspect ratio L/H", domain.get("aspect_ratio")),
-        ("elements along x (nelx)", mesh.get("nelx")),
-        ("elements along y (nely)", mesh.get("nely")),
+        ("mesh mode", mesh.get("mode", "structured")),
+        *(
+            [("elements along x (nelx)", mesh.get("nelx")),
+             ("elements along y (nely)", mesh.get("nely"))]
+            if mesh.get("mode", "structured") == "structured"
+            else [("target element size (mm)", _mesh_step_data(run).get("element_size"))]
+        ),
         ("load point (mm)", domain.get("load_point")),
         ("tip load node index", summary.get("load_node")),
         ("fixed node set size", summary.get("node_sets", {}).get("fixed")),
@@ -945,6 +1105,16 @@ def render_html(
                 "</figcaption>"
                 "</figure>"
             )
+        topology_fig = ""
+        if topology_image is not None:
+            topology_fig = (
+                f"<figure><img src='{_e(topology_image)}' alt='Shaded 3D view of the optimized"
+                " topology'>"
+                "<figcaption>The optimized design as a solid: every element at density"
+                " \u2265 0.5, read back from <code>topology.stl</code> — the file to take into"
+                " Blender or CAD. It is blocky by construction; each step is one element."
+                "</figcaption></figure>"
+            )
         optimization_section = (
             "<h2>Topology optimization</h2>"
             "<p class='lede'>SIMP compliance minimisation under a volume constraint:"
@@ -953,6 +1123,7 @@ def render_html(
             f" {_e(simp.get('move_limit', ''))} move limit.</p>"
             + _optimization_cards(optimization, solve)
             + density_fig
+            + topology_fig
             + charts
         )
 
@@ -983,6 +1154,8 @@ def render_html(
 
 <h2>Result</h2>
 {_stat_cards(summary, params)}
+
+{_cad_section(geometry, params, copied, cad_image)}
 
 <h2>Mesh</h2>
 <figure>
@@ -1053,19 +1226,36 @@ def build_site(run_dir: Path, site_dir: Path) -> Path:
 
     mesh_npz = run_dir / "mesh" / "mesh.npz"
     solution_npz = run_dir / "solution" / "solution.npz"
-    svg = mesh_svg(mesh_npz)
+    svg = mesh_svg(mesh_npz, holes=run.get("params", {}).get("domain", {}).get("holes", ()))
     solve_figure = (
         solution_svg(mesh_npz, solution_npz) if solution_npz.exists() else None
     )
 
     density_npz = run_dir / "optimization" / "density.npz"
-    density_figure = density_svg(mesh_npz, density_npz) if density_npz.exists() else None
+    structured = run.get("params", {}).get("mesh", {}).get("mode", "structured") == "structured"
+    density_figure = (
+        density_svg(mesh_npz, density_npz, structured=structured) if density_npz.exists() else None
+    )
 
     history_csv = run_dir / "optimization" / "log.csv"
     history = read_history(history_csv) if history_csv.exists() else None
 
+    from .cadview import render_brep, render_stl
+
+    cad_image = topology_image = None
+    brep = run_dir / "cad" / "design_domain.brep"
+    if brep.exists():
+        render_brep(brep, site_dir / "figures" / "cad_domain.png")
+        cad_image = "figures/cad_domain.png"
+    stl = run_dir / "optimization" / "topology.stl"
+    if stl.exists():
+        render_stl(stl, site_dir / "figures" / "topology.png")
+        topology_image = "figures/topology.png"
+
     index = site_dir / "index.html"
     index.write_text(
-        render_html(run, svg, copied, solve_figure, density_figure, history)
+        render_html(
+            run, svg, copied, solve_figure, density_figure, history, cad_image, topology_image
+        )
     )
     return index

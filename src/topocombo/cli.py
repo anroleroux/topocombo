@@ -6,29 +6,92 @@ import argparse
 import sys
 from pathlib import Path
 
-from .geometry import BeamDomain, BeamDomain3D
-from .meshing import MeshSpec, MeshSpec3D
+from .geometry import BeamDomain, BeamDomain3D, load_cad_config
+from .meshing import MESH_MODES, MeshSpec, MeshSpec3D
+
+#: CadQuery inputs and their defaults.  The flags default to None so an
+#: explicit flag can be told apart from a value read from --cad-config:
+#: flag > config file > these defaults.
+CAD_DEFAULTS = {
+    "dim": 2, "length": 60.0, "height": 20.0, "thickness": 1.0, "width": 1.0, "holes": (),
+}
 
 
-def _add_model_args(p: argparse.ArgumentParser) -> None:
+def _hole(text: str) -> tuple[float, float, float]:
+    """``X,Y,D`` -> (x, y, diameter)."""
+    try:
+        x, y, d = (float(v) for v in text.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected X,Y,DIAMETER in mm, not {text!r}") from None
+    return x, y, d
+
+
+def _add_cad_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--cad-config",
+        type=Path,
+        default=None,
+        help="JSON or TOML file with the CadQuery inputs (dim, length, height, thickness,"
+        " width, holes); flags given on the command line override it",
+    )
     p.add_argument(
         "--dim",
         type=int,
         choices=(2, 3),
-        default=2,
+        default=None,
         help="2: plane-stress quads; 3: solid hexahedra (default: 2)",
     )
-    p.add_argument("--length", type=float, default=60.0, help="beam length in mm (default: 60)")
-    p.add_argument("--height", type=float, default=20.0, help="beam height in mm (default: 20)")
+    p.add_argument("--length", type=float, default=None, help="beam length in mm (default: 60)")
+    p.add_argument("--height", type=float, default=None, help="beam height in mm (default: 20)")
     p.add_argument(
         "--thickness",
         type=float,
-        default=1.0,
+        default=None,
         help="2D only: out-of-plane thickness in mm (default: 1)",
     )
     p.add_argument(
-        "--width", type=float, default=1.0, help="3D only: beam width along z in mm (default: 1)"
+        "--width", type=float, default=None, help="3D only: beam width along z in mm (default: 1)"
     )
+    p.add_argument(
+        "--hole",
+        dest="holes",
+        type=_hole,
+        action="append",
+        default=None,
+        metavar="X,Y,D",
+        help="circular cutout through z, diameter D centred at (X, Y) in mm; repeatable,"
+        " and replaces any holes from --cad-config (default: none)",
+    )
+
+
+def _resolve_cad_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Fill the CadQuery inputs in ``args``: flag, else config file, else default."""
+    config: dict = {}
+    if args.cad_config is not None:
+        try:
+            config = load_cad_config(args.cad_config)
+        except (OSError, ValueError) as exc:
+            parser.error(f"--cad-config: {exc}")
+    for key, default in CAD_DEFAULTS.items():
+        if getattr(args, key) is None:
+            setattr(args, key, config.get(key, default))
+
+
+def _domain(parser: argparse.ArgumentParser, args: argparse.Namespace) -> BeamDomain | BeamDomain3D:
+    try:
+        if args.dim == 3:
+            return BeamDomain3D(
+                length=args.length, height=args.height, width=args.width, holes=args.holes
+            )
+        return BeamDomain(
+            length=args.length, height=args.height, thickness=args.thickness, holes=args.holes
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+
+def _add_model_args(p: argparse.ArgumentParser) -> None:
+    _add_cad_args(p)
     p.add_argument("--nelx", type=int, default=60, help="elements along the length (default: 60)")
     p.add_argument("--nely", type=int, default=20, help="elements through the height (default: 20)")
     p.add_argument(
@@ -36,6 +99,22 @@ def _add_model_args(p: argparse.ArgumentParser) -> None:
         type=int,
         default=1,
         help="3D only: elements through the width (default: 1, keeps runs light)",
+    )
+    p.add_argument(
+        "--mesh",
+        dest="mesh_mode",
+        choices=MESH_MODES,
+        default="structured",
+        help="structured: transfinite grid over the envelope, cutouts held void;"
+        " body-fitted: unstructured quads (extruded hexes in 3D) of the real CAD"
+        " profile, cutouts included (default: structured)",
+    )
+    p.add_argument(
+        "--mesh-size",
+        type=float,
+        default=None,
+        help="body-fitted only: target element edge in mm"
+        " (default: the structured cell size, min(L/nelx, H/nely))",
     )
     p.add_argument(
         "--youngs", type=float, default=210_000.0, help="Young's modulus in MPa (default: 210000)"
@@ -82,6 +161,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p_cad = sub.add_parser(
+        "cad",
+        help="build only the CadQuery design domain: script, BREP, STEP and a PNG preview",
+    )
+    _add_cad_args(p_cad)
+    p_cad.add_argument(
+        "--out",
+        type=Path,
+        default=Path("results/cad"),
+        help="directory for the CAD files (default: results/cad)",
+    )
+
     p_run = sub.add_parser("run", help="mesh, solve and optimize the design domain")
     _add_model_args(p_run)
 
@@ -94,18 +185,34 @@ def main(argv: list[str] | None = None) -> int:
     p_all.add_argument("--site", type=Path, default=Path("site"))
 
     args = parser.parse_args(argv)
+    if args.command in ("cad", "run", "all"):
+        _resolve_cad_args(parser, args)
+
+    if args.command == "cad":
+        from .cadview import render_brep
+        from .geometry import export_domain
+
+        domain = _domain(parser, args)
+        print(domain.cadquery_script())
+        exported = export_domain(domain, args.out)
+        exported["png"] = render_brep(exported["brep"], args.out / "design_domain.png")
+        for kind, path in exported.items():
+            print(f"{kind}: {path}")
 
     if args.command in ("run", "all"):
         from .fea import Material
         from .optimize import SimpParams
         from .pipeline import run
 
-        if args.dim == 3:
-            domain = BeamDomain3D(length=args.length, height=args.height, width=args.width)
-            spec = MeshSpec3D(nelx=args.nelx, nely=args.nely, nelz=args.nelz)
-        else:
-            domain = BeamDomain(length=args.length, height=args.height, thickness=args.thickness)
-            spec = MeshSpec(nelx=args.nelx, nely=args.nely)
+        domain = _domain(parser, args)
+        mesh_opts = {"mode": args.mesh_mode, "size": args.mesh_size}
+        try:
+            if args.dim == 3:
+                spec = MeshSpec3D(nelx=args.nelx, nely=args.nely, nelz=args.nelz, **mesh_opts)
+            else:
+                spec = MeshSpec(nelx=args.nelx, nely=args.nely, **mesh_opts)
+        except ValueError as exc:
+            parser.error(str(exc))
         material = Material(youngs_modulus=args.youngs, poisson_ratio=args.poisson)
         simp = SimpParams(
             volume_fraction=args.volfrac,
@@ -123,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
             load_fy=args.load,
             simp=simp,
             optimize_design=not args.no_optimize,
+            cad_config=args.cad_config,
         )
 
     if args.command in ("report", "all"):

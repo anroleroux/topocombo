@@ -47,6 +47,7 @@ def test_cad_artifacts_written(coarse_run):
     cad = coarse_run["dir"] / "cad"
     assert (cad / "design_domain.brep").exists()
     assert (cad / "design_domain.step").exists()
+    assert (cad / "design_domain.py").read_text() == coarse_run["domain"].cadquery_script()
 
 
 def test_mesh_counts_match_spec(coarse_run):
@@ -1077,3 +1078,301 @@ def test_density_figure_adds_top_and_end_views_only_for_deep_meshes(tmp_path):
         np.savez(tmp_path / f"rho{nz}.npz", densities=np.linspace(0, 1, mesh.n_elements))
         svg = density_svg(tmp_path / f"mesh{nz}.npz", tmp_path / f"rho{nz}.npz")
         assert svg.count("<svg") == expected
+
+
+# --------------------------------------------------------------------------
+# CadQuery input control and CAD pictures in the report
+# --------------------------------------------------------------------------
+import html as html_lib  # noqa: E402
+
+from topocombo.cadview import _weld, feature_edges, render_triangles, shape_triangles  # noqa: E402
+from topocombo.geometry import load_cad_config, run_cadquery_script  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "domain", [BeamDomain(length=7.0, height=3.0), BeamDomain3D(length=7.0, height=3.0, width=2.0)]
+)
+def test_the_exported_script_rebuilds_the_domain(domain, tmp_path):
+    """The script is the CadQuery input: running it on its own gives the same shape."""
+    script = domain.cadquery_script()
+    assert "length = 7.0" in script and "height = 3.0" in script
+    shape = run_cadquery_script(script).val()
+    bb = shape.BoundingBox()
+    assert (bb.xmin, bb.ymin, bb.zmin) == pytest.approx((0.0, 0.0, 0.0))
+    assert (bb.xmax, bb.ymax) == pytest.approx((7.0, 3.0))
+    if isinstance(domain, BeamDomain3D):
+        assert bb.zmax == pytest.approx(2.0)
+        assert shape.Volume() == pytest.approx(domain.volume)
+    else:
+        assert shape.Area() == pytest.approx(domain.area)
+
+
+def test_a_script_without_a_result_is_rejected():
+    with pytest.raises(ValueError, match="result"):
+        run_cadquery_script("import cadquery as cq\nbox = cq.Workplane().box(1, 1, 1)\n")
+
+
+def test_cad_config_reads_json_and_toml(tmp_path):
+    (tmp_path / "a.json").write_text('{"cad": {"dim": 3, "length": 30, "width": 2.5}}')
+    (tmp_path / "b.toml").write_text("dim = 2\nheight = 8\nthickness = 0.5\n")
+    assert load_cad_config(tmp_path / "a.json") == {"dim": 3, "length": 30.0, "width": 2.5}
+    assert load_cad_config(tmp_path / "b.toml") == {"dim": 2, "height": 8.0, "thickness": 0.5}
+
+
+@pytest.mark.parametrize(
+    "text, message",
+    [
+        ('{"lenght": 30}', "unknown CAD parameter"),
+        ('{"length": -1}', "positive"),
+        ('{"height": "20"}', "number"),
+        ('{"dim": 4}', "dim"),
+        ("[1, 2]", "table"),
+    ],
+)
+def test_cad_config_rejects_bad_input(tmp_path, text, message):
+    path = tmp_path / "cad.json"
+    path.write_text(text)
+    with pytest.raises(ValueError, match=message):
+        load_cad_config(path)
+
+
+def test_cli_flags_override_the_cad_config(tmp_path, capsys):
+    config = tmp_path / "cad.toml"
+    config.write_text("[cad]\ndim = 3\nlength = 9\nheight = 3\nwidth = 2\n")
+    out = tmp_path / "cad"
+    assert cli_main(["cad", "--cad-config", str(config), "--width", "4", "--out", str(out)]) == 0
+    script = (out / "design_domain.py").read_text()
+    assert "length = 9.0" in script and "width = 4.0" in script
+    assert (out / "design_domain.png").read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    assert "cq.Workplane" in capsys.readouterr().out
+
+
+def test_cli_rejects_a_bad_cad_config(tmp_path):
+    config = tmp_path / "cad.json"
+    config.write_text('{"lenght": 9}')
+    with pytest.raises(SystemExit):
+        cli_main(["cad", "--cad-config", str(config), "--out", str(tmp_path / "cad")])
+
+
+def test_a_box_has_twelve_feature_edges():
+    points, triangles = shape_triangles(BeamDomain3D(length=3.0, height=2.0, width=1.0).solid())
+    points, triangles = _weld(points, triangles)
+    edges, sides = feature_edges(points, triangles)
+    assert edges.shape == (12, 2)
+    assert np.all(sides >= 0)  # a closed solid: every edge has two faces
+
+
+def test_render_writes_a_png(tmp_path):
+    points, triangles = shape_triangles(BeamDomain(length=3.0, height=2.0).face())
+    png = render_triangles(points, triangles, tmp_path / "face.png", two_sided=True)
+    assert png.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+@pytest.mark.parametrize("which", ["coarse_run", "coarse_run_3d"])
+def test_report_prints_the_cadquery_input_and_shows_the_cad_output(which, request, tmp_path):
+    run_info = request.getfixturevalue(which)
+    site = tmp_path / "site"
+    html = build_site(run_dir=run_info["dir"], site_dir=site).read_text()
+    assert "Geometry (CadQuery)" in html
+    script = html_lib.escape(run_info["domain"].cadquery_script())
+    assert script in html
+    assert "figures/cad_domain.png" in html and "figures/topology.png" in html
+    assert (site / "figures" / "cad_domain.png").stat().st_size > 0
+    assert (site / "figures" / "topology.png").stat().st_size > 0
+    assert (site / "artifacts" / "design_domain.py").exists()
+
+
+
+# --------------------------------------------------------------------------
+# circular cutouts through z
+# --------------------------------------------------------------------------
+import cadquery as cq  # noqa: E402
+
+HOLE = (20.0, 10.0, 10.0)
+
+
+@pytest.mark.parametrize("cls", [BeamDomain, BeamDomain3D])
+def test_cutout_is_cut_from_the_cad_model(cls):
+    domain = cls(holes=[HOLE])
+    shape = domain.workplane().val()
+    hole_area = np.pi * 5.0**2
+    if cls is BeamDomain3D:
+        assert isinstance(shape, cq.Solid)
+        assert shape.Volume() == pytest.approx(domain.volume - hole_area * domain.width)
+        assert domain.material_volume == pytest.approx(shape.Volume())
+    else:
+        assert isinstance(shape, cq.Face)
+        assert shape.Area() == pytest.approx(domain.area - hole_area)
+        assert domain.material_area == pytest.approx(shape.Area())
+    assert "holes = [(20.0, 10.0, 10.0)]" in domain.cadquery_script()
+    assert domain.envelope().holes == ()
+
+
+@pytest.mark.parametrize(
+    "hole, message",
+    [((58.0, 10.0, 10.0), "fit"), ((20.0, 10.0, 0.0), "positive"), ((20.0, 10.0), "diameter")],
+)
+def test_cutouts_must_fit_inside_the_domain(hole, message):
+    with pytest.raises(ValueError, match=message):
+        BeamDomain3D(holes=[hole])
+
+
+def test_overlapping_cutouts_are_rejected():
+    with pytest.raises(ValueError, match="overlap"):
+        BeamDomain(holes=[(20.0, 10.0, 10.0), (26.0, 10.0, 4.0)])
+
+
+def test_void_mask_picks_the_centroids_inside_the_cutout():
+    domain = BeamDomain(holes=[HOLE])
+    centroids = np.array([[20.0, 10.0], [24.9, 10.0], [25.1, 10.0], [50.0, 10.0]])
+    assert domain.void_mask(centroids).tolist() == [True, True, False, False]
+
+
+def test_cad_config_reads_hole_tables(tmp_path):
+    path = tmp_path / "cad.toml"
+    path.write_text("[cad]\ndim = 3\n[[cad.holes]]\nx = 20\ny = 10\ndiameter = 10\n")
+    assert load_cad_config(path) == {"dim": 3, "holes": (HOLE,)}
+    (tmp_path / "cad.json").write_text('{"holes": [[20, 10, 10]]}')
+    assert load_cad_config(tmp_path / "cad.json") == {"holes": (HOLE,)}
+    (tmp_path / "bad.json").write_text('{"holes": [{"x": 20, "y": 10, "d": 10}]}')
+    with pytest.raises(ValueError, match="unknown: d"):
+        load_cad_config(tmp_path / "bad.json")
+
+
+def test_passive_elements_stay_void_and_the_volume_holds():
+    mesh = _brick_grid(8, 4, 1)
+    mesh.node_sets[PHYS_FIXED] = np.flatnonzero(mesh.nodes[:, 0] == 0.0)
+    tip = int(np.flatnonzero((mesh.nodes[:, 0] == 8.0) & (mesh.nodes[:, 1] == 2.0))[0])
+    passive = np.zeros(mesh.n_elements, dtype=bool)
+    passive[:4] = True  # the column of elements next to the clamp
+    for filter_type in ("sensitivity", "density"):
+        design = optimize(
+            mesh, Material(), 1.0, LoadCase(node=tip, fy=-10.0), PHYS_FIXED,
+            SimpParams(max_iterations=8, filter_type=filter_type, filter_radius=1.5),
+            passive=passive,
+        )
+        assert np.all(design.densities[passive] == 0.0)
+        assert design.volume_fraction == pytest.approx(0.5, abs=1e-6)
+
+
+@pytest.fixture(scope="module")
+def holed_run_3d(tmp_path_factory):
+    out = tmp_path_factory.mktemp("holed3d")
+    domain = BeamDomain3D(length=24.0, height=8.0, width=1.0, holes=[(8.0, 4.0, 4.0)])
+    spec = MeshSpec3D(nelx=24, nely=8, nelz=1)
+    _, summary = run(domain=domain, spec=spec, out_dir=out,
+                     simp=SimpParams(max_iterations=6), echo=False)
+    return {"dir": out, "domain": domain, "summary": summary}
+
+
+def test_pipeline_holds_the_cutout_void(holed_run_3d):
+    out, summary = holed_run_3d["dir"], holed_run_3d["summary"]
+    assert summary["all_checks_passed"]
+    assert (out / "cad" / "design_envelope.brep").exists()
+    passive = np.load(out / "mesh" / "mesh.npz")["passive"]
+    assert passive.sum() == summary["passive_elements"] > 0
+    assert summary["passive_measure"] == pytest.approx(summary["cutout_measure"], rel=0.25)
+    densities = np.load(out / "optimization" / "density.npz")["densities"]
+    assert np.all(densities[passive] == 0.0)
+
+
+def test_report_shows_the_cutout(holed_run_3d, tmp_path):
+    html = build_site(run_dir=holed_run_3d["dir"], site_dir=tmp_path / "site").read_text()
+    assert 'class="hole"' in html and "held void" in html
+    assert "(8, 4, ⌀4)" in html
+
+
+# --------------------------------------------------------------------------
+# body-fitted meshing: the CAD profile, cutouts included
+# --------------------------------------------------------------------------
+from topocombo.mesh_io import check_mesh  # noqa: E402
+
+
+@pytest.fixture(scope="module", params=[2, 3], ids=["2d", "3d"])
+def fitted_run(request, tmp_path_factory):
+    out = tmp_path_factory.mktemp(f"fitted{request.param}d")
+    holes = [(8.0, 4.0, 4.0)]
+    if request.param == 3:
+        domain = BeamDomain3D(length=24.0, height=8.0, width=1.0, holes=holes)
+        spec = MeshSpec3D(nelx=24, nely=8, nelz=2, mode="body-fitted")
+    else:
+        domain = BeamDomain(length=24.0, height=8.0, holes=holes)
+        spec = MeshSpec(nelx=24, nely=8, mode="body-fitted")
+    _, summary = run(domain=domain, spec=spec, out_dir=out,
+                     simp=SimpParams(max_iterations=6), echo=False)
+    return {"dir": out, "domain": domain, "spec": spec, "summary": summary}
+
+
+def test_mesh_spec_rejects_an_unknown_mode_and_a_bad_size():
+    with pytest.raises(ValueError, match="mode"):
+        MeshSpec(mode="tetra")
+    with pytest.raises(ValueError, match="size"):
+        MeshSpec3D(mode="body-fitted", size=0.0)
+    assert MeshSpec(mode="body-fitted").n_elements is None
+    assert MeshSpec(nelx=30, nely=10, mode="body-fitted").element_size(BeamDomain()) == 2.0
+
+
+def test_fitted_mesh_follows_the_cad_boundary(fitted_run):
+    domain, summary = fitted_run["domain"], fitted_run["summary"]
+    assert summary["all_checks_passed"] and summary["mesh_mode"] == "body-fitted"
+    mesh = load_mesh(fitted_run["dir"] / "mesh" / "beam.msh")
+    cad = domain.material_volume if mesh.dim == 3 else domain.material_area
+    # straight chords over the arc: slightly more than the CAD, never less
+    assert cad < mesh.cell_measures().sum() < cad * (1 + 5e-3)
+    centroids = mesh.nodes[mesh.cells].mean(axis=1)
+    assert not domain.void_mask(centroids).any()  # nothing is meshed inside the hole
+    assert "passive" not in np.load(fitted_run["dir"] / "mesh" / "mesh.npz")
+    r = np.hypot(mesh.nodes[:, 0] - 8.0, mesh.nodes[:, 1] - 4.0)
+    assert r.min() == pytest.approx(2.0, abs=1e-6)  # nodes sit on the hole's edge
+
+
+def test_fitted_mesh_puts_the_load_on_real_nodes(fitted_run):
+    domain, summary = fitted_run["domain"], fitted_run["summary"]
+    mesh = load_mesh(fitted_run["dir"] / "mesh" / "beam.msh")
+    loaded = mesh.nodes[summary["load_nodes"]]
+    assert np.allclose(loaded[:, :2], domain.load_point[:2])
+    if mesh.dim == 3:
+        assert len(summary["load_nodes"]) == fitted_run["spec"].nelz + 1
+        assert mesh.cell_type == "hexahedron"
+    assert summary["solve"]["reaction_y"] == pytest.approx(1000.0, rel=1e-9)
+
+
+def test_fitted_run_optimizes_and_reports(fitted_run, tmp_path):
+    opt = fitted_run["summary"]["optimization"]
+    assert opt["iterations"] == 6
+    assert opt["volume_fraction"] == pytest.approx(0.5, abs=1e-6)
+    html = build_site(run_dir=fitted_run["dir"], site_dir=tmp_path / "site").read_text()
+    assert "body-fitted" in html and "real hole" in html
+
+
+def test_check_mesh_rejects_a_fitted_mesh_that_misses_the_cutout(coarse_run):
+    """The structured coarse mesh covers the hole, so as a body-fitted mesh of a
+    holed domain its area is too large."""
+    mesh = load_mesh(coarse_run["dir"] / "mesh" / "beam.msh")
+    holed = BeamDomain(length=12.0, height=4.0, holes=[(6.0, 2.0, 2.0)])
+    summary = check_mesh(mesh, holed, expected_elements=None)
+    assert not summary["checks"]["area_sum_matches_cad"]
+
+
+def test_filter_weighs_neighbours_by_size_only_on_non_uniform_meshes():
+    uniform = _brick_grid(3, 1, 1)
+    h, _ = build_filter(uniform, 1.5)
+    assert np.allclose(h.toarray(), h.toarray().T)
+    stretched = _brick_grid(3, 1, 1)
+    stretched.nodes[stretched.nodes[:, 0] == 3.0, 0] = 5.0  # last element twice as long
+    h, hs = build_filter(stretched, 1.5)
+    dense = h.toarray()
+    assert dense[1, 2] == pytest.approx(2 * dense[2, 1] * dense[1, 1] / dense[2, 2])
+
+
+def test_cli_runs_a_body_fitted_mesh(tmp_path):
+    out = tmp_path / "cli_fitted"
+    code = cli_main([
+        "run", "--dim", "3", "--length", "12", "--height", "4", "--hole", "4,2,2",
+        "--mesh", "body-fitted", "--mesh-size", "0.5", "--no-optimize", "--out", str(out),
+    ])
+    assert code == 0
+    run_json = json.loads((out / "run.json").read_text())
+    assert run_json["params"]["mesh"]["mode"] == "body-fitted"
+    assert run_json["params"]["mesh"]["size"] == 0.5
+    assert (out / "cad" / "design_profile.brep").exists()

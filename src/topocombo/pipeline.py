@@ -34,11 +34,13 @@ from .meshing import (
     PHYS_LOAD,
     MeshSpec,
     MeshSpec3D,
+    generate_fitted_mesh,
     generate_hex_mesh,
     generate_quad_mesh,
 )
 from .optimize import (
     SimpParams,
+    element_centroids,
     optimize,
     save_density_field,
     save_design,
@@ -58,8 +60,13 @@ def run(
     optimize_design: bool = True,
     snapshot_every: int = 10,
     echo: bool = True,
+    cad_config: Path | None = None,
 ) -> tuple[RunLog, dict[str, Any]]:
-    """Mesh the domain, solve it at full density, then run the SIMP loop."""
+    """Mesh the domain, solve it at full density, then run the SIMP loop.
+
+    ``cad_config`` is only recorded: the file the domain's parameters were read
+    from, if any (see :func:`topocombo.geometry.load_cad_config`).
+    """
     three_d = isinstance(domain, BeamDomain3D)
     if three_d != isinstance(spec, MeshSpec3D):
         raise TypeError("a 3D domain needs a MeshSpec3D, a 2D domain a MeshSpec")
@@ -105,7 +112,9 @@ def run(
                 f"z = {z0:g} .. {z1:g}"
             )
             solid = domain.solid()
-            log.log(f"solid volume: {solid.Volume():.3f} mm^3 (expected {domain.volume:.3f})")
+            log.log(
+                f"solid volume: {solid.Volume():.3f} mm^3 (expected {domain.material_volume:.3f})"
+            )
             cad_record = {"solid_volume": solid.Volume()}
         else:
             log.log(
@@ -115,31 +124,73 @@ def run(
             )
             log.log(f"clamped edge: x = 0; tip load applied at {domain.load_point}")
             face = domain.face()
-            log.log(f"planar face area: {face.Area():.3f} mm^2 (expected {domain.area:.3f})")
+            log.log(
+                f"planar face area: {face.Area():.3f} mm^2 (expected {domain.material_area:.3f})"
+            )
             cad_record = {"face_area": face.Area()}
+        for x, y, d in domain.holes:
+            log.log(f"cutout through z: diameter {d:g} mm at x = {x:g}, y = {y:g}")
+        if cad_config is not None:
+            log.log(f"CAD parameters read from {cad_config}")
         exported = export_domain(domain, out_dir / "cad")
+        log.log("built by running the generated CadQuery script (shown in the report)")
+        descriptions = {
+            "script": "design domain, the CadQuery script that built it (runs in CQ-editor)",
+            "brep": "design domain, BREP format",
+            "step": "design domain, STEP format",
+            "envelope": "design envelope without cutouts, BREP format"
+            + (" — what Gmsh meshes" if spec.structured else " (for the structured mesh mode)"),
+        }
         for kind, path in exported.items():
-            log.artifact(path, f"design domain, {kind.upper()} format")
-        log.record(**cad_record, **domain.as_dict())
+            log.artifact(path, descriptions[kind])
+        log.record(
+            **cad_record,
+            **domain.as_dict(),
+            cad_script=domain.cadquery_script(),
+            cad_config=None if cad_config is None else str(cad_config),
+        )
 
     cells_word = "hexahedra" if three_d else "quadrilaterals"
-    with log.step("meshing", f"2. Mesh with Gmsh (structured {cells_word})"):
-        grid = f"{spec.nelx} x {spec.nely}" + (f" x {spec.nelz}" if three_d else "")
-        log.log(
-            f"transfinite grid: {grid} = {spec.n_elements} {cells_word}, "
-            f"{spec.n_nodes} nodes expected"
-        )
-        mesher = generate_hex_mesh if three_d else generate_quad_mesh
+    kind = "structured" if spec.structured else "body-fitted"
+    with log.step("meshing", f"2. Mesh with Gmsh ({kind} {cells_word})"):
+        if spec.structured:
+            grid = f"{spec.nelx} x {spec.nely}" + (f" x {spec.nelz}" if three_d else "")
+            log.log(
+                f"transfinite grid: {grid} = {spec.n_elements} {cells_word}, "
+                f"{spec.n_nodes} nodes expected"
+            )
+            if domain.holes:
+                log.log(
+                    "the structured grid covers the whole envelope; elements inside the "
+                    "cutouts are held void by the optimizer"
+                )
+            mesher = generate_hex_mesh if three_d else generate_quad_mesh
+            brep = exported.get("envelope", exported["brep"])
+        else:
+            mesher = generate_fitted_mesh
+            if three_d:  # the hexes are extruded from a mesh of the x-y profile
+                brep = out_dir / "cad" / "design_profile.brep"
+                BeamDomain(
+                    length=domain.length, height=domain.height, holes=domain.holes
+                ).face().exportBrep(str(brep))
+                log.artifact(brep, "x-y profile of the design domain, BREP — what Gmsh meshes")
+            else:
+                brep = exported["brep"]
+            log.log(
+                "body-fitted: the mesh follows the CAD boundary, cutouts included"
+                if domain.holes else "body-fitted: the mesh follows the CAD boundary"
+            )
         msh_path, _ = mesher(
             domain=domain,
             spec=spec,
-            brep_path=exported["brep"],
+            brep_path=brep,
             out_dir=out_dir / "mesh",
             log=log,
         )
         mesh_word = "hexahedral" if three_d else "quadrilateral"
         log.artifact(msh_path, f"{mesh_word} mesh with physical groups (Gmsh 2.2 ASCII)")
-        log.record(**spec.as_dict())
+        size = None if spec.structured else spec.element_size(domain)
+        log.record(**spec.as_dict(), element_size=size)
 
     with log.step("validation", "3. Load the mesh and check it"):
         mesh = load_mesh(msh_path)
@@ -152,10 +203,27 @@ def run(
         else:
             load_nodes = np.array([find_node(mesh, domain.load_point)])
         load_node = int(load_nodes[0])
+        miss = float(np.linalg.norm(mesh.nodes[load_node][:2] - np.asarray(domain.load_point[:2])))
+        if miss > 1e-6 * domain.length:
+            raise RuntimeError(f"no mesh node at the load point ({miss:.3g} mm away)")
         summary = check_mesh(mesh, domain, expected_elements=spec.n_elements)
+        summary["mesh_mode"] = spec.mode
         summary["load_node"] = load_node
         summary["load_nodes"] = [int(n) for n in load_nodes]
         summary["load_node_coords"] = [float(c) for c in mesh.nodes[load_node]]
+        if spec.structured:
+            passive = domain.void_mask(element_centroids(mesh))
+        else:  # the cutouts are not meshed at all
+            passive = np.zeros(mesh.n_elements, dtype=bool)
+        if passive.any():
+            measures = mesh.cell_measures()
+            if three_d:
+                cut = domain.volume - domain.material_volume
+            else:
+                cut = domain.area - domain.material_area
+            summary["passive_elements"] = int(passive.sum())
+            summary["passive_measure"] = float(measures[passive].sum())
+            summary["cutout_measure"] = float(cut)
 
         log.log(f"{summary['n_nodes']} nodes, {summary['n_elements']} {cells_word}, {summary['n_dofs']} DOFs")
         log.log(
@@ -165,11 +233,19 @@ def run(
         )
         m, unit = mesh.measure_name, "mm^3" if three_d else "mm^2"
         log.log(
-            f"meshed {m} {summary[f'{m}_sum']:.6f} {unit} vs domain "
+            f"meshed {m} {summary[f'{m}_sum']:.6f} {unit} vs "
+            f"{'domain' if spec.structured else 'CAD (cutouts removed)'} "
             f"{summary[f'domain_{m}']:.6f} {unit}"
         )
         for name, count in summary["node_sets"].items():
             log.log(f"node set '{name}': {count} nodes")
+        if passive.any():
+            log.log(
+                f"cutouts: {summary['passive_elements']} elements held void, "
+                f"{summary['passive_measure']:.4g} {unit} of grid vs "
+                f"{summary['cutout_measure']:.4g} {unit} in the CAD model "
+                "(the grid resolves a cutout to whole elements)"
+            )
         coords = ", ".join(f"{c:.3f}" for c in summary["load_node_coords"])
         if load_nodes.size > 1:
             log.log(f"tip load line: {load_nodes.size} nodes, starting at #{load_node} ({coords})")
@@ -183,7 +259,10 @@ def run(
         log.record(**summary)
 
     with log.step("export", "4. Write mesh artifacts"):
-        paths = save_mesh(mesh, out_dir / "mesh", load_node=load_node, load_nodes=load_nodes)
+        paths = save_mesh(
+            mesh, out_dir / "mesh", load_node=load_node, load_nodes=load_nodes,
+            passive=passive if passive.any() else None,
+        )
         log.artifact(paths["npz"], f"nodes, {mesh.cell_type} connectivity and boundary node sets (numpy)")
         log.artifact(paths["vtu"], "mesh for PyVista / ParaView")
 
@@ -219,6 +298,7 @@ def run(
             thickness=depth,
             load=load,
             fixed_node_set=PHYS_FIXED,
+            densities=np.where(passive, 0.0, 1.0) if passive.any() else None,
             ke_all=ke_all,
         )
         beam = timoshenko_tip_deflection(
@@ -238,6 +318,7 @@ def run(
             f"Timoshenko beam theory: {beam['total']:.6g} mm "
             f"(bending {beam['bending']:.4g} + shear {beam['shear']:.4g}) "
             f"-> {rel * 100:.2f}% difference"
+            + (" (beam theory ignores the cutouts)" if domain.holes else "")
         )
         log.log(
             f"equilibrium: ||KU - F|| on free DOFs = {result.equilibrium_residual:.3e}, "
@@ -310,6 +391,7 @@ def run(
                 fixed_node_set=PHYS_FIXED,
                 params=simp,
                 on_iteration=on_iteration,
+                passive=passive,
             )
             reduction = (design.compliance / result.compliance) if result.compliance else float("nan")
             log.log(

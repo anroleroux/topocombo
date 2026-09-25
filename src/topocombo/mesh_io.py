@@ -256,20 +256,43 @@ def nodes_on_segment(
     return idx[on][np.argsort(t[on])]
 
 
+def _in_plane_edge_ratio(mesh: Mesh) -> np.ndarray:
+    """Per element, longest over shortest edge, counting only edges in x-y."""
+    a, b = np.array(CELL_EDGES[mesh.cell_type]).T
+    xyz = mesh.nodes[mesh.cells]
+    vec = xyz[:, b] - xyz[:, a]
+    lengths = np.linalg.norm(vec, axis=2)
+    if mesh.dim == 3:
+        in_plane = np.abs(vec[:, :, 2]) < 1e-9 * lengths.max()
+        lengths = np.where(in_plane, lengths, np.nan)
+    return np.nanmax(lengths, axis=1) / np.nanmin(lengths, axis=1)
+
+
+#: Body-fitted checks: the meshed measure may differ from the CAD one by the
+#: chordal error of straight element edges on curved boundaries, and no element
+#: may be stretched past this edge-length ratio in the x-y plane (extruded
+#: hexes are as long through the width as the layers make them, by design).
+FITTED_MEASURE_RTOL = 5e-3
+FITTED_EDGE_RATIO_MAX = 4.0
+
+
 def check_mesh(
-    mesh: Mesh, domain: BeamDomain | BeamDomain3D, expected_elements: int
+    mesh: Mesh, domain: BeamDomain | BeamDomain3D, expected_elements: int | None
 ) -> dict[str, Any]:
     """Validate the mesh against the design domain; return a quality summary.
 
     Summary keys name the cell measure — ``area_*`` for a 2D mesh,
-    ``volume_*`` for a 3D one.
+    ``volume_*`` for a 3D one.  ``expected_elements`` is the structured grid's
+    count; None marks a body-fitted mesh, which is checked against the CAD
+    shape (cutouts removed) and for element quality instead.
     """
+    fitted = expected_elements is None
     if isinstance(domain, BeamDomain3D):
         extent = np.array([domain.length, domain.height, domain.width])
-        domain_measure = domain.volume
+        domain_measure = domain.material_volume if fitted else domain.volume
     else:
         extent = np.array([domain.length, domain.height])
-        domain_measure = domain.area
+        domain_measure = domain.material_area if fitted else domain.area
     if extent.size != mesh.dim:
         raise ValueError(f"a {mesh.dim}D mesh cannot be checked against a {extent.size}D domain")
 
@@ -279,11 +302,18 @@ def check_mesh(
     aspect = edges.max(axis=1) / edges.min(axis=1)
     lower, upper = mesh.bounding_box()
 
-    checks = {
-        "element_count_matches_spec": mesh.n_elements == expected_elements,
+    rtol = FITTED_MEASURE_RTOL if fitted else 1e-6
+    checks = {}
+    if fitted:
+        checks[f"edge_ratio_below_{FITTED_EDGE_RATIO_MAX:g}"] = bool(
+            _in_plane_edge_ratio(mesh).max() < FITTED_EDGE_RATIO_MAX
+        )
+    else:
+        checks["element_count_matches_spec"] = mesh.n_elements == expected_elements
+    checks |= {
         f"all_elements_positive_{name}": bool(np.all(measures > 0)),
-        f"{name}_sum_matches_domain": bool(
-            abs(measures.sum() - domain_measure) < 1e-6 * domain_measure
+        f"{name}_sum_matches_{'cad' if fitted else 'domain'}": bool(
+            abs(measures.sum() - domain_measure) < rtol * domain_measure
         ),
         "bbox_matches_domain": bool(
             np.all(np.abs(lower) < 1e-9) and np.all(np.abs(upper - extent) < 1e-9 * extent)
@@ -328,8 +358,12 @@ def save_mesh(
     out_dir: Path,
     load_node: int | None = None,
     load_nodes: np.ndarray | None = None,
+    passive: np.ndarray | None = None,
 ) -> dict[str, Path]:
-    """Write the solver-facing ``mesh.npz`` and the visualisation-facing ``mesh.vtu``."""
+    """Write the solver-facing ``mesh.npz`` and the visualisation-facing ``mesh.vtu``.
+
+    ``passive`` marks the elements held void (inside a CAD cutout).
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -344,6 +378,8 @@ def save_mesh(
         arrays["load_node"] = np.asarray([load_node], dtype=int)
     if load_nodes is not None:  # a load spread over several nodes (3D load line)
         arrays["load_nodes"] = np.asarray(load_nodes, dtype=int)
+    if passive is not None:
+        arrays["passive"] = np.asarray(passive, dtype=bool)
 
     npz = out_dir / "mesh.npz"
     np.savez_compressed(npz, **arrays)

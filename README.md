@@ -58,13 +58,87 @@ python -m topocombo.cli report --run results/cantilever --site site
 python -m topocombo.cli all
 
 # the same cantilever as a 3D solid: hexahedra, one element through the width
-# (this is what CI runs and publishes)
 python -m topocombo.cli all --dim 3 --width 1 --nelz 1 --out results/cantilever3d
+
+# or take the CadQuery inputs from a file; flags on the command line still override it
+python -m topocombo.cli all --cad-config examples/cantilever3d.toml --out results/cantilever3d
+
+# what CI runs and publishes: those inputs (with the hole), meshed body-fitted
+python -m topocombo.cli all --cad-config examples/cantilever3d.toml --mesh body-fitted \
+    --nelx 60 --nely 20 --nelz 1 --out results/cantilever --site site
+
+# just the CAD stage: print the CadQuery script, write it with BREP, STEP and a PNG preview
+python -m topocombo.cli cad --cad-config examples/cantilever3d.toml --width 5 --out results/cad
+
+# a 10 mm hole through z at x = 20, y = 10 (repeat --hole for more)
+python -m topocombo.cli all --dim 3 --hole 20,10,10 --out results/holed
+
+# the same part meshed body-fitted: the mesh follows the hole instead of holding
+# grid cells void (--mesh-size sets the element edge, default L/nelx)
+python -m topocombo.cli all --dim 3 --hole 20,10,10 --mesh body-fitted --out results/fitted
+
+# a shaded PNG of any exported BREP or STL, no OpenGL needed
+python -m topocombo.cadview results/cantilever3d/optimization/topology.stl
 
 # PyVista views of a finished run, written to <run>/figures (optional extra)
 pip install -e ".[viz]"
 python -m topocombo.viz --run results/cantilever3d
 ```
+
+### CadQuery input
+
+The design domain is not built by hidden API calls: each run generates a
+standalone CadQuery script from its parameters, builds the shape by executing
+exactly that script, and writes it to `cad/design_domain.py` (it opens as-is in
+CQ-editor). The parameters — `dim`, `length`, `height`, `thickness` (2D),
+`width` (3D) and circular cutouts through z (`holes`) — come from the flags,
+from a `--cad-config` JSON or TOML file (flat, or under a `[cad]` table), or
+the defaults, in that order of precedence.
+The config is validated before anything runs: unknown keys (a typo such as
+`lenght`), non-numbers, non-positive lengths and a `dim` other than 2 or 3 are
+rejected with a message naming the allowed keys, and a cutout must lie strictly
+inside the beam and clear of the others. The report prints the parameters and
+the script, and shows a shaded picture of the resulting CAD shape alongside
+one of the optimized topology.
+
+Cutouts are given as `--hole X,Y,D` (repeatable; replaces any holes from the
+config) or as `[[cad.holes]]` tables with `x`, `y` and `diameter`. The
+published run has one: diameter 10 mm at x = 20, y = 10. CadQuery cuts them
+from the model, so the script, STEP, BREP and picture all carry them. The
+structured grid still covers the full L x H envelope (`design_envelope.brep`
+is what Gmsh meshes), and the elements whose centres fall inside a cutout are
+held at zero density by the optimizer: a passive, non-design region, the usual
+SIMP treatment. The volume fraction stays relative to the whole envelope, and
+the full-density solve already has the cutout void.
+
+### Mesh modes
+
+`--mesh structured` (the CLI default) is the transfinite grid above: uniform
+cells, one per design variable, over the L x H envelope. `--mesh body-fitted`
+meshes the real CAD profile instead, cutouts included. Gmsh splits the free
+edge at mid-height so the load lands on nodes, meshes the x-y face into
+unstructured quads (frontal-Delaunay triangles recombined to all-quad) at
+`--mesh-size` (default `min(L/nelx, H/nely)`), and in 3D extrudes them through
+the width into `--nelz` layers of hexahedra. The 3D profile is written to
+`cad/design_profile.brep`. Nothing is held void: the hole is simply not meshed.
+This is the mode CI publishes; the structured grid stays the CLI default and
+the reference the exact 2D <-> 3D and beam-theory checks run on.
+
+Validation changes with it. Instead of the grid count, the meshed area or
+volume must match the CAD shape (cutouts removed) to 0.5%; straight element
+edges on an arc give a chordal error of about 0.05% at 1 mm. No element may be
+stretched past an in-plane edge ratio of 4. The density filter weights
+neighbours by their size once the elements are unequal (on a uniform grid the
+factor is constant and skipped, so structured results are unchanged). The
+report draws the unstructured mesh and density field element by element; a 3D
+run gets the side view only, because the top and end projections need grid
+columns.
+
+The volume fraction is always relative to the meshed region. Structured, that
+is the envelope with the hole counted as void; body-fitted, it is the holed
+part. So at the same `--volfrac` the body-fitted design has 50% of 1121 mm³
+rather than 50% of 1200 mm³, and is a little more compliant (969 vs 909 N·mm
+for the 3D case with the hole).
 
 With `--dim 3` the beam is a CadQuery box meshed into hexahedra, solved with
 the H8 solid element, and loaded along a line across the width at mid-height of
@@ -94,10 +168,12 @@ the solid elements.
 
 | File | Contents |
 | --- | --- |
-| `cad/design_domain.brep` | design domain, consumed by Gmsh's OCC importer |
+| `cad/design_domain.py` | the CadQuery script that built the design domain (runs in CQ-editor) |
+| `cad/design_domain.brep` | design domain; Gmsh's OCC importer meshes it directly when there are no cutouts |
+| `cad/design_envelope.brep` | with cutouts: the L x H envelope Gmsh meshes instead |
 | `cad/design_domain.step` | same geometry for exchange with other CAD tools |
 | `mesh/beam.msh` | hex (3D) or quad (2D) mesh with `design_domain`, `fixed` and `load_edge` physical groups |
-| `mesh/mesh.npz` | nodes, cell connectivity (`cells`, `cell_type`), boundary node sets, tip-load node(s) — what the solver reads |
+| `mesh/mesh.npz` | nodes, cell connectivity (`cells`, `cell_type`), boundary node sets, tip-load node(s), `passive` void elements (with cutouts) — what the solver reads |
 | `mesh/mesh.vtu` | the same mesh for PyVista / ParaView |
 | `solution/solution.npz` | displacements, per-element compliance and von Mises stress |
 | `solution/solution.vtu` | displacement and stress fields for PyVista / ParaView |
@@ -138,20 +214,25 @@ projections show.
 ### Report
 
 Each push runs the tests and the 3D pipeline in CI and publishes the procedure
-log — parameters, per-stage terminal output, mesh validation, the full-density
-solve and the optimized density — to GitHub Pages:
+log — the CadQuery input script with a picture of its output, parameters,
+per-stage terminal output, mesh validation, the full-density solve, the
+optimized density and a shaded view of the optimized topology — to GitHub Pages:
 <https://anroleroux.github.io/topocombo/>. The page is generated by
 `topocombo.report`, which reads only the artifacts of a run directory, so it is
 a downstream consumer like the other visualization paths, not part of the loop.
 A 3D density field is shown as projections: the mean through the width (side
 view), plus top and end views once the mesh is more than one element deep.
+The two CAD pictures are PNGs rendered by `topocombo.cadview` from
+`design_domain.brep` and `topology.stl`: a tessellated, Lambert-shaded
+axonometric view drawn with matplotlib's Agg backend, so it needs no OpenGL
+on the CI runner.
 
 ## Layout
 
 ```
 src/topocombo/
-  geometry.py   parametric design domain (CadQuery)
-  meshing.py    transfinite quad / hex meshing and physical groups (Gmsh)
+  geometry.py   parametric design domain as a generated CadQuery script; --cad-config loading
+  meshing.py    structured (transfinite) or body-fitted (unstructured quad / extruded hex) meshing (Gmsh)
   mesh_io.py    .msh -> dimension-agnostic Mesh, quality checks, .npz/.vtu export
   fea.py        Q4 plane-stress / H8 solid solver: element stiffness, assembly, direct solve
   optimize.py   SIMP loop: neighbourhood filter, OC update, convergence, log.csv
@@ -159,10 +240,12 @@ src/topocombo/
   runlog.py     structured, timed logging of a run
   topology.py   thresholded design -> closed STL surface (for Blender)
   report.py     static HTML report built from a run directory
+  cadview.py    `python -m topocombo.cadview`: shaded PNG of a BREP or STL (no OpenGL)
   viz.py        `python -m topocombo.viz`: PyVista views of a run (optional)
-  cli.py        `python -m topocombo.cli run|report|all [--dim 3]`
+  cli.py        `python -m topocombo.cli cad|run|report|all [--dim 3] [--cad-config FILE]`
 tests/          mesh invariants, solver verification, optimizer invariants, 2D <-> 3D checks
 docs/           the 3D migration plan
+examples/       CadQuery input configs (`--cad-config`)
 ```
 
 ## Status

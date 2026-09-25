@@ -91,7 +91,9 @@ def build_filter(mesh: Mesh, radius: float) -> tuple[sp.csr_matrix, np.ndarray]:
 
     Filtering couples neighbouring elements, which is what stops the
     checkerboard patterns that the element-wise density field would otherwise
-    converge to.
+    converge to.  On a mesh of unequal elements (body-fitted) each neighbour is
+    also weighted by its size, so a patch of small elements does not outvote a
+    large one; on a uniform grid that factor is constant and left out.
     """
     centroids = element_centroids(mesh)
     tree = cKDTree(centroids)
@@ -113,6 +115,9 @@ def build_filter(mesh: Mesh, radius: float) -> tuple[sp.csr_matrix, np.ndarray]:
         (np.concatenate(weights), (np.concatenate(rows), np.concatenate(cols))),
         shape=(mesh.n_elements, mesh.n_elements),
     ).tocsr()
+    measures = mesh.cell_measures()
+    if np.ptp(measures) > 1e-9 * measures.mean():
+        h = (h @ sp.diags(measures / measures.mean())).tocsr()
     hs = np.asarray(h.sum(axis=1)).ravel()
     return h, hs
 
@@ -125,8 +130,12 @@ def oc_update(
     move: float,
     volume_of: Callable[[np.ndarray], float],
     l2_start: float = 1e9,
+    passive: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Optimality Criteria step: bisect the Lagrange multiplier onto the volume."""
+    """Optimality Criteria step: bisect the Lagrange multiplier onto the volume.
+
+    Elements flagged ``passive`` are held at zero density throughout.
+    """
     l1, l2 = 0.0, l2_start
     x_new = x
     while (l2 - l1) / max(l1 + l2, 1e-30) > 1e-9:
@@ -134,6 +143,8 @@ def oc_update(
         # OC: x * sqrt(-dc / (lambda dv)); dc < 0 for compliance, so the root is real
         ratio = np.sqrt(np.maximum(-dc / (lmid * dv), 0.0))
         x_new = np.clip(np.clip(x * ratio, x - move, x + move), 0.0, 1.0)
+        if passive is not None:
+            x_new[passive] = 0.0
         if volume_of(x_new) > volume_fraction:
             l1 = lmid
         else:
@@ -149,9 +160,17 @@ def optimize(
     fixed_node_set: str,
     params: SimpParams | None = None,
     on_iteration: Callable[[dict[str, float], np.ndarray], None] | None = None,
+    passive: np.ndarray | None = None,
 ) -> OptResult:
-    """Minimise compliance subject to a volume constraint, returning the design."""
+    """Minimise compliance subject to a volume constraint, returning the design.
+
+    ``passive`` (a boolean mask) marks non-design elements held void — the
+    cutouts of the CAD model.  The volume fraction stays relative to the whole
+    meshed envelope.
+    """
     params = params or SimpParams()
+    if passive is not None and not np.any(passive):
+        passive = None
 
     ke_all = element_stiffnesses(mesh, material, thickness)
     measures = mesh.cell_measures()
@@ -159,6 +178,8 @@ def optimize(
     h, hs = build_filter(mesh, params.filter_radius)
 
     x = np.full(mesh.n_elements, params.volume_fraction)
+    if passive is not None:
+        x[passive] = 0.0
     history: list[dict[str, float]] = []
     change = float("inf")
     converged = False
@@ -168,7 +189,9 @@ def optimize(
 
     def physical(design: np.ndarray) -> np.ndarray:
         if params.filter_type == "density":
-            return np.asarray(h @ design).ravel() / hs
+            design = np.asarray(h @ design).ravel() / hs
+            if passive is not None:
+                design[passive] = 0.0
         return design
 
     def volume_of(design: np.ndarray) -> float:
@@ -213,6 +236,7 @@ def optimize(
             volume_fraction=params.volume_fraction,
             move=params.move_limit,
             volume_of=volume_of,
+            passive=passive,
         )
         change = float(np.abs(x_new - x).max())
         x = x_new

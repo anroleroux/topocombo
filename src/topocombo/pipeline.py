@@ -1,40 +1,40 @@
 """The main flow — geometry, mesh, solve, SIMP — as one terminal-driven run.
 
-The domain decides the dimension: a :class:`BeamDomain` runs the 2D
-plane-stress quad pipeline, a :class:`BeamDomain3D` the solid hex pipeline
-with the tip load spread along a line across the width.  Everything is
-written to a run directory; nothing is plotted or rendered here.
+The domain decides the dimension: a 2D domain (:class:`BeamDomain`, or a part
+script that builds a face) runs the plane-stress quad pipeline, a 3D one
+(:class:`BeamDomain3D`, or a script that builds a solid) the solid hex
+pipeline.  Where the part is held and loaded comes from its named regions
+(:mod:`topocombo.regions`), through the constraints and loads of a study
+(:mod:`topocombo.study`); the parametric beam brings its own cantilever
+regions and defaults.  Everything is written to a run directory; nothing is
+plotted or rendered here.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
+from . import calculix
 from .fea import (
     LoadCase,
     Material,
     element_stiffnesses,
-    solve as fea_solve,
+    rigid_body_free,
+    solve_cases,
     timoshenko_tip_deflection,
 )
-from .geometry import BeamDomain, BeamDomain3D, export_domain
-from .mesh_io import (
-    check_mesh,
-    find_node,
-    load_mesh,
-    nodes_on_segment,
-    save_mesh,
-    save_solution,
-)
+from .geometry import BEAM_FIXED, BEAM_LOAD, CadDomain, Domain, export_domain
+from .mesh_io import check_mesh, load_mesh, save_mesh, save_solution
 from .meshing import (
-    PHYS_FIXED,
-    PHYS_LOAD,
     MeshSpec,
     MeshSpec3D,
     generate_fitted_mesh,
+    generate_tet_mesh,
     generate_hex_mesh,
     generate_quad_mesh,
 )
@@ -46,12 +46,176 @@ from .optimize import (
     save_design,
     save_history,
 )
+from .mma import Limit, optimize_mma
+from .regions import embed_points, node_shares, region_dim, region_nodes
+from .responses import displacement_selector
 from .runlog import RunLog
+from .study import Displace, Fix, Force, LoadCase as StudyCase, Passive
 from .topology import save_topology_stl
+
+_REGION_KIND = {0: "vertex", 1: "edge", 2: "face", 3: "solid"}
+#: MMA's move limit with a stress limit: a larger one lets the design empty out
+#: (measured on the L-bracket: 0.2 runs away, 0.05 converges, 0.02 crawls)
+STRESS_MOVE = 0.05
+
+
+def _element_size(domain: Domain, spec: MeshSpec | MeshSpec3D) -> list[float]:
+    """Element edge lengths in mm: the grid cell (dx, dy[, dz]) when structured;
+    the target in-plane edge (and the layer thickness in 3D) when body-fitted."""
+    if spec.structured:
+        size = [domain.length / spec.nelx, domain.height / spec.nely]
+    else:
+        size = [spec.element_size(domain)]
+    if domain.dim == 3 and not getattr(spec, "tetrahedral", False):
+        size.append(domain.width / spec.nelz)
+    return size
+
+
+def _region_summary(shape: Any) -> dict[str, Any]:
+    bb = shape.BoundingBox()
+    dim = region_dim(shape)
+    count = len(shape.Faces() if dim == 2 else shape.Edges() if dim == 1 else shape.Vertices())
+    return {
+        "kind": _REGION_KIND[dim],
+        "count": count,
+        "bbox": [bb.xmin, bb.ymin, bb.zmin, bb.xmax, bb.ymax, bb.zmax],
+    }
+
+
+def _boundary_conditions(
+    domain: Domain, constraints: Sequence[Fix | Displace], cases: Sequence[StudyCase],
+    regions: dict[str, Any],
+) -> dict[str, Any]:
+    """The displacement constraints and forces the solve applies, by region."""
+    axes = "xyz"[: domain.dim]
+    def entry(c: Fix | Displace, case: StudyCase | None) -> dict[str, Any]:
+        return {
+            **c.as_dict(),
+            **_region_summary(regions[c.region]),
+            "displacements": {f"u{axes[i]}": v for i, v in c.components(domain.dim).items()},
+            **({"case": case.name} if case is not None else {}),
+        }
+
+    return {
+        "constraints": [entry(c, None) for c in constraints]
+        + [entry(c, case) for case in cases for c in case.constraints],
+        "loads": [
+            {
+                **f.as_dict(),
+                **_region_summary(regions[f.region]),
+                "case": case.name,
+                "weight": case.weight,
+                "force": {f"f{a}": v for a, v in zip(axes, f.vector)},
+            }
+            for case in cases
+            for f in case.loads
+        ],
+    }
+
+
+def _driver_limits(limits: Sequence[Any], cases: Sequence[StudyCase], mesh: Any) -> list[Limit]:
+    """The study's limits as MMA constraints, one per load case where a limit
+    applies to every case."""
+    names = [c.name for c in cases]
+    out: list[Limit] = []
+    for lim in limits:
+        kind = type(lim).__name__
+        if kind == "ComplianceLimit":
+            idx = None if lim.case is None else names.index(lim.case)
+            out.append(Limit("compliance", lim.max, f"compliance ({lim.case or 'weighted'})", case=idx))
+            continue
+        targets = range(len(cases)) if lim.case is None else [names.index(lim.case)]
+        for i in targets:
+            if kind == "DisplacementLimit":
+                comp = "xyz".index(lim.component)
+                if comp >= mesh.dim:
+                    raise ValueError(f"a {mesh.dim}D part has no {lim.component} displacement")
+                out.append(Limit(
+                    "displacement", lim.max, f"|u{lim.component}| at '{lim.region}' ({names[i]})",
+                    case=i, selector=displacement_selector(mesh, mesh.node_sets[lim.region], comp),
+                ))
+            else:
+                out.append(Limit("stress", lim.max, f"stress p-norm ({names[i]})", case=i,
+                                 p=lim.p, q=lim.q))
+    return out
+
+
+def _crosscheck(log: RunLog, mesh: Any, material: Material, depth: float, nodal: Any,
+                prescribed: Any, densities: np.ndarray | None, ke_all: np.ndarray,
+                results: Sequence[Any], cases: Sequence[StudyCase], solver: str, penal: float,
+                what: str) -> dict[str, Any]:
+    """Solve again with the other solver and compare, case by case: the
+    largest displacement difference relative to the largest displacement,
+    and the compliances."""
+    other = "direct" if solver == "calculix" else "calculix"
+    t0 = time.perf_counter()
+    again = solve_cases(mesh, material, depth, nodal, densities=densities, penal=penal,
+                        ke_all=ke_all, solver=other, prescribed=prescribed)
+    seconds = time.perf_counter() - t0
+    names = {"calculix": "CalculiX", "direct": "topocombo (direct)", "amg-cg": "topocombo (CG)"}
+    rows = []
+    for case, a, b in zip(cases, results, again):
+        scale = float(np.abs(a.u).max()) or 1.0
+        rows.append({
+            "case": case.name,
+            "compliance": a.compliance,
+            "compliance_other": b.compliance,
+            "compliance_rel_diff": abs(b.compliance - a.compliance) / (abs(a.compliance) or 1.0),
+            "u_rel_diff": float(np.abs(b.u - a.u).max()) / scale,
+        })
+    worst = max(r["u_rel_diff"] for r in rows)
+    log.log(
+        f"cross-check at {what}: {names.get(other, other)} against "
+        f"{names.get(results[0].solver, results[0].solver)} ({seconds:.2f} s): displacements "
+        f"agree to {worst:.2e} of the largest"
+        + "".join(f"; case '{r['case']}' compliance {r['compliance']:.7g} vs "
+                  f"{r['compliance_other']:.7g}" for r in rows)
+    )
+    return {"solver": results[0].solver, "other": other, "what": what, "seconds": seconds,
+            "cases": rows, "u_rel_diff": worst,
+            "compliance_rel_diff": max(r["compliance_rel_diff"] for r in rows)}
+
+
+def _held_dofs(mesh: Any, constraints: Sequence[Fix | Displace], dim: int) -> dict[int, float]:
+    """DOF -> held displacement for ``constraints``; two of them holding a
+    component at different values is an error."""
+    held: dict[int, float] = {}
+    held_by: dict[int, str] = {}
+    for c in constraints:
+        for comp, value in c.components(dim).items():
+            for n in mesh.node_sets[c.region]:
+                dof = mesh.dofs_per_node * int(n) + comp
+                if dof in held and held[dof] != value:
+                    raise ValueError(
+                        f"regions '{held_by[dof]}' and '{c.region}' hold node {int(n)}'s "
+                        f"u{'xyz'[comp]} at {held[dof]:g} and {value:g}"
+                    )
+                held[dof], held_by[dof] = value, c.region
+    return held
+
+
+def _clamped_nodes(mesh: Any, prescribed: dict[int, float]) -> np.ndarray:
+    """Nodes with every component held at zero (drawn as a clamp; the rest of
+    the constrained nodes as supports that let something move)."""
+    d = mesh.dofs_per_node
+    held = np.zeros((mesh.n_nodes, d), dtype=bool)
+    for dof, value in prescribed.items():
+        if value == 0.0:
+            held[dof // d, dof % d] = True
+    return np.flatnonzero(held.all(axis=1))
+
+
+def _held(mesh: Any, prescribed: dict[int, float]) -> np.ndarray:
+    """(n_nodes, dim): which displacement components each node has held."""
+    d = mesh.dofs_per_node
+    held = np.zeros((mesh.n_nodes, d), dtype=bool)
+    for dof in prescribed:
+        held[dof // d, dof % d] = True
+    return held
 
 
 def run(
-    domain: BeamDomain | BeamDomain3D,
+    domain: Domain,
     spec: MeshSpec | MeshSpec3D,
     out_dir: Path,
     material: Material | None = None,
@@ -60,16 +224,82 @@ def run(
     optimize_design: bool = True,
     snapshot_every: int = 10,
     echo: bool = True,
-    cad_config: Path | None = None,
+    constraints: Sequence[Fix | Displace] | None = None,
+    loads: Sequence[Force] | None = None,
+    study: Any = None,
+    solver: str = "auto",
+    load_cases: Sequence[StudyCase] | None = None,
+    passive_regions: Sequence[Passive] = (),
+    objective: str = "compliance",
+    limits: Sequence[Any] = (),
+    crosscheck: bool = False,
 ) -> tuple[RunLog, dict[str, Any]]:
     """Mesh the domain, solve it at full density, then run the SIMP loop.
 
-    ``cad_config`` is only recorded: the file the domain's parameters were read
-    from, if any (see :func:`topocombo.geometry.load_cad_config`).
+    ``crosscheck`` solves the full-density model and the final design again
+    with the other solver — CalculiX when the run uses the built-in one, the
+    built-in direct solver when it runs on CalculiX — and records how far
+    the two agree.
+
+    ``constraints`` (:class:`Fix`, :class:`Displace`), the forces — ``loads``
+    for one case or ``load_cases`` for several — and ``passive_regions``
+    refer to the domain's named regions.  Left out, the parametric beam uses
+    its cantilever defaults: ``fixed`` clamped and ``load_fy`` at ``load``.
+    ``study`` is the loaded study the run came from (see
+    :func:`topocombo.study.run_study`), recorded with the run.
     """
-    three_d = isinstance(domain, BeamDomain3D)
+    three_d = domain.dim == 3
+    scripted = isinstance(domain, CadDomain)
+    if (solver == "calculix" or crosscheck) and not calculix.available():
+        raise RuntimeError(
+            "this run needs CalculiX (solver='calculix' or crosscheck=True) but 'ccx' is not "
+            "installed: apt install calculix-ccx, or set TOPOCOMBO_CCX to the executable"
+        )
     if three_d != isinstance(spec, MeshSpec3D):
         raise TypeError("a 3D domain needs a MeshSpec3D, a 2D domain a MeshSpec")
+    regions = domain.regions()
+    if constraints is None and loads is None and load_cases is None and not scripted:
+        constraints = [Fix(BEAM_FIXED)]
+        loads = [Force(BEAM_LOAD, (0.0, load_fy, 0.0)[: domain.dim])]
+    if loads and load_cases:
+        raise ValueError("give loads (one case) or load_cases, not both")
+    cases = list(load_cases) if load_cases else ([StudyCase("load", tuple(loads))] if loads else [])
+    passive_regions = list(passive_regions)
+    constraints = list(constraints or [])
+    if not cases or not (constraints or all(case.constraints for case in cases)):
+        raise ValueError("a run needs constraints and loads on the part's named regions")
+    forces = [f for case in cases for f in case.loads]
+    if not forces:
+        raise ValueError("a run needs at least one Force(...)")
+    case_constraints = [c for case in cases for c in case.constraints]
+    limits = list(limits)
+    limit_regions = [lim.region for lim in limits if hasattr(lim, "region")]
+    bc_names = list(dict.fromkeys(
+        [c.region for c in constraints + case_constraints] + [f.region for f in forces]
+        + limit_regions
+    ))
+    unknown = [n for n in bc_names + [p.region for p in passive_regions] if n not in regions]
+    if unknown:
+        raise ValueError(
+            f"unknown region(s) {', '.join(unknown)}; the part defines "
+            f"{', '.join(sorted(regions)) or 'none'}"
+        )
+    solids = [n for n in bc_names if region_dim(regions[n]) == 3]
+    if solids:
+        raise ValueError(
+            f"region(s) {', '.join(solids)} are solids: constraints and forces act on "
+            "vertices, edges or faces (solid regions are for Passive)"
+        )
+    for f in forces:
+        if len(f.vector) != domain.dim:
+            raise ValueError(f"a {domain.dim}D part takes a {domain.dim}-component force")
+    for c in constraints + case_constraints:
+        c.components(domain.dim)  # a z component on a 2D part raises here
+    force = forces[0]  # the first force of the first case: what one-load summaries show
+    bc_regions = {n: regions[n] for n in bc_names}
+    tetrahedral = getattr(spec, "tetrahedral", False)
+    if three_d and not tetrahedral and not domain.is_prism:
+        domain.profile()  # raises, saying why hexahedra cannot mesh this part
     out_dir = Path(out_dir)
     material = material or Material()
     simp = simp or SimpParams()
@@ -77,19 +307,30 @@ def run(
     depth = domain.width if three_d else domain.thickness
     analysis = "3D solid" if three_d else "plane-stress"
     log = RunLog(
-        name=f"cantilever beam — meshing, {analysis} solve and SIMP optimization",
+        name=f"topology optimization — meshing, {analysis} solve and SIMP",
         out_dir=out_dir,
         echo=echo,
     )
     log.params = {
         "dim": 3 if three_d else 2,
-        "element": "H8 hexahedron" if three_d else "Q4 quadrilateral",
+        "element": spec.element.label,
+        "element_name": spec.element.name,
         "domain": domain.as_dict(),
-        "mesh": spec.as_dict(),
+        "mesh": {**spec.as_dict(), "element_size": _element_size(domain, spec)},
         "material": material.as_dict(),
-        "load": {"fy": load_fy},
+        "load": {f"f{a}": v for a, v in zip("xyz", force.vector)},
+        "load_cases": [c.as_dict() for c in cases],
+        "boundary_conditions": _boundary_conditions(domain, constraints, cases, regions),
+        "passive": [p.as_dict() for p in passive_regions],
+        "objective": objective,
+        "limits": [{"kind": type(lim).__name__, **dataclasses.asdict(lim)} for lim in limits],
+        "regions": {name: _region_summary(shape) for name, shape in regions.items()},
         "simp": simp.as_dict(),
+        "solver": solver,
+        "crosscheck": crosscheck,
     }
+    if study is not None:
+        log.params["study"] = {"path": str(study.path), "part": study.study.part}
 
     import cadquery
     import meshio
@@ -101,28 +342,32 @@ def run(
     log.tool("scipy", scipy.__version__)
 
     with log.step("geometry", "1. Define parametric geometry (CadQuery)"):
+        if scripted:
+            log.log(f"CadQuery input: {domain.path or 'a script'} (any geometry, as code)")
+            log.log(
+                f"bounding box {domain.length:g} x {domain.height:g}"
+                + (f" x {domain.width:g}" if three_d else "")
+                + f" mm (aspect ratio {domain.aspect_ratio:.2f})"
+                + ("" if three_d else f", out-of-plane thickness {domain.thickness:g} mm")
+            )
         if three_d:
-            log.log(
-                f"design domain {domain.length} x {domain.height} x {domain.width} mm box "
-                f"(aspect ratio {domain.aspect_ratio:.2f})"
-            )
-            (x0, y0, z0), (_, _, z1) = domain.load_line
-            log.log(
-                f"clamped face: x = 0; tip load along x = {x0:g}, y = {y0:g}, "
-                f"z = {z0:g} .. {z1:g}"
-            )
+            if not scripted:
+                log.log(
+                    f"design domain {domain.length} x {domain.height} x {domain.width} mm box "
+                    f"(aspect ratio {domain.aspect_ratio:.2f})"
+                )
             solid = domain.solid()
             log.log(
                 f"solid volume: {solid.Volume():.3f} mm^3 (expected {domain.material_volume:.3f})"
             )
             cad_record = {"solid_volume": solid.Volume()}
         else:
-            log.log(
-                f"design domain {domain.length} x {domain.height} mm "
-                f"(aspect ratio {domain.aspect_ratio:.2f}), "
-                f"out-of-plane thickness {domain.thickness} mm"
-            )
-            log.log(f"clamped edge: x = 0; tip load applied at {domain.load_point}")
+            if not scripted:
+                log.log(
+                    f"design domain {domain.length} x {domain.height} mm "
+                    f"(aspect ratio {domain.aspect_ratio:.2f}), "
+                    f"out-of-plane thickness {domain.thickness} mm"
+                )
             face = domain.face()
             log.log(
                 f"planar face area: {face.Area():.3f} mm^2 (expected {domain.material_area:.3f})"
@@ -130,10 +375,28 @@ def run(
             cad_record = {"face_area": face.Area()}
         for x, y, d in domain.holes:
             log.log(f"cutout through z: diameter {d:g} mm at x = {x:g}, y = {y:g}")
-        if cad_config is not None:
-            log.log(f"CAD parameters read from {cad_config}")
+        if scripted and domain.is_prism:
+            cut = domain.area - domain.material_area
+            log.log(
+                f"x-y profile: {domain.material_area:.3f} of {domain.area:.3f} mm^2 envelope"
+                + (f" ({cut:.3f} mm^2 cut away)" if domain.has_cutouts else " (fills its bounding box)")
+            )
+        elif scripted:
+            log.log(
+                f"not a prism along z: {domain.material_volume:.3f} of {domain.volume:.3f} mm^3 "
+                "bounding box — meshed with tetrahedra"
+            )
+        for name, info in log.params["regions"].items():
+            lo, hi = info["bbox"][:3], info["bbox"][3:]
+            log.log(
+                f"region '{name}': {info['count']} {info['kind']}(s), "
+                f"({', '.join(f'{v:g}' for v in lo)}) .. ({', '.join(f'{v:g}' for v in hi)})"
+            )
         exported = export_domain(domain, out_dir / "cad")
-        log.log("built by running the generated CadQuery script (shown in the report)")
+        log.log(
+            "built by running the CadQuery script (shown in the report)" if scripted
+            else "built by running the generated CadQuery script (shown in the report)"
+        )
         descriptions = {
             "script": "design domain, the CadQuery script that built it (runs in CQ-editor)",
             "brep": "design domain, BREP format",
@@ -143,14 +406,20 @@ def run(
         }
         for kind, path in exported.items():
             log.artifact(path, descriptions[kind])
+        if study is not None:
+            study_copy = out_dir / "study.py"
+            study_copy.write_text(study.source)
+            log.log(f"study: {study.path} (part: {study.study.part})")
+            log.artifact(study_copy, "the study script: mesh, material, constraints, loads, optimizer")
         log.record(
+            study_script=None if study is None else study.source,
+            study_path=None if study is None else str(study.path),
             **cad_record,
             **domain.as_dict(),
             cad_script=domain.cadquery_script(),
-            cad_config=None if cad_config is None else str(cad_config),
         )
 
-    cells_word = "hexahedra" if three_d else "quadrilaterals"
+    cells_word = spec.element.plural
     kind = "structured" if spec.structured else "body-fitted"
     with log.step("meshing", f"2. Mesh with Gmsh ({kind} {cells_word})"):
         if spec.structured:
@@ -159,71 +428,136 @@ def run(
                 f"transfinite grid: {grid} = {spec.n_elements} {cells_word}, "
                 f"{spec.n_nodes} nodes expected"
             )
-            if domain.holes:
+            if domain.has_cutouts:
                 log.log(
-                    "the structured grid covers the whole envelope; elements inside the "
-                    "cutouts are held void by the optimizer"
+                    "the structured grid covers the whole envelope; elements outside the "
+                    "part (inside its cutouts) are held void by the optimizer"
                 )
             mesher = generate_hex_mesh if three_d else generate_quad_mesh
             brep = exported.get("envelope", exported["brep"])
+        elif tetrahedral:
+            mesher = generate_tet_mesh
+            brep = exported["brep"]
+            log.log("body-fitted tetrahedra of the solid itself: any 3D shape")
         else:
             mesher = generate_fitted_mesh
             if three_d:  # the hexes are extruded from a mesh of the x-y profile
                 brep = out_dir / "cad" / "design_profile.brep"
-                BeamDomain(
-                    length=domain.length, height=domain.height, holes=domain.holes
-                ).face().exportBrep(str(brep))
+                domain.profile().exportBrep(str(brep))
                 log.artifact(brep, "x-y profile of the design domain, BREP — what Gmsh meshes")
             else:
                 brep = exported["brep"]
             log.log(
                 "body-fitted: the mesh follows the CAD boundary, cutouts included"
-                if domain.holes else "body-fitted: the mesh follows the CAD boundary"
+                if domain.has_cutouts else "body-fitted: the mesh follows the CAD boundary"
             )
+        tol = 1e-6 * max(domain.length, domain.height, getattr(domain, "width", 0.0))
+        if spec.structured:
+            extra = {}
+        elif tetrahedral:
+            extra = {"regions": bc_regions}
+        else:
+            extra = {"points": embed_points(bc_regions, domain.profile(), tol)}
         msh_path, _ = mesher(
             domain=domain,
             spec=spec,
             brep_path=brep,
             out_dir=out_dir / "mesh",
             log=log,
+            **extra,
         )
-        mesh_word = "hexahedral" if three_d else "quadrilateral"
-        log.artifact(msh_path, f"{mesh_word} mesh with physical groups (Gmsh 2.2 ASCII)")
+        log.artifact(msh_path, f"{spec.element.label} mesh with physical groups (Gmsh 2.2 ASCII)")
         size = None if spec.structured else spec.element_size(domain)
         log.record(**spec.as_dict(), element_size=size)
 
     with log.step("validation", "3. Load the mesh and check it"):
         mesh = load_mesh(msh_path)
-        if three_d:
-            load_nodes = nodes_on_segment(
-                mesh, *domain.load_line, candidates=mesh.node_sets[PHYS_LOAD]
-            )
-            if load_nodes.size == 0:  # pragma: no cover - nely odd: no node row at H/2
-                load_nodes = np.array([find_node(mesh, domain.load_point)])
-        else:
-            load_nodes = np.array([find_node(mesh, domain.load_point)])
+        for name, shape in bc_regions.items():
+            mesh.node_sets[name] = region_nodes(mesh.nodes, shape, tol)
+        empty = [n for n in bc_names if mesh.node_sets[n].size == 0]
+        if empty:
+            raise RuntimeError(f"region(s) {', '.join(empty)} have no mesh nodes")
+        # every force as nodal loads (fea.LoadCase), grouped by load case
+        nodal: list[list[LoadCase]] = []
+        for case in cases:
+            nodal.append([])
+            for f in case.loads:
+                nodes_f = mesh.node_sets[f.region]
+                shares_f = node_shares(
+                    mesh.nodes, mesh.cells, mesh.cell_type, nodes_f,
+                    region_dim(regions[f.region]), f.region,
+                )
+                comps = dict(zip(("fx", "fy", "fz"), f.vector))
+                nodal[-1].append(
+                    LoadCase(node=tuple(int(n) for n in nodes_f),
+                             shares=tuple(float(v) for v in shares_f), **comps)
+                    if nodes_f.size > 1 else LoadCase(node=int(nodes_f[0]), **comps)
+                )
+        load = next(lc[0] for lc in nodal if lc)
+        load_nodes = load.nodes
         load_node = int(load_nodes[0])
-        miss = float(np.linalg.norm(mesh.nodes[load_node][:2] - np.asarray(domain.load_point[:2])))
-        if miss > 1e-6 * domain.length:
-            raise RuntimeError(f"no mesh node at the load point ({miss:.3g} mm away)")
+        # constraints: DOF -> held displacement, the study's in every case plus
+        # each case's own (which win on a component both hold)
+        prescribed = _held_dofs(mesh, constraints, domain.dim)
+        case_prescribed = [
+            {**prescribed, **_held_dofs(mesh, case.constraints, domain.dim)} for case in cases
+        ]
+        for case, held_c in zip(cases, case_prescribed):
+            loose = rigid_body_free(mesh, np.array(sorted(held_c), dtype=int))
+            if loose:
+                raise ValueError(
+                    "the constraints leave the part free to move"
+                    + (f" in case '{case.name}'" if len(cases) > 1 else "")
+                    + f": {loose} rigid-body motion(s) (translations or rotations) are not held;"
+                    " fix more components"
+                )
+        # what the solver gets: one shared map, or one map per case
+        prescribed_arg = case_prescribed if case_constraints else prescribed
+        every_held = {dof: v for held_c in case_prescribed for dof, v in held_c.items()}
+        constrained = np.array(sorted(every_held), dtype=int)
+        fixed_nodes = np.unique(constrained // mesh.dofs_per_node)
         summary = check_mesh(mesh, domain, expected_elements=spec.n_elements)
         summary["mesh_mode"] = spec.mode
         summary["load_node"] = load_node
         summary["load_nodes"] = [int(n) for n in load_nodes]
         summary["load_node_coords"] = [float(c) for c in mesh.nodes[load_node]]
         if spec.structured:
-            passive = domain.void_mask(element_centroids(mesh))
+            cutouts = domain.void_mask(element_centroids(mesh))
         else:  # the cutouts are not meshed at all
-            passive = np.zeros(mesh.n_elements, dtype=bool)
-        if passive.any():
+            cutouts = np.zeros(mesh.n_elements, dtype=bool)
+        if cutouts.any():
             measures = mesh.cell_measures()
             if three_d:
                 cut = domain.volume - domain.material_volume
             else:
                 cut = domain.area - domain.material_area
-            summary["passive_elements"] = int(passive.sum())
-            summary["passive_measure"] = float(measures[passive].sum())
+            summary["passive_elements"] = int(cutouts.sum())
+            summary["passive_measure"] = float(measures[cutouts].sum())
             summary["cutout_measure"] = float(cut)
+        # passive regions: held void (with the cutouts) or held solid
+        passive, solid = cutouts.copy(), np.zeros(mesh.n_elements, dtype=bool)
+        centroids = element_centroids(mesh)
+        for p_region in passive_regions:
+            picked = region_nodes(centroids, regions[p_region.region], max(p_region.within, tol))
+            if picked.size == 0:
+                raise RuntimeError(f"Passive('{p_region.region}') holds no elements: widen `within`")
+            (solid if p_region.state == "solid" else passive)[picked] = True
+            summary.setdefault("passive_regions", []).append(
+                {**p_region.as_dict(), "elements": int(picked.size)}
+            )
+        if np.any(solid & passive):
+            raise ValueError("some elements are in both a solid and a void passive region")
+        summary["passive_void_elements"] = int(passive.sum())
+        summary["passive_solid_elements"] = int(solid.sum())
+        summary["constrained_dofs"] = int(constrained.size)
+        summary["load_cases"] = [
+            {"name": case.name, "weight": case.weight,
+             "forces": [{"region": f.region, "nodes": int(mesh.node_sets[f.region].size),
+                         "vector": list(f.vector)} for f in case.loads],
+             "constraints": [{**c.as_dict(), "nodes": int(mesh.node_sets[c.region].size)}
+                             for c in case.constraints]}
+            for case in cases
+        ]
 
         log.log(f"{summary['n_nodes']} nodes, {summary['n_elements']} {cells_word}, {summary['n_dofs']} DOFs")
         log.log(
@@ -239,114 +573,190 @@ def run(
         )
         for name, count in summary["node_sets"].items():
             log.log(f"node set '{name}': {count} nodes")
-        if passive.any():
+        if cutouts.any():
             log.log(
                 f"cutouts: {summary['passive_elements']} elements held void, "
                 f"{summary['passive_measure']:.4g} {unit} of grid vs "
                 f"{summary['cutout_measure']:.4g} {unit} in the CAD model "
                 "(the grid resolves a cutout to whole elements)"
             )
-        coords = ", ".join(f"{c:.3f}" for c in summary["load_node_coords"])
-        if load_nodes.size > 1:
-            log.log(f"tip load line: {load_nodes.size} nodes, starting at #{load_node} ({coords})")
-        else:
-            log.log(f"tip load node: #{load_node} at ({coords})")
+        for p_info in summary.get("passive_regions", []):
+            log.log(
+                f"passive '{p_info['region']}' held {p_info['state']}: {p_info['elements']} "
+                f"elements within {p_info['within']:g} mm"
+            )
+        for case in summary["load_cases"]:
+            for f_info in case["forces"]:
+                log.log(
+                    f"load case '{case['name']}': force on '{f_info['region']}' "
+                    f"spread over {f_info['nodes']} node(s)"
+                )
         for name, passed in summary["checks"].items():
             log.log(f"  [{'PASS' if passed else 'FAIL'}] {name}")
         if not summary["all_checks_passed"]:
             failed = [n for n, ok in summary["checks"].items() if not ok]
-            raise RuntimeError(f"mesh validation failed: {', '.join(failed)}")
+            hint = ""
+            if any(n.startswith("tet_quality") for n in failed):
+                hint = (
+                    f" (worst tetrahedron quality {summary['tet_quality_min']:.3g}: elements"
+                    " larger than the part's thinnest feature make slivers — try a smaller"
+                    " Mesh.size)"
+                )
+            raise RuntimeError(f"mesh validation failed: {', '.join(failed)}{hint}")
         log.record(**summary)
 
     with log.step("export", "4. Write mesh artifacts"):
         paths = save_mesh(
             mesh, out_dir / "mesh", load_node=load_node, load_nodes=load_nodes,
             passive=passive if passive.any() else None,
+            fixed_nodes=fixed_nodes,
+            load_vector=force.vector,
+            solid=solid if solid.any() else None,
+            clamped_nodes=_clamped_nodes(mesh, every_held),
+            held=_held(mesh, every_held)[fixed_nodes],
         )
         log.artifact(paths["npz"], f"nodes, {mesh.cell_type} connectivity and boundary node sets (numpy)")
         log.artifact(paths["vtu"], "mesh for PyVista / ParaView")
 
     with log.step("solve", f"5. Assemble and solve ({analysis}, full density)"):
-        if load_nodes.size > 1:
-            load = LoadCase.along_line(mesh, load_nodes, fy=load_fy)
-        else:
-            load = LoadCase(node=load_node, fy=load_fy)
         log.log(
             f"material: E = {material.youngs_modulus:g} MPa, nu = {material.poisson_ratio:g}, "
             f"G = {material.shear_modulus:g} MPa"
         )
-        log.log(
-            f"boundary conditions: node set '{PHYS_FIXED}' clamped "
-            f"({mesh.dofs_per_node * summary['node_sets'][PHYS_FIXED]} DOFs), "
-            + (
-                f"Fy = {load.fy:g} N spread over {load.nodes.size} nodes "
-                f"(shares {', '.join(f'{v:.3g}' for v in load.node_shares())})"
-                if load.nodes.size > 1
-                else f"Fy = {load.fy:g} N at node {load.node}"
+        for case, c in [(None, c) for c in constraints] + [
+            (case, c) for case in cases for c in case.constraints
+        ]:
+            comps = c.components(domain.dim)
+            what = ", ".join(f"u{'xyz'[i]} = {v:g}" for i, v in comps.items())
+            log.log(
+                (f"case '{case.name}': " if case is not None else "")
+                + f"constraint on '{c.region}' ({mesh.node_sets[c.region].size} nodes): {what}"
             )
+        log.log(
+            f"{constrained.size} constrained DOFs"
+            + (" (over all cases)" if case_constraints else "")
+            + "; every rigid-body motion held"
         )
+        for case, loads_c in zip(cases, nodal):
+            for f, lc in zip(case.loads, loads_c):
+                shares_text = (
+                    f" (shares {', '.join(f'{v:.3g}' for v in lc.node_shares())})"
+                    if 1 < lc.nodes.size <= 6 else ""
+                )
+                log.log(
+                    f"case '{case.name}' (weight {case.weight:g}): F = "
+                    f"({', '.join(f'{v:g}' for v in f.vector)}) N on '{f.region}', spread over "
+                    f"{lc.nodes.size} node(s) by {_REGION_KIND[region_dim(regions[f.region])]}"
+                    f" tributary share{shares_text}"
+                )
         ke_all = element_stiffnesses(mesh, material, depth)
         n_edof = ke_all.shape[1]
-        gauss = "x".join(["2"] * mesh.dim)
         log.log(
             f"assembled {ke_all.shape[0]} element stiffness matrices "
-            f"({n_edof}x{n_edof}, {gauss} Gauss)"
+            f"({n_edof}x{n_edof}, {len(mesh.element.quadrature[1])}-point quadrature)"
         )
-        result = fea_solve(
+        density0 = np.where(passive, 0.0, 1.0) if passive.any() else None
+        results = solve_cases(
             mesh=mesh,
             material=material,
             thickness=depth,
-            load=load,
-            fixed_node_set=PHYS_FIXED,
-            densities=np.where(passive, 0.0, 1.0) if passive.any() else None,
+            loads=nodal,
+            prescribed=prescribed_arg,
+            densities=density0,
             ke_all=ke_all,
+            solver=solver,
         )
-        beam = timoshenko_tip_deflection(
+        result = results[0]
+        weights = np.array([case.weight for case in cases])
+        total = float(weights @ [r.compliance for r in results])
+        tip_uy = float(result.component(1)[load.nodes].mean())
+        reactions = [float(result.component(i, "reactions").sum()) for i in range(mesh.dim)]
+        reaction_y = reactions[1]
+        # a reference only the parametric cantilever has: tip-loaded beam theory
+        beam = None if scripted or len(forces) != 1 else timoshenko_tip_deflection(
             domain.length, domain.height, depth, material, load.fy
         )
-        tip_uy = float(result.component(1)[load.nodes].mean())
-        rel = abs(abs(tip_uy) - beam["total"]) / beam["total"]
-        reaction_y = float(result.component(1, "reactions").sum())
+        rel = abs(abs(tip_uy) - beam["total"]) / beam["total"] if beam else None
 
-        log.log(f"solved {result.n_free_dofs} free DOFs (sparse direct)")
-        log.log(f"compliance F.U = {result.compliance:.6g} N*mm")
-        log.log(
-            f"tip deflection uy = {tip_uy:.6g} mm"
-            + (" (mean over the load line)" if load.nodes.size > 1 else "")
+        how = (
+            f"multigrid-preconditioned CG, {result.solver_iterations} iterations"
+            if result.solver == "amg-cg" else
+            "CalculiX" if result.solver == "calculix" else f"sparse {result.solver}"
         )
+        log.log(f"solved {result.n_free_dofs} free DOFs ({how})"
+                + (f", {len(cases)} load cases" if len(cases) > 1 else ""))
+        case_summaries = []
+        for case, r, loads_c in zip(cases, results, nodal):
+            applied = sum((np.array(lc.components(mesh.dim)) for lc in loads_c), np.zeros(mesh.dim))
+            react = [float(r.component(i, "reactions").sum()) for i in range(mesh.dim)]
+            log.log(
+                f"case '{case.name}': compliance = {r.compliance:.6g} N*mm; reactions "
+                f"({', '.join(f'{v:.6g}' for v in react)}) N vs applied "
+                f"({', '.join(f'{0.0 - v:g}' for v in applied)}) N; "
+                + (f"CalculiX's nodal forces sum to {r.equilibrium_residual:.3e} N"
+                   if r.solver == "calculix" else
+                   f"||KU - F|| on free DOFs = {r.equilibrium_residual:.3e}")
+            )
+            case_summaries.append({
+                "name": case.name, "weight": case.weight, "compliance": r.compliance,
+                "reactions": react, "applied": [float(v) for v in applied],
+                "equilibrium_residual": r.equilibrium_residual,
+                "max_displacement": float(r.displacement_magnitude.max()),
+            })
+        if len(cases) > 1:
+            log.log(f"weighted compliance = {total:.6g} N*mm")
+        log.log(f"compliance F.U = {total:.6g} N*mm"
+                + (" (f.u - u_p.r_p: prescribed displacements do work)" if any(v for held_c in case_prescribed for v in held_c.values()) else ""))
         log.log(
-            f"Timoshenko beam theory: {beam['total']:.6g} mm "
-            f"(bending {beam['bending']:.4g} + shear {beam['shear']:.4g}) "
-            f"-> {rel * 100:.2f}% difference"
-            + (" (beam theory ignores the cutouts)" if domain.holes else "")
+            f"uy at the load = {tip_uy:.6g} mm"
+            + (f" (mean over {load.nodes.size} nodes)" if load.nodes.size > 1 else "")
         )
+        if beam:
+            log.log(
+                f"Timoshenko beam theory: {beam['total']:.6g} mm "
+                f"(bending {beam['bending']:.4g} + shear {beam['shear']:.4g}) "
+                f"-> {rel * 100:.2f}% difference"
+                + (" (beam theory ignores the cutouts)" if domain.has_cutouts else "")
+            )
         log.log(
-            f"equilibrium: ||KU - F|| on free DOFs = {result.equilibrium_residual:.3e}, "
-            f"sum of vertical reactions = {reaction_y:.6g} N vs applied {-load.fy:g} N"
+            (f"equilibrium: CalculiX's nodal forces sum to {result.equilibrium_residual:.3e} N"
+             if result.solver == "calculix" else
+             f"equilibrium: ||KU - F|| on free DOFs = {result.equilibrium_residual:.3e}")
+            + f", sum of reactions = ({', '.join(f'{v:.6g}' for v in reactions)}) N"
         )
         log.log(
             f"von Mises at centroids: {result.von_mises.min():.4g} – "
             f"{result.von_mises.max():.4g} MPa"
+            + (f" (case '{cases[0].name}')" if len(cases) > 1 else "")
         )
         log.log(
             "element compliances u_e^T k_e u_e sum to "
             f"{result.element_compliance.sum():.6g} N*mm — the SIMP sensitivity basis"
         )
         solve_summary = {
-            "compliance": result.compliance,
+            "compliance": total,
+            "cases": case_summaries,
             "tip_uy": tip_uy,
             "max_deflection": result.max_deflection(),
             "beam_theory": beam,
             "beam_theory_rel_diff": rel,
             "equilibrium_residual": result.equilibrium_residual,
             "reaction_y": reaction_y,
+            "reactions": reactions,
             "n_free_dofs": result.n_free_dofs,
+            "solver": result.solver,
+            "solver_iterations": result.solver_iterations,
             "von_mises_min": float(result.von_mises.min()),
             "von_mises_max": float(result.von_mises.max()),
             "element_compliance_sum": float(result.element_compliance.sum()),
             "load": load.as_dict(),
             "material": material.as_dict(),
         }
+        if crosscheck:
+            solve_summary["crosscheck"] = _crosscheck(
+                log, mesh, material, depth, nodal, prescribed_arg, density0, ke_all, results,
+                cases, solver, 3.0, "full density",
+            )
         log.record(**solve_summary)
         summary["solve"] = solve_summary
 
@@ -377,23 +787,83 @@ def run(
                         f"vol = {record['volume_fraction']:.4f}  "
                         f"change = {record['change']:.4f}  "
                         f"Mnd = {record['measure_of_discreteness']:5.1f}%"
+                        + (f"  limits {record['max_violation']:+.3f}"
+                           if "max_violation" in record else "")
+                        + (f"  beta {record['beta']:g}" if "beta" in record else "")
                     )
                 if snapshot_every and it % snapshot_every == 0:
                     save_density_field(
                         mesh, densities, snapshots_dir / f"density_iter_{it:04d}.vtu"
                     )
 
-            design = optimize(
-                mesh=mesh,
-                material=material,
-                thickness=depth,
-                load=load,
-                fixed_node_set=PHYS_FIXED,
-                params=simp,
-                on_iteration=on_iteration,
-                passive=passive,
-            )
-            reduction = (design.compliance / result.compliance) if result.compliance else float("nan")
+            if simp.projection:
+                log.log(
+                    f"Heaviside projection at eta = {simp.projection_eta:g}: beta from 1, doubled "
+                    f"every {simp.projection_every} iterations (or once the design settles) "
+                    f"up to {simp.projection:g}"
+                )
+            optimizer = simp.optimizer
+            if optimizer == "auto":
+                plain = objective == "compliance" and not limits and not simp.projection
+                optimizer = "oc" if plain else "mma"
+            if optimizer == "oc" and (limits or objective != "compliance"):
+                raise ValueError("limits or a volume objective need optimizer='mma'")
+            if optimizer in ("mma", "nlopt"):
+                if simp.filter_type == "sensitivity":
+                    log.log("MMA needs true gradients: using the density filter")
+                simp = dataclasses.replace(simp, filter_type="density")
+                driver_limits = _driver_limits(limits, cases, mesh)
+                if any(lim.kind == "stress" for lim in driver_limits) and simp.move_limit > STRESS_MOVE:
+                    log.log(
+                        f"stress limits: move limit {simp.move_limit:g} -> {STRESS_MOVE:g} (the "
+                        "p-norm is ruled by a few elements; larger steps outrun MMA's model)"
+                    )
+                    simp = dataclasses.replace(simp, move_limit=STRESS_MOVE)
+                log.log(
+                    f"optimizer: {'MMA' if optimizer == 'mma' else 'NLopt MMA'}, minimising {objective}"
+                    + ("" if objective == "volume" else f" with volume <= {simp.volume_fraction:g}")
+                    + "".join(f"; {lim.label} <= {lim.bound:g}" for lim in driver_limits)
+                )
+            else:
+                log.log("optimizer: Optimality Criteria")
+            if solid.any():
+                log.log(f"{int(solid.sum())} elements held solid, {int(passive.sum())} held void")
+            if len(cases) > 1:
+                log.log(
+                    "objective: the weighted sum of the load cases' compliances ("
+                    + " + ".join(f"{c.weight:g} x {c.name}" for c in cases) + ")"
+                )
+            weighted = [(case.weight, loads_c) for case, loads_c in zip(cases, nodal)]
+            if optimizer in ("mma", "nlopt"):
+                design = optimize_mma(
+                    mesh, material, depth, weighted, simp, objective=objective,
+                    limits=driver_limits, prescribed=prescribed_arg, passive=passive, solid=solid,
+                    solver=solver, on_iteration=on_iteration, driver=optimizer,
+                )
+                for lim in design.limits:
+                    log.log(
+                        f"limit {lim['label']}: {lim['value']:.6g} of {lim['bound']:g} "
+                        f"({'met' if lim['satisfied'] else 'EXCEEDED'})"
+                    )
+            else:
+                design = optimize(
+                    mesh=mesh,
+                    material=material,
+                    thickness=depth,
+                    load=None,
+                    fixed_node_set=None,
+                    params=simp,
+                    on_iteration=on_iteration,
+                    passive=passive,
+                    solver=solver,
+                    cases=weighted,
+                    prescribed=prescribed_arg,
+                    solid=solid,
+                )
+            reduction = (design.compliance / total) if total else float("nan")
+            if len(cases) > 1:
+                for case, c_value in zip(cases, design.case_compliances):
+                    log.log(f"case '{case.name}': compliance {c_value:.6g} N*mm")
             log.log(
                 f"{'converged' if design.converged else 'stopped'} after "
                 f"{design.iterations} iterations"
@@ -401,7 +871,7 @@ def run(
             log.log(
                 f"compliance {design.compliance:.4f} N*mm at {design.volume_fraction:.3f} "
                 f"volume fraction ({reduction:.2f}x the full-density compliance, "
-                f"with {simp.volume_fraction:g} of the material)"
+                f"with {design.volume_fraction:.3g} of the material)"
             )
             log.log(
                 f"measure of discreteness Mnd = {design.measure_of_discreteness():.1f}% "
@@ -410,6 +880,14 @@ def run(
             )
             opt_summary = design.as_dict()
             opt_summary["compliance_ratio_to_full_density"] = reduction
+            if crosscheck:
+                final = solve_cases(mesh, material, depth, nodal, densities=design.densities,
+                                    penal=simp.penal, ke_all=ke_all, solver=solver,
+                                    prescribed=prescribed_arg)
+                opt_summary["crosscheck"] = _crosscheck(
+                    log, mesh, material, depth, nodal, prescribed_arg, design.densities, ke_all,
+                    final, cases, solver, simp.penal, "the optimized design",
+                )
             log.record(**opt_summary)
             summary["optimization"] = opt_summary
 

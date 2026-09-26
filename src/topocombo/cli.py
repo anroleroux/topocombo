@@ -6,15 +6,22 @@ import argparse
 import sys
 from pathlib import Path
 
-from .geometry import BeamDomain, BeamDomain3D, load_cad_config
+from .geometry import BeamDomain, BeamDomain3D, Domain
 from .meshing import MESH_MODES, MeshSpec, MeshSpec3D
 
-#: CadQuery inputs and their defaults.  The flags default to None so an
-#: explicit flag can be told apart from a value read from --cad-config:
-#: flag > config file > these defaults.
+#: Inputs of the parametric beam and their defaults.  The flags default to None
+#: so a flag that --study makes meaningless can be rejected.
 CAD_DEFAULTS = {
     "dim": 2, "length": 60.0, "height": 20.0, "thickness": 1.0, "width": 1.0, "holes": (),
 }
+
+
+def _nav(text: str) -> tuple[str, str]:
+    """``LABEL=URL`` -> (label, url)."""
+    label, sep, url = text.partition("=")
+    if not sep or not label or not url:
+        raise argparse.ArgumentTypeError(f"expected LABEL=URL, not {text!r}")
+    return label, url
 
 
 def _hole(text: str) -> tuple[float, float, float]:
@@ -26,13 +33,23 @@ def _hole(text: str) -> tuple[float, float, float]:
     return x, y, d
 
 
+#: Flags a study sets itself; given together with --study they are an error.
+#: (--out, --site and --no-optimize still apply.)
+_STUDY_SETS = (
+    "dim", "length", "height", "thickness", "width", "holes", "nelx", "nely", "nelz",
+    "mesh_mode", "mesh_size", "youngs", "poisson", "load", "volfrac", "penal", "rmin",
+    "filter_type", "max_iter", "tol", "element", "solver", "optimizer",
+)
+
+
 def _add_cad_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
-        "--cad-config",
+        "--study",
         type=Path,
         default=None,
-        help="JSON or TOML file with the CadQuery inputs (dim, length, height, thickness,"
-        " width, holes); flags given on the command line override it",
+        help="a study script (study.py): it names the CadQuery part script and sets the"
+        " mesh, material, constraints, loads and optimizer. Without it, the flags below"
+        " describe a parametric cantilever",
     )
     p.add_argument(
         "--dim",
@@ -59,25 +76,36 @@ def _add_cad_args(p: argparse.ArgumentParser) -> None:
         action="append",
         default=None,
         metavar="X,Y,D",
-        help="circular cutout through z, diameter D centred at (X, Y) in mm; repeatable,"
-        " and replaces any holes from --cad-config (default: none)",
+        help="circular cutout through z, diameter D centred at (X, Y) in mm; repeatable"
+        " (default: none)",
     )
 
 
-def _resolve_cad_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    """Fill the CadQuery inputs in ``args``: flag, else config file, else default."""
-    config: dict = {}
-    if args.cad_config is not None:
-        try:
-            config = load_cad_config(args.cad_config)
-        except (OSError, ValueError) as exc:
-            parser.error(f"--cad-config: {exc}")
+def _resolve_cad_args(
+    parser: argparse.ArgumentParser, sub: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Fill the parametric beam inputs in ``args`` with their defaults; with
+    --study the study sets them, so giving them too is rejected."""
+    if args.study is not None:
+        given = [
+            k for k in _STUDY_SETS
+            if hasattr(args, k) and getattr(args, k) != sub.get_default(k)
+        ]
+        if given:
+            flags = ", ".join(
+                {"holes": "--hole", "mesh_mode": "--mesh", "filter_type": "--filter"}.get(
+                    k, "--" + k.replace("_", "-")
+                )
+                for k in given
+            )
+            parser.error(f"--study sets these itself; drop {flags}")
+        return
     for key, default in CAD_DEFAULTS.items():
         if getattr(args, key) is None:
-            setattr(args, key, config.get(key, default))
+            setattr(args, key, default)
 
 
-def _domain(parser: argparse.ArgumentParser, args: argparse.Namespace) -> BeamDomain | BeamDomain3D:
+def _domain(parser: argparse.ArgumentParser, args: argparse.Namespace) -> Domain:
     try:
         if args.dim == 3:
             return BeamDomain3D(
@@ -86,7 +114,7 @@ def _domain(parser: argparse.ArgumentParser, args: argparse.Namespace) -> BeamDo
         return BeamDomain(
             length=args.length, height=args.height, thickness=args.thickness, holes=args.holes
         )
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         parser.error(str(exc))
 
 
@@ -99,6 +127,29 @@ def _add_model_args(p: argparse.ArgumentParser) -> None:
         type=int,
         default=1,
         help="3D only: elements through the width (default: 1, keeps runs light)",
+    )
+    p.add_argument(
+        "--optimizer",
+        choices=("auto", "oc", "mma", "nlopt"),
+        default="auto",
+        help="Optimality Criteria, MMA or NLopt's MMA (both with the density filter)"
+        " (default: auto, which is OC for the parametric beam's minimum compliance)",
+    )
+    p.add_argument(
+        "--solver",
+        choices=("auto", "direct", "cg", "calculix"),
+        default="auto",
+        help="linear solver: direct sparse LU, multigrid-preconditioned CG, auto, or the "
+        "external CalculiX (ccx)"
+        " (direct up to 30k free DOFs) (default: auto)",
+    )
+    p.add_argument(
+        "--element",
+        choices=("hex8", "tet4", "tet10"),
+        default="hex8",
+        help="3D only: hex8 (structured or extruded hexahedra) or tetrahedra meshed from"
+        " the solid, body-fitted only: tet10 (quadratic) or tet4 (linear, stiff in"
+        " bending) (default: hex8)",
     )
     p.add_argument(
         "--mesh",
@@ -179,27 +230,45 @@ def main(argv: list[str] | None = None) -> int:
     p_report = sub.add_parser("report", help="render an HTML report from a run directory")
     p_report.add_argument("--run", type=Path, default=Path("results/cantilever"))
     p_report.add_argument("--site", type=Path, default=Path("site"))
+    p_report.add_argument("--nav", type=_nav, action="append", default=None, metavar="LABEL=URL",
+                          help="link to another report from this one; repeatable")
 
     p_all = sub.add_parser("all", help="run the pipeline, then render the HTML report")
     _add_model_args(p_all)
     p_all.add_argument("--site", type=Path, default=Path("site"))
+    p_all.add_argument("--nav", type=_nav, action="append", default=None, metavar="LABEL=URL",
+                       help="link to another report from this one; repeatable")
 
     args = parser.parse_args(argv)
-    if args.command in ("cad", "run", "all"):
-        _resolve_cad_args(parser, args)
+    subparsers = {"cad": p_cad, "run": p_run, "all": p_all}
+    if args.command in subparsers:
+        _resolve_cad_args(parser, subparsers[args.command], args)
+
+    loaded = None
+    if getattr(args, "study", None) is not None:
+        from .study import load_study
+
+        try:
+            loaded = load_study(args.study)
+        except (OSError, ValueError) as exc:
+            parser.error(f"--study: {exc}")
 
     if args.command == "cad":
         from .cadview import render_brep
         from .geometry import export_domain
 
-        domain = _domain(parser, args)
+        domain = loaded.domain if loaded else _domain(parser, args)
         print(domain.cadquery_script())
         exported = export_domain(domain, args.out)
         exported["png"] = render_brep(exported["brep"], args.out / "design_domain.png")
         for kind, path in exported.items():
             print(f"{kind}: {path}")
 
-    if args.command in ("run", "all"):
+    if args.command in ("run", "all") and loaded is not None:
+        from .study import run_loaded
+
+        run_loaded(loaded, args.out, optimize=not args.no_optimize)
+    elif args.command in ("run", "all"):
         from .fea import Material
         from .optimize import SimpParams
         from .pipeline import run
@@ -208,8 +277,15 @@ def main(argv: list[str] | None = None) -> int:
         mesh_opts = {"mode": args.mesh_mode, "size": args.mesh_size}
         try:
             if args.dim == 3:
-                spec = MeshSpec3D(nelx=args.nelx, nely=args.nely, nelz=args.nelz, **mesh_opts)
+                from .elements import BY_NAME
+
+                spec = MeshSpec3D(
+                    nelx=args.nelx, nely=args.nely, nelz=args.nelz,
+                    element=BY_NAME[args.element], **mesh_opts,
+                )
             else:
+                if args.element != "hex8":
+                    parser.error("--element picks a 3D element; a 2D run uses quad4")
                 spec = MeshSpec(nelx=args.nelx, nely=args.nely, **mesh_opts)
         except ValueError as exc:
             parser.error(str(exc))
@@ -221,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
             filter_type=args.filter_type,
             max_iterations=args.max_iter,
             tolerance=args.tol,
+            optimizer=args.optimizer,
         )
         run(
             domain=domain,
@@ -230,14 +307,14 @@ def main(argv: list[str] | None = None) -> int:
             load_fy=args.load,
             simp=simp,
             optimize_design=not args.no_optimize,
-            cad_config=args.cad_config,
+            solver=args.solver,
         )
 
     if args.command in ("report", "all"):
         from .report import build_site
 
         run_dir = args.run if args.command == "report" else args.out
-        index = build_site(run_dir=run_dir, site_dir=args.site)
+        index = build_site(run_dir=run_dir, site_dir=args.site, nav=args.nav)
         print(f"report: {index}")
 
     return 0

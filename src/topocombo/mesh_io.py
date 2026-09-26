@@ -19,71 +19,33 @@ from typing import Any
 import meshio
 import numpy as np
 
-from .geometry import BeamDomain, BeamDomain3D
-from .meshing import PHYS_FIXED, PHYS_LOAD
+from .elements import ELEMENTS, Element, element, gauss_legendre_2, jacobians, measures
+from .geometry import Domain
+from .meshing import PHYS_DOMAIN
 
 
-#: Nodes per cell for every supported cell type (meshio naming).
-CELL_NODES = {"quad": 4, "hexahedron": 8}
-
-#: Spatial dimension of each cell type, and the boundary cell type that carries
-#: its node sets (edges bound a quad mesh, faces bound a hex mesh).
-CELL_DIM = {"quad": 2, "hexahedron": 3}
-BOUNDARY_CELL = {"quad": "line", "hexahedron": "quad"}
-
-#: Reference coordinates of the cell corners, in Gmsh / VTK node order: quads
-#: counter-clockwise; hexes bottom face (zeta = -1) then top face, each
-#: counter-clockwise seen from +z.
-REFERENCE_NODES = {
-    "quad": np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]]),
-    "hexahedron": np.array(
-        [
-            [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [1.0, 1.0, -1.0], [-1.0, 1.0, -1.0],
-            [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0],
-        ]
-    ),
-}
-
-#: Corner pairs joined by an edge.
-CELL_EDGES = {
-    "quad": [(0, 1), (1, 2), (2, 3), (3, 0)],
-    "hexahedron": [
-        (0, 1), (1, 2), (2, 3), (3, 0),  # bottom
-        (4, 5), (5, 6), (6, 7), (7, 4),  # top
-        (0, 4), (1, 5), (2, 6), (3, 7),  # verticals
-    ],
-}
-
-#: Gauss-Legendre points (weights 1) of the 2-point rule, per coordinate.
-_G = 1.0 / np.sqrt(3.0)
+#: Per-cell-type tables, derived from the element registry
+#: (:mod:`topocombo.elements`), which is where element facts live.
+CELL_NODES = {t: e.n_nodes for t, e in ELEMENTS.items()}
+CELL_DIM = {t: e.dim for t, e in ELEMENTS.items()}
+BOUNDARY_CELL = {t: e.facet_cell_type for t, e in ELEMENTS.items()}
+REFERENCE_NODES = {t: e.reference_nodes for t, e in ELEMENTS.items()}
+CELL_EDGES = {t: list(e.edges) for t, e in ELEMENTS.items()}
 
 
 def shape_derivatives(cell_type: str, point: np.ndarray) -> np.ndarray:
-    """dN/dxi of the (bi/tri)linear shape functions at ``point``, shape (n_nodes, dim).
-
-    ``N_a = prod_i (1 + xi_a,i * xi_i) / 2^dim`` for both quads and hexes.
-    """
-    ref = REFERENCE_NODES[cell_type]
-    dim = ref.shape[1]
-    factors = 1.0 + ref * np.asarray(point, dtype=float)  # (n, dim)
-    out = np.empty_like(ref)
-    for i in range(dim):
-        others = np.prod(np.delete(factors, i, axis=1), axis=1)
-        out[:, i] = ref[:, i] * others
-    return out / 2.0**dim
+    """dN/dxi of the cell type's shape functions at ``point``, shape (n_nodes, dim)."""
+    return element(cell_type).shape_derivatives(np.asarray(point, dtype=float))
 
 
 def gauss_points(dim: int) -> np.ndarray:
     """The 2^dim points of the 2-point Gauss rule on the reference cell (weights 1)."""
-    grids = np.meshgrid(*([[-_G, _G]] * dim), indexing="ij")
-    return np.column_stack([g.ravel() for g in grids])
+    return gauss_legendre_2(dim)[0]
 
 
 def jacobian_determinants(nodes: np.ndarray, cells: np.ndarray, cell_type: str, point) -> np.ndarray:
     """det(J) of the isoparametric map of every cell at reference ``point``."""
-    dn = shape_derivatives(cell_type, np.asarray(point, dtype=float))  # (n, dim)
-    jac = np.einsum("ni,enj->eij", dn, nodes[cells])  # (m, dim, dim)
-    return np.linalg.det(jac)
+    return np.linalg.det(jacobians(element(cell_type), nodes[cells], np.asarray(point, dtype=float)))
 
 
 @dataclass
@@ -101,7 +63,7 @@ class Mesh:
     cell_type: str = "quad"
 
     def __post_init__(self) -> None:
-        if self.cell_type not in CELL_NODES:
+        if self.cell_type not in ELEMENTS:
             raise ValueError(f"unsupported cell type {self.cell_type!r}")
         if self.cells.ndim != 2 or self.cells.shape[1] != CELL_NODES[self.cell_type]:
             raise ValueError(
@@ -113,6 +75,11 @@ class Mesh:
                 f"{self.cell_type} meshes need {CELL_DIM[self.cell_type]}D nodes, "
                 f"got shape {self.nodes.shape}"
             )
+
+    @property
+    def element(self) -> Element:
+        """The element this mesh is made of (see :mod:`topocombo.elements`)."""
+        return ELEMENTS[self.cell_type]
 
     @property
     def dim(self) -> int:
@@ -137,23 +104,20 @@ class Mesh:
 
     @property
     def measure_name(self) -> str:
-        return "area" if self.dim == 2 else "volume"
+        return self.element.measure_name
 
     def cell_measures(self) -> np.ndarray:
         """Signed size of every cell: area in 2D, volume in 3D.
 
-        Integrates det(J) with the 2-point Gauss rule, which is exact for
-        bilinear quads and trilinear hexes; a negative value means the cell is
+        Integrates det(J) with the element's quadrature (exact for bilinear
+        quads and trilinear hexes); a negative value means the cell is
         inverted (clockwise quad, left-handed hex).
         """
-        return sum(
-            jacobian_determinants(self.nodes, self.cells, self.cell_type, point)
-            for point in gauss_points(self.dim)
-        )
+        return measures(self.element, self.nodes, self.cells)
 
     def edge_lengths(self) -> np.ndarray:
         """Lengths of every edge of every cell, shape (n_elements, n_edges)."""
-        a, b = np.array(CELL_EDGES[self.cell_type]).T
+        a, b = np.array(self.element.edges).T
         xyz = self.nodes[self.cells]
         return np.linalg.norm(xyz[:, b] - xyz[:, a], axis=2)
 
@@ -181,36 +145,38 @@ def _nodes_in_group(mesh: meshio.Mesh, tag: int, block_type: str) -> np.ndarray:
     return np.unique(np.concatenate(picked)).astype(int)
 
 
-#: Node permutation that mirrors a cell, turning an inverted one right way round:
-#: a quad is walked backwards, a hex has both faces walked backwards.
-_FLIP = {"quad": [3, 2, 1, 0], "hexahedron": [0, 3, 2, 1, 4, 7, 6, 5]}
-
-
 def orient_cells(nodes: np.ndarray, cells: np.ndarray, cell_type: str) -> np.ndarray:
     """Reorder inverted cells so det(J) is positive at every cell centre.
 
     Element stiffness integration needs a positive Jacobian; Gmsh's ordering is
     normally right already, so this is a guard rather than a transformation.
     """
+    el = element(cell_type)
     cells = np.array(cells, copy=True)
-    centre = np.zeros(CELL_DIM[cell_type])
-    inverted = jacobian_determinants(nodes, cells, cell_type, centre) < 0
-    cells[inverted] = cells[inverted][:, _FLIP[cell_type]]
+    inverted = jacobian_determinants(nodes, cells, cell_type, el.centre) < 0
+    cells[inverted] = cells[inverted][:, list(el.flip)]
     return cells
 
 
 def load_mesh(msh_path: Path) -> Mesh:
-    """Load a quad (2D) or hex (3D) mesh and its boundary node sets from a Gmsh file.
+    """Load a mesh of one supported element type, and any boundary node sets,
+    from a Gmsh file.
 
-    The cell type decides the dimension: hexahedra make a 3D mesh whose node
-    sets come from boundary faces; otherwise quads make a 2D mesh whose node
-    sets come from boundary edges.
+    The element is the highest-dimensional supported cell type in the file
+    (see :mod:`topocombo.elements`); lower-dimensional cells there are facets
+    carrying boundary groups.
     """
     mesh = meshio.read(str(msh_path))
-    present = {b.type for b in mesh.cells}
-    cell_type = "hexahedron" if "hexahedron" in present else "quad"
-    if cell_type not in present:
-        raise ValueError(f"{msh_path} contains no quadrilateral or hexahedral elements")
+    present = {b.type for b in mesh.cells} & set(ELEMENTS)
+    if not present:
+        raise ValueError(
+            f"{msh_path} contains none of the supported elements: {', '.join(ELEMENTS)}"
+        )
+    top = max(ELEMENTS[t].dim for t in present)
+    candidates = sorted(t for t in present if ELEMENTS[t].dim == top)
+    if len(candidates) > 1:
+        raise ValueError(f"{msh_path} mixes element types {', '.join(candidates)}")
+    cell_type = candidates[0]
 
     nodes = np.asarray(mesh.points, dtype=float)[:, : CELL_DIM[cell_type]]
     cells = np.vstack([np.asarray(b.data, dtype=int) for b in mesh.cells if b.type == cell_type])
@@ -218,9 +184,9 @@ def load_mesh(msh_path: Path) -> Mesh:
 
     tags = _physical_tags(mesh)
     node_sets: dict[str, np.ndarray] = {}
-    for name in (PHYS_FIXED, PHYS_LOAD):
-        if name in tags:
-            node_sets[name] = _nodes_in_group(mesh, tags[name], BOUNDARY_CELL[cell_type])
+    for name, tag in tags.items():  # boundary groups, if the .msh carries any
+        if name != PHYS_DOMAIN:
+            node_sets[name] = _nodes_in_group(mesh, tag, BOUNDARY_CELL[cell_type])
 
     return Mesh(nodes=nodes, cells=cells, node_sets=node_sets, cell_type=cell_type)
 
@@ -258,7 +224,7 @@ def nodes_on_segment(
 
 def _in_plane_edge_ratio(mesh: Mesh) -> np.ndarray:
     """Per element, longest over shortest edge, counting only edges in x-y."""
-    a, b = np.array(CELL_EDGES[mesh.cell_type]).T
+    a, b = np.array(mesh.element.edges).T
     xyz = mesh.nodes[mesh.cells]
     vec = xyz[:, b] - xyz[:, a]
     lengths = np.linalg.norm(vec, axis=2)
@@ -266,6 +232,22 @@ def _in_plane_edge_ratio(mesh: Mesh) -> np.ndarray:
         in_plane = np.abs(vec[:, :, 2]) < 1e-9 * lengths.max()
         lengths = np.where(in_plane, lengths, np.nan)
     return np.nanmax(lengths, axis=1) / np.nanmin(lengths, axis=1)
+
+
+#: Tetrahedra: the lowest acceptable shape quality ``6 sqrt(2) V / l_rms^3``
+#: (1 for a regular tetrahedron, 0 for a flat one); Gmsh's optimised meshes
+#: stay well above it.
+TET_QUALITY_MIN = 0.1
+
+
+def tet_quality(mesh: Mesh) -> np.ndarray:
+    """Shape quality of every tetrahedron from its corners: ``6 sqrt(2) V /
+    l_rms^3``, 1 for a regular one and 0 for a flat one."""
+    p = mesh.nodes[mesh.cells[:, :4]]
+    vol = np.einsum("ij,ij->i", np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), p[:, 3] - p[:, 0]) / 6
+    a, b = np.array(mesh.element.edges).T
+    l_rms = np.sqrt((np.linalg.norm(p[:, b] - p[:, a], axis=2) ** 2).mean(axis=1))
+    return 6.0 * np.sqrt(2.0) * vol / l_rms**3
 
 
 #: Body-fitted checks: the meshed measure may differ from the CAD one by the
@@ -277,7 +259,7 @@ FITTED_EDGE_RATIO_MAX = 4.0
 
 
 def check_mesh(
-    mesh: Mesh, domain: BeamDomain | BeamDomain3D, expected_elements: int | None
+    mesh: Mesh, domain: Domain, expected_elements: int | None
 ) -> dict[str, Any]:
     """Validate the mesh against the design domain; return a quality summary.
 
@@ -287,7 +269,7 @@ def check_mesh(
     shape (cutouts removed) and for element quality instead.
     """
     fitted = expected_elements is None
-    if isinstance(domain, BeamDomain3D):
+    if domain.dim == 3:
         extent = np.array([domain.length, domain.height, domain.width])
         domain_measure = domain.material_volume if fitted else domain.volume
     else:
@@ -304,7 +286,11 @@ def check_mesh(
 
     rtol = FITTED_MEASURE_RTOL if fitted else 1e-6
     checks = {}
-    if fitted:
+    tets = mesh.cell_type.startswith("tetra")
+    quality = tet_quality(mesh) if tets else None
+    if tets:
+        checks[f"tet_quality_above_{TET_QUALITY_MIN:g}"] = bool(quality.min() > TET_QUALITY_MIN)
+    elif fitted:
         checks[f"edge_ratio_below_{FITTED_EDGE_RATIO_MAX:g}"] = bool(
             _in_plane_edge_ratio(mesh).max() < FITTED_EDGE_RATIO_MAX
         )
@@ -319,9 +305,9 @@ def check_mesh(
             np.all(np.abs(lower) < 1e-9) and np.all(np.abs(upper - extent) < 1e-9 * extent)
         ),
         "no_orphan_nodes": bool(np.unique(mesh.cells).size == mesh.n_nodes),
-        "fixed_set_non_empty": bool(mesh.node_sets.get(PHYS_FIXED, np.empty(0)).size > 0),
-        "load_set_non_empty": bool(mesh.node_sets.get(PHYS_LOAD, np.empty(0)).size > 0),
     }
+    for set_name, idx in mesh.node_sets.items():
+        checks[f"region_{set_name}_has_nodes"] = bool(np.asarray(idx).size > 0)
 
     return {
         "n_nodes": mesh.n_nodes,
@@ -336,6 +322,8 @@ def check_mesh(
         "edge_length_min": float(edges.min()),
         "edge_length_max": float(edges.max()),
         "aspect_ratio_max": float(aspect.max()),
+        **({"tet_quality_min": float(quality.min()), "tet_quality_mean": float(quality.mean())}
+           if tets else {}),
         "bounding_box": [float(v) for v in (*lower, *upper)],
         "node_sets": {name: int(idx.size) for name, idx in mesh.node_sets.items()},
         "checks": checks,
@@ -359,6 +347,11 @@ def save_mesh(
     load_node: int | None = None,
     load_nodes: np.ndarray | None = None,
     passive: np.ndarray | None = None,
+    fixed_nodes: np.ndarray | None = None,
+    load_vector: Any = None,
+    solid: np.ndarray | None = None,
+    clamped_nodes: np.ndarray | None = None,
+    held: np.ndarray | None = None,
 ) -> dict[str, Path]:
     """Write the solver-facing ``mesh.npz`` and the visualisation-facing ``mesh.vtu``.
 
@@ -380,6 +373,16 @@ def save_mesh(
         arrays["load_nodes"] = np.asarray(load_nodes, dtype=int)
     if passive is not None:
         arrays["passive"] = np.asarray(passive, dtype=bool)
+    if fixed_nodes is not None:  # every constrained node, whatever its region
+        arrays["fixed_nodes"] = np.asarray(fixed_nodes, dtype=int)
+    if load_vector is not None:  # the total force, for drawing its direction
+        arrays["load_vector"] = np.asarray(load_vector, dtype=float)
+    if solid is not None:  # elements held solid (passive keep-in regions)
+        arrays["solid"] = np.asarray(solid, dtype=bool)
+    if clamped_nodes is not None:  # nodes with every component held at zero
+        arrays["clamped_nodes"] = np.asarray(clamped_nodes, dtype=int)
+    if held is not None:  # (len(fixed_nodes), dim): which components each one holds
+        arrays["held"] = np.asarray(held, dtype=bool)
 
     npz = out_dir / "mesh.npz"
     np.savez_compressed(npz, **arrays)

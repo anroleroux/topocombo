@@ -5,23 +5,20 @@ kernel and meshed with a *transfinite* (structured) quad grid, which is what the
 SIMP loop wants: one design variable per element, uniform element size, and a
 predictable element ordering.
 
-Boundary regions are tagged as physical groups so the downstream solver never
-has to re-derive them from coordinates:
-
-``design_domain``  the meshed surface (all quads)
-``fixed``          left edge — clamped
-``load_edge``      right edge — carries the tip load
+The meshed surface or volume is tagged ``design_domain``.  Nothing here knows
+where the part is held or loaded: that is the named regions' job
+(:mod:`topocombo.regions`), which pick their nodes from the finished mesh.
 
 The 3D domain is meshed the same way into a structured hexahedral grid
-(:func:`generate_hex_mesh`); the groups keep their names but tag the volume and
-the clamped / loaded *faces* (x = 0 and x = L) instead of edges.  By default the
-grid is one element through the width, which keeps the CI run light.
+(:func:`generate_hex_mesh`).  By default the grid is one element through the
+width, which keeps the CI run light.
 
 The *body-fitted* mode (:func:`generate_fitted_mesh`) meshes the real CAD
 profile, cutouts included: an unstructured all-quad mesh of the x-y face
 (frontal-Delaunay triangles recombined into quads), extruded through the width
-into hexahedra in 3D.  The right edge is split at mid-height first, so the tip
-load lands on real nodes.  The structured grid stays the default and the
+into hexahedra in 3D.  The corners of the named regions are embedded in the
+profile first, so a region that is not a whole CAD edge or face (a load line
+across the free end, say) still lands on real nodes.  The structured grid stays the default and the
 reference; the body-fitted one follows curved boundaries exactly (to within the
 chordal error of the element edges) at the cost of a non-uniform mesh.
 """
@@ -29,18 +26,17 @@ chordal error of the element edges) at the cost of a non-uniform mesh.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
 import gmsh
 
-from .geometry import BeamDomain, BeamDomain3D
+from .elements import HEX8, QUAD4, Element
+from .geometry import Domain
 
-#: Physical group names written into the .msh file.
+#: Physical group name of the meshed surface / volume in the .msh file.
 PHYS_DOMAIN = "design_domain"
-PHYS_FIXED = "fixed"
-PHYS_LOAD = "load_edge"
 
 _TOL = 1e-6
 
@@ -75,6 +71,9 @@ class MeshSpec:
             raise ValueError("nelx and nely must be >= 1")
         _check_mode(self.mode, self.size)
 
+    #: the element this spec meshes into
+    element: Element = field(default=QUAD4, init=False, repr=False, compare=False)
+
     @property
     def structured(self) -> bool:
         return self.mode == "structured"
@@ -88,7 +87,7 @@ class MeshSpec:
     def n_nodes(self) -> int | None:
         return (self.nelx + 1) * (self.nely + 1) if self.structured else None
 
-    def element_size(self, domain: BeamDomain | BeamDomain3D) -> float:
+    def element_size(self, domain: Domain) -> float:
         """The target edge length of a body-fitted mesh."""
         return self.size or min(domain.length / self.nelx, domain.height / self.nely)
 
@@ -105,18 +104,38 @@ class MeshSpec:
 
 @dataclass(frozen=True)
 class MeshSpec3D:
-    """Discretisation of the 3D design domain; one element through the width by default."""
+    """Discretisation of the 3D design domain.
+
+    Hexahedra (the default) come from a structured grid or from the x-y
+    profile extruded into ``nelz`` layers, so the part must be a prism along
+    z.  Tetrahedra (``TET4``, ``TET10``) are meshed by Gmsh from the solid
+    itself at edge length ``size`` — any 3D part, body-fitted only; ``nelz``
+    does not apply to them.
+    """
 
     nelx: int = 60
     nely: int = 20
     nelz: int = 1
     mode: str = "structured"
     size: float | None = None
+    #: the element this spec meshes into
+    element: Element = field(default=HEX8, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.nelx < 1 or self.nely < 1 or self.nelz < 1:
             raise ValueError("nelx, nely and nelz must be >= 1")
         _check_mode(self.mode, self.size)
+        if self.element.dim != 3:
+            raise ValueError(f"a 3D mesh takes 3D elements, not {self.element.name}")
+        if self.tetrahedral and self.structured:
+            raise ValueError(
+                f"{self.element.name} elements are meshed body-fitted; "
+                "the structured grid is hexahedral"
+            )
+
+    @property
+    def tetrahedral(self) -> bool:
+        return self.element.cell_type.startswith("tetra")
 
     @property
     def structured(self) -> bool:
@@ -131,23 +150,25 @@ class MeshSpec3D:
     def n_nodes(self) -> int | None:
         return (self.nelx + 1) * (self.nely + 1) * (self.nelz + 1) if self.structured else None
 
-    def element_size(self, domain: BeamDomain | BeamDomain3D) -> float:
-        """The target in-plane edge length of a body-fitted mesh (``nelz`` layers in z)."""
+    def element_size(self, domain: Domain) -> float:
+        """The target edge length of a body-fitted mesh: in-plane for extruded
+        hexes (``nelz`` layers in z), in every direction for tetrahedra."""
         return self.size or min(domain.length / self.nelx, domain.height / self.nely)
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "element": self.element.name,
             "mode": self.mode,
             "nelx": self.nelx,
             "nely": self.nely,
-            "nelz": self.nelz,
+            "nelz": None if self.tetrahedral else self.nelz,
             "size": self.size,
             "expected_elements": self.n_elements,
             "expected_nodes": self.n_nodes,
         }
 
 
-def _classify_curves(domain: BeamDomain) -> dict[str, list[int]]:
+def _classify_curves(domain: Domain) -> dict[str, list[int]]:
     """Sort the boundary curves of the imported face into named edges."""
     groups: dict[str, list[int]] = {"left": [], "right": [], "bottom": [], "top": []}
     for dim, tag in gmsh.model.getEntities(1):
@@ -210,7 +231,7 @@ def _write_msh(msh_path: Path) -> None:
 
 
 def generate_quad_mesh(
-    domain: BeamDomain,
+    domain: Domain,
     spec: MeshSpec,
     brep_path: Path,
     out_dir: Path,
@@ -240,10 +261,7 @@ def generate_quad_mesh(
         gmsh.model.mesh.setTransfiniteSurface(surf_tag)
         gmsh.model.mesh.setRecombine(2, surf_tag)
 
-        # Physical groups carry the boundary conditions downstream.
         gmsh.model.addPhysicalGroup(2, [surf_tag], name=PHYS_DOMAIN)
-        gmsh.model.addPhysicalGroup(1, edges["left"], name=PHYS_FIXED)
-        gmsh.model.addPhysicalGroup(1, edges["right"], name=PHYS_LOAD)
 
         gmsh.model.mesh.generate(2)
         gmsh.model.mesh.setOrder(1)
@@ -252,7 +270,7 @@ def generate_quad_mesh(
     return msh_path, gmsh_log
 
 
-def _classify_box(domain: BeamDomain3D) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+def _classify_box(domain: Domain) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
     """Sort the 12 edges of the box by direction and its 6 faces by position.
 
     Edges are keyed ``x``/``y``/``z`` (the axis they run along); faces are keyed
@@ -291,7 +309,7 @@ def _classify_box(domain: BeamDomain3D) -> tuple[dict[str, list[int]], dict[str,
 
 
 def generate_hex_mesh(
-    domain: BeamDomain3D,
+    domain: Domain,
     spec: MeshSpec3D,
     brep_path: Path,
     out_dir: Path,
@@ -325,10 +343,7 @@ def generate_hex_mesh(
                 gmsh.model.mesh.setRecombine(2, tag)  # quad faces -> hexahedra
         gmsh.model.mesh.setTransfiniteVolume(vol_tag)
 
-        # Physical groups carry the boundary conditions downstream.
         gmsh.model.addPhysicalGroup(3, [vol_tag], name=PHYS_DOMAIN)
-        gmsh.model.addPhysicalGroup(2, faces["xmin"], name=PHYS_FIXED)
-        gmsh.model.addPhysicalGroup(2, faces["xmax"], name=PHYS_LOAD)
 
         gmsh.model.mesh.generate(3)
         gmsh.model.mesh.setOrder(1)
@@ -337,58 +352,43 @@ def generate_hex_mesh(
     return msh_path, gmsh_log
 
 
-def _curves_at_x(x: float) -> list[int]:
-    """Curves lying in the plane x = const (the clamped or the loaded edge)."""
-    tags = []
-    for _, tag in gmsh.model.getEntities(1):
-        xmin, _, _, xmax, _, _ = gmsh.model.getBoundingBox(1, tag)
-        if abs(xmin - x) < _TOL and abs(xmax - x) < _TOL:
-            tags.append(tag)
-    return tags
-
-
-def _surfaces_at_x(x: float) -> list[int]:
-    tags = []
-    for _, tag in gmsh.model.getEntities(2):
-        xmin, _, _, xmax, _, _ = gmsh.model.getBoundingBox(2, tag)
-        if abs(xmin - x) < _TOL and abs(xmax - x) < _TOL:
-            tags.append(tag)
-    return tags
-
-
 def generate_fitted_mesh(
-    domain: BeamDomain | BeamDomain3D,
+    domain: Domain,
     spec: MeshSpec | MeshSpec3D,
     brep_path: Path,
     out_dir: Path,
     log: Any = None,
+    points: Any = (),
 ) -> tuple[Path, list[str]]:
-    """Mesh the CAD profile in ``brep_path`` (a planar x-y face, cutouts and all)
+    """Mesh the CAD profile in ``brep_path`` (any planar x-y face, cutouts and all)
     into unstructured quads — or, for a 3D domain, extrude those quads through
-    the width into ``spec.nelz`` layers of hexahedra.  Returns (msh path, gmsh log).
+    the width into ``spec.nelz`` layers of hexahedra.  ``points`` are (x, y)
+    positions the mesh must have nodes at (the corners of the named regions);
+    they are fused into the profile before meshing.  Returns (msh path, gmsh log).
     """
-    three_d = isinstance(domain, BeamDomain3D)
+    three_d = domain.dim == 3
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     msh_path = out_dir / "beam.msh"
     size = spec.element_size(domain)
 
-    with _gmsh_session("cantilever_beam_fitted", log) as gmsh_log:
+    with _gmsh_session("design_domain_fitted", log) as gmsh_log:
         surf_tag = _import_single(brep_path, 2)
-        # split the free edge at mid-height so the tip load has a node to act on
-        tip = gmsh.model.occ.addPoint(domain.length, domain.height / 2.0, 0.0)
-        gmsh.model.occ.fragment([(2, surf_tag)], [(0, tip)])
-        gmsh.model.occ.synchronize()
-        surf_tag = gmsh.model.getEntities(2)[0][1]
+        before = len(gmsh.model.getEntities(0))
+        tags = [gmsh.model.occ.addPoint(float(x), float(y), 0.0) for x, y in points]
+        if tags:
+            gmsh.model.occ.fragment([(2, surf_tag)], [(0, t) for t in tags])
+            gmsh.model.occ.synchronize()
+            surfaces = gmsh.model.getEntities(2)
+            if len(surfaces) != 1:  # pragma: no cover - a point cannot split a face
+                raise RuntimeError(f"embedding region points split the profile into {len(surfaces)}")
+            surf_tag = surfaces[0][1]
         n_curves = len(gmsh.model.getEntities(1))
-        fixed, loaded = _curves_at_x(0.0), _curves_at_x(domain.length)
-        if not fixed or not loaded:  # pragma: no cover - defensive
-            raise RuntimeError("the profile has no edge at x = 0 or x = L")
         if log is not None:
+            added = len(gmsh.model.getEntities(0)) - before
             log.log(
-                f"imported {brep_path.name}: 1 surface, {n_curves} curves "
-                f"({n_curves - len(fixed) - len(loaded) - 2} on cutouts), free edge split at "
-                f"y = {domain.height / 2:g}"
+                f"imported {brep_path.name}: 1 surface, {n_curves} curves; "
+                f"{added} region point(s) embedded"
             )
             log.log(
                 f"unstructured quads: target size {size:g} mm, frontal-Delaunay "
@@ -409,15 +409,78 @@ def generate_fitted_mesh(
             gmsh.model.occ.synchronize()
             vol_tag = next(tag for dim, tag in extruded if dim == 3)
             gmsh.model.addPhysicalGroup(3, [vol_tag], name=PHYS_DOMAIN)
-            gmsh.model.addPhysicalGroup(2, _surfaces_at_x(0.0), name=PHYS_FIXED)
-            gmsh.model.addPhysicalGroup(2, _surfaces_at_x(domain.length), name=PHYS_LOAD)
             gmsh.model.mesh.generate(3)
         else:
             gmsh.model.addPhysicalGroup(2, [surf_tag], name=PHYS_DOMAIN)
-            gmsh.model.addPhysicalGroup(1, fixed, name=PHYS_FIXED)
-            gmsh.model.addPhysicalGroup(1, loaded, name=PHYS_LOAD)
             gmsh.model.mesh.generate(2)
         gmsh.model.mesh.setOrder(1)
+        _write_msh(msh_path)
+
+    return msh_path, gmsh_log
+
+
+def generate_tet_mesh(
+    domain: Domain,
+    spec: MeshSpec3D,
+    brep_path: Path,
+    out_dir: Path,
+    log: Any = None,
+    regions: dict[str, Any] | None = None,
+) -> tuple[Path, list[str]]:
+    """Mesh the solid in ``brep_path`` — any 3D part — into tetrahedra of
+    ``spec.element`` (linear or quadratic) at edge length ``spec.size``.
+
+    The named ``regions`` are fused into the solid first (OCC fragment), so a
+    region that is not a whole CAD face or edge — a load line across a face,
+    say — is imprinted on the boundary and gets mesh nodes along it.
+    Quadratic elements put their mid-nodes on the CAD geometry, curved faces
+    included.  Returns (msh path, gmsh log).
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    msh_path = out_dir / "beam.msh"
+    size = spec.element_size(domain)
+
+    with _gmsh_session("design_domain_tet", log) as gmsh_log:
+        gmsh.model.occ.importShapes(str(brep_path))
+        gmsh.model.occ.synchronize()
+        volumes = gmsh.model.getEntities(3)
+        if len(volumes) != 1:  # pragma: no cover - the CAD check allows one solid
+            raise RuntimeError(f"expected one solid in {brep_path}, got {len(volumes)}")
+        if regions:
+            # one file per region: importShapes keeps only the highest dimension
+            # it finds, so a face and a line imported together would lose the line
+            tools = []
+            region_brep = out_dir / "region.brep"
+            for shape in regions.values():
+                shape.exportBrep(str(region_brep))
+                tools += gmsh.model.occ.importShapes(str(region_brep))
+            region_brep.unlink()
+            gmsh.model.occ.fragment(volumes, tools)
+            gmsh.model.occ.synchronize()
+        vols = [tag for _, tag in gmsh.model.getEntities(3)]
+        if log is not None:
+            log.log(
+                f"imported {brep_path.name}: {len(vols)} volume, "
+                f"{len(gmsh.model.getEntities(2))} surfaces, {len(gmsh.model.getEntities(1))} curves"
+                + (f"; {len(regions)} region(s) fused in" if regions else "")
+            )
+            kind = (
+                "quadratic (10-node), mid-nodes on the CAD geometry"
+                if spec.element.order == 2 else "linear (4-node)"
+            )
+            log.log(f"tetrahedra: target size {size:g} mm, HXT + Netgen optimisation, {kind}")
+        gmsh.option.setNumber("Mesh.MeshSizeMin", size)
+        gmsh.option.setNumber("Mesh.MeshSizeMax", size)
+        gmsh.option.setNumber("Mesh.Algorithm", 6)  # frontal-Delaunay surfaces
+        # HXT volume meshing, then Gmsh's and Netgen's optimisers: plain Delaunay
+        # leaves slivers in thin parts, which stiffen and ill-condition the solve
+        gmsh.option.setNumber("Mesh.Algorithm3D", 10)
+        gmsh.option.setNumber("Mesh.Optimize", 1)
+        gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
+        gmsh.model.addPhysicalGroup(3, vols, name=PHYS_DOMAIN)
+        gmsh.model.mesh.generate(3)
+        gmsh.model.mesh.setOrder(spec.element.order)
         _write_msh(msh_path)
 
     return msh_path, gmsh_log

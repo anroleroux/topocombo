@@ -7,27 +7,25 @@ quantity SIMP sensitivities are built from.
 
 Conventions: with ``d = mesh.dofs_per_node`` components per node, node ``n``
 owns DOFs ``d*n`` (x), ``d*n + 1`` (y) and, in 3D, ``d*n + 2`` (z); units are
-N and mm throughout, so stresses come out in MPa.  Element routines dispatch on
-``mesh.cell_type``: bilinear quads (plane stress, with an out-of-plane
-thickness) and trilinear hexahedra (full 3D, where the width is modelled and
-``thickness`` is not used).  Both integrate with the 2-point Gauss rule.
+N and mm throughout, so stresses come out in MPa.  Everything element-specific
+comes from the mesh's :class:`~topocombo.elements.Element` (shape functions,
+quadrature, B matrices); this module only picks the constitutive law by
+dimension — plane stress in 2D (with an out-of-plane ``thickness``), full 3D
+elasticity in 3D (where the width is modelled and ``thickness`` is not used).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
-from .mesh_io import Mesh, gauss_points, shape_derivatives
-
-#: 2x2 Gauss-Legendre points and weights on the reference square.
-_GAUSS = [(-1 / np.sqrt(3), -1 / np.sqrt(3)), (1 / np.sqrt(3), -1 / np.sqrt(3)),
-          (1 / np.sqrt(3), 1 / np.sqrt(3)), (-1 / np.sqrt(3), 1 / np.sqrt(3))]
-_NODE_XI = np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]])
+from . import elements
+from .elements import HEX8, QUAD4
+from .mesh_io import Mesh
 
 
 @dataclass(frozen=True)
@@ -64,6 +62,10 @@ class Material:
         d[:3, :3] += 2.0 * mu * np.eye(3)
         d[3:, 3:] = mu * np.eye(3)
         return d
+
+    def stiffness_matrix(self, dim: int) -> np.ndarray:
+        """The D matrix for a ``dim``-dimensional analysis: plane stress in 2D."""
+        return self.constitutive_matrix() if dim == 2 else self.constitutive_matrix_3d()
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -155,6 +157,8 @@ class FEResult:
     equilibrium_residual: float  # ||K U - F|| on the free DOFs
     n_free_dofs: int
     dofs_per_node: int = 2
+    solver: str = "direct"  # what solved it: "direct" or "amg-cg"
+    solver_iterations: int = 0  # CG iterations (0 for a direct solve)
 
     @property
     def displacement_magnitude(self) -> np.ndarray:
@@ -169,70 +173,30 @@ class FEResult:
         return float(-self.component(1).min())
 
 
-def _shape_gradients(coords: np.ndarray, xi: float, eta: float) -> tuple[np.ndarray, float]:
-    """dN/dx, dN/dy (2x4) and det(J) of the isoparametric map at (xi, eta)."""
-    dn_dxi = 0.25 * np.column_stack(
-        [
-            _NODE_XI[:, 0] * (1.0 + _NODE_XI[:, 1] * eta),
-            _NODE_XI[:, 1] * (1.0 + _NODE_XI[:, 0] * xi),
-        ]
-    )  # (4, 2)
-    jac = dn_dxi.T @ coords  # (2, 2)
-    det = float(np.linalg.det(jac))
-    if det <= 0.0:
-        raise ValueError(f"non-positive Jacobian ({det:.3e}); element is inverted or degenerate")
-    return np.linalg.solve(jac, dn_dxi.T), det
-
-
 def strain_displacement(coords: np.ndarray, xi: float, eta: float) -> tuple[np.ndarray, float]:
-    """B matrix (3x8) and det(J) for a Q4 element at (xi, eta)."""
-    grads, det = _shape_gradients(coords, xi, eta)
-    b = np.zeros((3, 8))
-    b[0, 0::2] = grads[0]
-    b[1, 1::2] = grads[1]
-    b[2, 0::2] = grads[1]
-    b[2, 1::2] = grads[0]
-    return b, det
+    """B matrix (3x8) and det(J) for one Q4 element at (xi, eta)."""
+    b, det = elements.strain_displacement(QUAD4, np.asarray(coords)[None], np.array([xi, eta]))
+    return b[0], float(det[0])
 
 
 def element_stiffness(coords: np.ndarray, d: np.ndarray, thickness: float) -> np.ndarray:
-    """Q4 plane-stress element stiffness (8x8) by 2x2 Gauss quadrature."""
-    ke = np.zeros((8, 8))
-    for xi, eta in _GAUSS:
-        b, det = strain_displacement(coords, xi, eta)
-        ke += thickness * det * (b.T @ d @ b)  # unit Gauss weights
-    return ke
+    """Q4 plane-stress element stiffness (8x8) of one element."""
+    return elements.stiffness(QUAD4, np.asarray(coords)[None], d, thickness)[0]
 
 
 def hex_strain_displacement(coords: np.ndarray, point: np.ndarray) -> tuple[np.ndarray, float]:
-    """B matrix (6x24) and det(J) for an H8 element at reference ``point``.
+    """B matrix (6x24) and det(J) for one H8 element at reference ``point``.
 
     Strain order is [exx, eyy, ezz, gxy, gyz, gzx] (engineering shears), matching
     :meth:`Material.constitutive_matrix_3d`.
     """
-    dn_dxi = shape_derivatives("hexahedron", point)  # (8, 3)
-    jac = dn_dxi.T @ coords  # (3, 3)
-    det = float(np.linalg.det(jac))
-    if det <= 0.0:
-        raise ValueError(f"non-positive Jacobian ({det:.3e}); element is inverted or degenerate")
-    g = np.linalg.solve(jac, dn_dxi.T)  # (3, 8): dN/dx, dN/dy, dN/dz
-    b = np.zeros((6, 24))
-    b[0, 0::3] = g[0]
-    b[1, 1::3] = g[1]
-    b[2, 2::3] = g[2]
-    b[3, 0::3], b[3, 1::3] = g[1], g[0]
-    b[4, 1::3], b[4, 2::3] = g[2], g[1]
-    b[5, 2::3], b[5, 0::3] = g[0], g[2]
-    return b, det
+    b, det = elements.strain_displacement(HEX8, np.asarray(coords)[None], np.asarray(point))
+    return b[0], float(det[0])
 
 
 def hex_element_stiffness(coords: np.ndarray, d: np.ndarray) -> np.ndarray:
-    """H8 solid element stiffness (24x24) by 2x2x2 Gauss quadrature."""
-    ke = np.zeros((24, 24))
-    for point in gauss_points(3):
-        b, det = hex_strain_displacement(coords, point)
-        ke += det * (b.T @ d @ b)  # unit Gauss weights
-    return ke
+    """H8 solid element stiffness (24x24) of one element."""
+    return elements.stiffness(HEX8, np.asarray(coords)[None], d)[0]
 
 
 def element_dofs(cells: np.ndarray, dofs_per_node: int = 2) -> np.ndarray:
@@ -247,17 +211,6 @@ def node_dofs(nodes: np.ndarray, dofs_per_node: int = 2) -> np.ndarray:
     return np.sort((dofs_per_node * np.asarray(nodes)[:, None] + comps).reshape(-1))
 
 
-def _element_function(mesh: Mesh, material: Material, thickness: float):
-    """The stiffness routine for the mesh's cell type, bound to its material."""
-    if mesh.cell_type == "quad":
-        d = material.constitutive_matrix()
-        return lambda coords: element_stiffness(coords, d, thickness)
-    if mesh.cell_type == "hexahedron":
-        d = material.constitutive_matrix_3d()
-        return lambda coords: hex_element_stiffness(coords, d)
-    raise NotImplementedError(f"no element formulation for {mesh.cell_type!r} cells")  # pragma: no cover
-
-
 def element_stiffnesses(mesh: Mesh, material: Material, thickness: float) -> np.ndarray:
     """Stiffness matrix of every element at full density, shape (n_elements, k, k).
 
@@ -266,14 +219,15 @@ def element_stiffnesses(mesh: Mesh, material: Material, thickness: float) -> np.
     broadcast view) instead of repeating the integration per element.
     ``thickness`` applies to plane-stress quads only.
     """
-    element = _element_function(mesh, material, thickness)
+    el = mesh.element
+    d = material.stiffness_matrix(el.dim)
     xyz = mesh.nodes[mesh.cells]  # (m, k, dim)
     rel = xyz - xyz[:, :1]
     size = float(np.ptp(mesh.nodes, axis=0).max()) or 1.0
     if np.allclose(rel, rel[:1], rtol=0.0, atol=1e-12 * size):
-        ke = element(rel[0])
+        ke = elements.stiffness(el, rel[:1], d, thickness)[0]
         return np.broadcast_to(ke, (mesh.n_elements, *ke.shape))
-    return np.array([element(coords) for coords in rel])
+    return elements.stiffness(el, rel, d, thickness)
 
 
 def simp_scaling(
@@ -288,16 +242,37 @@ def assemble_stiffness(
     ke_all: np.ndarray,
     scale: np.ndarray | None = None,
 ) -> sp.csc_matrix:
-    """Assemble the global stiffness matrix from per-element matrices."""
+    """Assemble the global stiffness matrix from per-element matrices.
+
+    The sparsity pattern and the map from element entries to it depend only on
+    the mesh, so they are built once and cached on it; each assembly after that
+    — one per SIMP iteration — is a weighted ``bincount``.
+    """
+    indptr, indices, slot = _assembly_plan(mesh)
+    values = ke_all if scale is None else ke_all * np.asarray(scale)[:, None, None]
+    data = np.bincount(slot, weights=values.reshape(-1), minlength=indices.size)
+    n_dof = mesh.n_dofs
+    return sp.csc_matrix((data, indices, indptr), shape=(n_dof, n_dof))
+
+
+def _assembly_plan(mesh: Mesh) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(indptr, row indices, slot of every element-matrix entry) of the global
+    matrix in CSC form, cached on the mesh."""
+    plan = getattr(mesh, "_assembly_plan", None)
+    key = (mesh.n_nodes, mesh.cells.shape)
+    if plan is not None and plan[0] == key:
+        return plan[1]
     dofs = element_dofs(mesh.cells, mesh.dofs_per_node)
     n_edof = dofs.shape[1]
-    values = ke_all if scale is None else ke_all * np.asarray(scale)[:, None, None]
     rows = np.repeat(dofs, n_edof, axis=1).reshape(-1)
     cols = np.tile(dofs, (1, n_edof)).reshape(-1)
     n_dof = mesh.n_dofs
-    return sp.coo_matrix(
-        (values.reshape(-1), (rows, cols)), shape=(n_dof, n_dof)
-    ).tocsc()
+    keys, slot = np.unique(cols.astype(np.int64) * n_dof + rows, return_inverse=True)
+    indices = (keys % n_dof).astype(np.int32)
+    indptr = np.concatenate([[0], np.cumsum(np.bincount(keys // n_dof, minlength=n_dof))])
+    result = (indptr, indices, slot.reshape(-1))
+    mesh._assembly_plan = (key, result)
+    return result
 
 
 def load_vector(mesh: Mesh, load: LoadCase) -> np.ndarray:
@@ -308,9 +283,12 @@ def load_vector(mesh: Mesh, load: LoadCase) -> np.ndarray:
     return f
 
 
-def fixed_dofs(mesh: Mesh, node_set: str) -> np.ndarray:
-    """Every DOF of every node in ``node_set`` (a fully clamped boundary)."""
-    return node_dofs(mesh.node_sets[node_set], mesh.dofs_per_node)
+def fixed_dofs(mesh: Mesh, node_set: str | Sequence[str]) -> np.ndarray:
+    """Every DOF of every node in ``node_set`` — one name or several (fully
+    clamped boundaries)."""
+    names = [node_set] if isinstance(node_set, str) else list(node_set)
+    nodes = np.unique(np.concatenate([np.asarray(mesh.node_sets[n], dtype=int) for n in names]))
+    return node_dofs(nodes, mesh.dofs_per_node)
 
 
 def _von_mises(stress: np.ndarray) -> np.ndarray:
@@ -328,22 +306,11 @@ def _von_mises(stress: np.ndarray) -> np.ndarray:
 def centroid_von_mises(
     mesh: Mesh, u: np.ndarray, material: Material, scale: np.ndarray | None = None
 ) -> np.ndarray:
-    """Von Mises stress at each element centroid, MPa (plane stress for quads)."""
-    if mesh.cell_type == "quad":
-        d = material.constitutive_matrix()
-
-        def b_at_centre(coords: np.ndarray) -> np.ndarray:
-            return strain_displacement(coords, 0.0, 0.0)[0]
-    elif mesh.cell_type == "hexahedron":
-        d = material.constitutive_matrix_3d()
-
-        def b_at_centre(coords: np.ndarray) -> np.ndarray:
-            return hex_strain_displacement(coords, np.zeros(3))[0]
-    else:  # pragma: no cover
-        raise NotImplementedError(f"no element formulation for {mesh.cell_type!r} cells")
-
+    """Von Mises stress at each element's centre, MPa (plane stress in 2D)."""
+    el = mesh.element
+    d = material.stiffness_matrix(el.dim)
     dofs = element_dofs(mesh.cells, mesh.dofs_per_node)
-    b_all = np.array([b_at_centre(mesh.nodes[cell]) for cell in mesh.cells])
+    b_all, _ = elements.strain_displacement(el, mesh.nodes[mesh.cells], el.centre)
     strain = np.einsum("eij,ej->ei", b_all, u[dofs])
     stress = strain @ d.T
     if scale is not None:
@@ -351,50 +318,373 @@ def centroid_von_mises(
     return _von_mises(stress)
 
 
+Load = "LoadCase | Sequence[LoadCase] | np.ndarray"
+
+
+def force_vector(mesh: Mesh, load: Any) -> np.ndarray:
+    """The global force vector of a load: one :class:`LoadCase`, several (their
+    sum — the forces of one load case) or a ready vector."""
+    if isinstance(load, np.ndarray):
+        if load.shape != (mesh.n_dofs,):
+            raise ValueError(f"a force vector needs {mesh.n_dofs} entries, not {load.shape}")
+        return np.asarray(load, dtype=float)
+    if isinstance(load, LoadCase):
+        return load_vector(mesh, load)
+    return sum((load_vector(mesh, part) for part in load), np.zeros(mesh.n_dofs))
+
+
+def constrained_dofs(
+    mesh: Mesh,
+    fixed_node_set: str | Sequence[str] | None = None,
+    prescribed: Mapping[int, float] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """(constrained DOFs, their prescribed values): every DOF of the nodes in
+    ``fixed_node_set`` held at zero, plus the ``prescribed`` DOF -> value map
+    (a component held at a given displacement, zero or not)."""
+    values: dict[int, float] = {}
+    if fixed_node_set is not None:
+        values.update((int(d), 0.0) for d in fixed_dofs(mesh, fixed_node_set))
+    for dof, value in (prescribed or {}).items():
+        if int(dof) in values and values[int(dof)] != float(value):
+            raise ValueError(f"DOF {dof} is held at both {values[int(dof)]:g} and {value:g}")
+        values[int(dof)] = float(value)
+    if not values:
+        raise ValueError("nothing is constrained: the part is free to move")
+    dofs = np.array(sorted(values), dtype=int)
+    return dofs, np.array([values[d] for d in dofs])
+
+
+def rigid_body_free(mesh: Mesh, dofs: np.ndarray) -> int:
+    """How many independent rigid-body motions the constrained ``dofs`` leave
+    possible: 0 when the part is held, otherwise the number of translations
+    and rotations it could still make without deforming."""
+    modes = rigid_body_modes(mesh)[dofs]
+    if modes.size == 0:
+        return modes.shape[1]
+    scale = np.linalg.norm(modes, axis=0)
+    sv = np.linalg.svd(modes / np.maximum(scale, 1e-300), compute_uv=False)
+    return int(modes.shape[1] - np.sum(sv > 1e-9 * sv.max()))
+
+
 def solve(
     mesh: Mesh,
     material: Material,
     thickness: float,
-    load: LoadCase,
-    fixed_node_set: str,
+    load: Any,
+    fixed_node_set: str | Sequence[str] | None = None,
     densities: np.ndarray | None = None,
     penal: float = 3.0,
     ke_all: np.ndarray | None = None,
+    solver: str = "auto",
+    x0: np.ndarray | None = None,
+    prescribed: Mapping[int, float] | None = None,
 ) -> FEResult:
-    """Direct linear-elastic solve; ``densities`` (if given) applies SIMP scaling.
+    """Linear-elastic solve of one load case; see :func:`solve_cases`."""
+    return solve_cases(
+        mesh, material, thickness, [load], fixed_node_set, densities, penal, ke_all,
+        solver, None if x0 is None else [x0], prescribed,
+    )[0]
 
-    Plane stress on a quad mesh (with ``thickness``), full 3D on a hex mesh.
+
+def solve_cases(
+    mesh: Mesh,
+    material: Material,
+    thickness: float,
+    loads: Sequence[Any],
+    fixed_node_set: str | Sequence[str] | None = None,
+    densities: np.ndarray | None = None,
+    penal: float = 3.0,
+    ke_all: np.ndarray | None = None,
+    solver: str = "auto",
+    x0: Sequence[np.ndarray | None] | None = None,
+    prescribed: Mapping[int, float] | Sequence[Mapping[int, float] | None] | None = None,
+    return_system: bool = False,
+) -> list[FEResult] | tuple[list[FEResult], list["LinearSystem"]]:
+    """Linear-elastic solves of several load cases.
+
+    With ``return_system`` it also returns each case's :class:`LinearSystem`
+    — the constrained stiffness and its factorisation — for adjoint solves.
+
+    ``densities`` (if given) applies SIMP scaling.  Plane stress on a 2D mesh
+    (with ``thickness``), full 3D elasticity on a 3D one.
+
+    Constraints are every DOF of ``fixed_node_set`` held at zero plus the
+    ``prescribed`` DOF -> displacement map: one map shared by all cases, or a
+    sequence with one map per case (a support that settles in one case, a
+    jack that pushes in another).  Cases held on the same DOFs share one
+    constrained stiffness and one factorisation.  Each case is solved by
+    partitioning, ``K_ff u_f = f_f - K_fp u_p``.  Its compliance is
+    ``f . u - u_p . r_p`` — the work of the loads less that of the reactions
+    at prescribed DOFs, i.e. minus twice the potential energy at equilibrium.
+    It is ``f . u`` without prescribed displacements, and its sensitivity to
+    an element's stiffness is ``-u_e^T dk_e u_e`` either way, so the SIMP
+    loop needs no special case.
+
+    ``solver`` is ``"direct"`` (sparse LU, factorised once per constrained
+    set), ``"cg"`` (conjugate gradients preconditioned by smoothed-aggregation
+    algebraic multigrid, built on the rigid-body modes), ``"auto"``: direct
+    up to :data:`DIRECT_MAX_DOFS` free DOFs, CG above; or ``"calculix"``:
+    the external CalculiX (:mod:`topocombo.calculix`), all cases in one run,
+    see :func:`_solve_calculix`.  ``x0`` (one entry per case) warm-starts CG
+    — the SIMP loop passes the previous displacements.
     """
     if ke_all is None:
         ke_all = element_stiffnesses(mesh, material, thickness)
     scale = None if densities is None else simp_scaling(densities, penal)
+    per_case = _per_case(prescribed, len(loads))
+    if solver == "calculix":
+        results, case_systems = _solve_calculix(
+            mesh, material, thickness, loads, fixed_node_set, per_case, ke_all, scale
+        )
+        return (results, case_systems) if return_system else results
 
     k = assemble_stiffness(mesh, ke_all, scale)
-    f = load_vector(mesh, load)
-
-    constrained = fixed_dofs(mesh, fixed_node_set)
-    free = np.setdiff1d(np.arange(mesh.n_dofs), constrained, assume_unique=False)
-
-    u = np.zeros(mesh.n_dofs)
-    u[free] = spla.spsolve(k[free][:, free].tocsc(), f[free])
-
-    residual = k @ u - f
+    systems: dict[bytes, LinearSystem] = {}
     dofs = element_dofs(mesh.cells, mesh.dofs_per_node)
-    ue = u[dofs]  # (n_elements, nodes_per_cell * dofs_per_node)
-    unscaled = np.einsum("ei,eij,ej->e", ue, ke_all, ue)
-    element_compliance = unscaled if scale is None else unscaled * scale
+    results, case_systems = [], []
+    for index, load in enumerate(loads):
+        fixed, values = constrained_dofs(mesh, fixed_node_set, per_case[index])
+        system = systems.get(fixed.tobytes())
+        if system is None:
+            loose = rigid_body_free(mesh, fixed)
+            if loose:
+                raise ValueError(
+                    f"the constraints leave {loose} rigid-body motion(s) free "
+                    "(translations or rotations that deform nothing): hold more components"
+                )
+            free = np.setdiff1d(np.arange(mesh.n_dofs), fixed, assume_unique=True)
+            system = LinearSystem(mesh=mesh, free=free, k_ff=k[free][:, free],
+                                  solver=_choose_solver(solver, free.size), fixed=fixed)
+            systems[fixed.tobytes()] = system
+        free = system.free
+        f = force_vector(mesh, load)
+        u = np.zeros(mesh.n_dofs)
+        u[fixed] = values
+        rhs = f[free]
+        if np.any(values):
+            if system.k_fp is None:
+                system.k_fp = k[free][:, fixed]
+            rhs = rhs - system.k_fp @ values
+        case_used, iterations = system.solver, 0
+        if system.solver == "amg-cg":
+            start = None if not x0 or x0[index] is None else np.asarray(x0[index])[free]
+            solution, iterations = _amg_cg(mesh, free, system.k_ff, rhs, start)
+            if solution is None:  # CG did not converge: fall back to the direct solve
+                case_used = "direct (after CG failed)"
+            else:
+                u[free] = solution
+        if case_used.startswith("direct"):
+            if system.factor is None:
+                system.factor = spla.splu(system.k_ff.tocsc())
+            u[free] = system.factor.solve(rhs)
 
-    return FEResult(
-        u=u,
-        compliance=float(f @ u),
-        element_compliance=element_compliance,
-        element_compliance_unscaled=unscaled,
-        von_mises=centroid_von_mises(mesh, u, material, scale),
-        reactions=residual,
-        equilibrium_residual=float(np.linalg.norm(residual[free])),
-        n_free_dofs=int(free.size),
-        dofs_per_node=mesh.dofs_per_node,
-    )
+        residual = k @ u - f  # the reactions on constrained DOFs
+        ue = u[dofs]  # (n_elements, nodes_per_cell * dofs_per_node)
+        unscaled = np.einsum("ei,eij,ej->e", ue, ke_all, ue)
+        element_compliance = unscaled if scale is None else unscaled * scale
+        results.append(FEResult(
+            u=u,
+            compliance=float(f @ u - values @ residual[fixed]),
+            element_compliance=element_compliance,
+            element_compliance_unscaled=unscaled,
+            von_mises=centroid_von_mises(mesh, u, material, scale),
+            reactions=residual,
+            equilibrium_residual=float(np.linalg.norm(residual[free])),
+            n_free_dofs=int(free.size),
+            dofs_per_node=mesh.dofs_per_node,
+            solver=case_used,
+            solver_iterations=iterations,
+        ))
+        case_systems.append(system)
+    if return_system:
+        return results, case_systems
+    return results
+
+
+def _solve_calculix(
+    mesh: Mesh, material: Material, thickness: float, loads: Sequence[Any],
+    fixed_node_set: str | Sequence[str] | None, per_case: list[Mapping[int, float] | None],
+    ke_all: np.ndarray, scale: np.ndarray | None,
+) -> tuple[list[FEResult], list["LinearSystem"]]:
+    """:func:`solve_cases` through CalculiX.
+
+    Displacements and reactions come from CalculiX; compliance is
+    ``f . u - u_p . r_p`` with its reactions.  The element energies (the
+    SIMP sensitivities) and centroid stresses are evaluated on its
+    displacements with topocombo's element matrices — for the 3D elements
+    the same as CalculiX's (they agree to its seven printed digits).
+    ``equilibrium_residual`` is the balance of CalculiX's reactions against
+    the loads, component by component (N): the stiffness matrix stays inside
+    CalculiX."""
+    from . import calculix
+
+    cases, systems, seen = [], [], {}
+    for index, load in enumerate(loads):
+        fixed, values = constrained_dofs(mesh, fixed_node_set, per_case[index])
+        loose = rigid_body_free(mesh, fixed)
+        if loose:
+            raise ValueError(
+                f"the constraints leave {loose} rigid-body motion(s) free "
+                "(translations or rotations that deform nothing): hold more components"
+            )
+        cases.append(calculix.CcxCase(force_vector(mesh, load), fixed, values))
+        key = fixed.tobytes()
+        if key not in seen:
+            free = np.setdiff1d(np.arange(mesh.n_dofs), fixed, assume_unique=True)
+            seen[key] = CalculixSystem(mesh=mesh, free=free, k_ff=None, solver="calculix",
+                                       fixed=fixed, material=material, thickness=thickness,
+                                       scale=scale)
+        systems.append(seen[key])
+    solved = calculix.run(mesh, material.youngs_modulus, material.poisson_ratio, thickness,
+                          cases, scale)
+    dofs = element_dofs(mesh.cells, mesh.dofs_per_node)
+    results = []
+    for case, (u, internal) in zip(cases, solved):
+        u[case.fixed] = case.values  # exactly, not to CalculiX's printed digits
+        ue = u[dofs]
+        unscaled = np.einsum("ei,eij,ej->e", ue, ke_all, ue)
+        # CalculiX's RF is K u at every node; topocombo's reactions are K u - f
+        reactions = internal - case.force
+        balance = internal.reshape(-1, mesh.dofs_per_node).sum(axis=0)
+        results.append(FEResult(
+            u=u,
+            compliance=float(case.force @ u - case.values @ reactions[case.fixed]),
+            element_compliance=unscaled if scale is None else unscaled * scale,
+            element_compliance_unscaled=unscaled,
+            von_mises=centroid_von_mises(mesh, u, material, scale),
+            reactions=reactions,
+            equilibrium_residual=float(np.linalg.norm(balance)),
+            n_free_dofs=int(mesh.n_dofs - case.fixed.size),
+            dofs_per_node=mesh.dofs_per_node,
+            solver="calculix",
+        ))
+    return results, systems
+
+
+def _per_case(
+    prescribed: Mapping[int, float] | Sequence[Mapping[int, float] | None] | None, n: int,
+) -> list[Mapping[int, float] | None]:
+    """One prescribed-displacement map per case, from a shared map or a list."""
+    if prescribed is None or isinstance(prescribed, Mapping):
+        return [prescribed] * n
+    maps = list(prescribed)
+    if len(maps) != n:
+        raise ValueError(f"prescribed has {len(maps)} maps for {n} load cases")
+    return maps
+
+
+@dataclass
+class LinearSystem:
+    """The constrained stiffness of one solve, kept for adjoint solves: the
+    same matrix with any right-hand side, zero at the constrained DOFs."""
+
+    mesh: Mesh
+    free: np.ndarray
+    k_ff: sp.spmatrix
+    factor: Any = None
+    solver: str = "direct"
+    fixed: np.ndarray | None = None
+    k_fp: sp.spmatrix | None = None
+
+    def solve(self, rhs: np.ndarray) -> np.ndarray:
+        """``K lambda = rhs`` with lambda = 0 on constrained DOFs (the adjoint
+        of a response whose derivative with respect to u is ``rhs``)."""
+        out = np.zeros(self.mesh.n_dofs)
+        r = np.asarray(rhs)[self.free]
+        if not np.any(r):
+            return out
+        if self.solver == "amg-cg":
+            solution, _ = _amg_cg(self.mesh, self.free, self.k_ff, r, None)
+            if solution is not None:
+                out[self.free] = solution
+                return out
+        if self.factor is None:
+            self.factor = spla.splu(self.k_ff.tocsc())
+        out[self.free] = self.factor.solve(r)
+        return out
+
+
+@dataclass
+class CalculixSystem(LinearSystem):
+    """A constrained stiffness that lives in CalculiX: each adjoint solve is
+    a CalculiX run with the right-hand side as nodal loads and the
+    constrained DOFs held at zero."""
+
+    material: Material | None = None
+    thickness: float = 1.0
+    scale: np.ndarray | None = None
+
+    def solve(self, rhs: np.ndarray) -> np.ndarray:
+        from . import calculix
+
+        rhs = np.asarray(rhs, dtype=float).copy()
+        rhs[self.fixed] = 0.0
+        if not np.any(rhs):
+            return np.zeros(self.mesh.n_dofs)
+        case = calculix.CcxCase(rhs, self.fixed, np.zeros(self.fixed.size))
+        u, _ = calculix.run(self.mesh, self.material.youngs_modulus,
+                            self.material.poisson_ratio, self.thickness, [case], self.scale)[0]
+        u[self.fixed] = 0.0
+        return u
+
+
+#: Above this many free DOFs, ``solver="auto"`` switches from the direct sparse
+#: LU to multigrid-preconditioned CG (a quadratic-tet mesh of the published
+#: part at 1 mm has ~55k: LU ~7 s per solve, warm-started CG a fraction).
+DIRECT_MAX_DOFS = 30_000
+SOLVERS = ("auto", "direct", "cg", "calculix")
+#: CG stops at this relative residual; compliance is then good to ~1e-10.
+CG_RTOL = 1e-9
+
+
+def _choose_solver(solver: str, n_free: int) -> str:
+    if solver not in SOLVERS:
+        raise ValueError(f"solver must be one of {', '.join(SOLVERS)}, not {solver!r}")
+    if solver == "cg" or (solver == "auto" and n_free > DIRECT_MAX_DOFS):
+        try:
+            import pyamg  # noqa: F401
+        except ImportError:  # pragma: no cover - pyamg is a dependency
+            return "direct"
+        return "amg-cg"
+    return "direct"
+
+
+def rigid_body_modes(mesh: Mesh) -> np.ndarray:
+    """The rigid-body displacement fields of the mesh, (n_dofs, 3 in 2D or 6 in 3D):
+    translations and infinitesimal rotations — the near-null space multigrid
+    needs to coarsen an elasticity problem well."""
+    d, n = mesh.dofs_per_node, mesh.n_nodes
+    x = mesh.nodes - mesh.nodes.mean(axis=0)
+    modes = np.zeros((d * n, 3 if d == 2 else 6))
+    for i in range(d):
+        modes[i::d, i] = 1.0
+    if d == 2:
+        modes[0::2, 2], modes[1::2, 2] = -x[:, 1], x[:, 0]
+    else:
+        for col, (a, b) in zip((3, 4, 5), ((0, 1), (1, 2), (2, 0))):
+            modes[a::3, col], modes[b::3, col] = -x[:, b], x[:, a]
+    return modes
+
+
+def _amg_cg(mesh: Mesh, free: np.ndarray, k: sp.spmatrix, f: np.ndarray,
+            x0: np.ndarray | None) -> tuple[np.ndarray | None, int]:
+    """CG on ``k u = f`` preconditioned by smoothed-aggregation AMG built on
+    the rigid-body modes; (u, iterations), or (None, iterations) if it did not
+    converge.  The hierarchy is rebuilt for every solve: reusing one from an
+    earlier SIMP iteration was measured slower, the density changes making CG
+    need several times the iterations."""
+    import pyamg
+
+    k = k.tocsr()
+    ml = pyamg.smoothed_aggregation_solver(k, B=rigid_body_modes(mesh)[free], max_coarse=500)
+    count = [0]
+
+    def tick(_):
+        count[0] += 1
+
+    u, info = spla.cg(k, f, x0=x0, rtol=CG_RTOL, maxiter=2000,
+                      M=ml.aspreconditioner(), callback=tick)
+    return (u if info == 0 else None), count[0]
 
 
 def timoshenko_tip_deflection(

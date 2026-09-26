@@ -1261,6 +1261,7 @@ def render_html(
     cad_image: str | None = None,
     topology_image: str | None = None,
     nav: list[tuple[str, str]] | None = None,
+    elements_image: str | None = None,
 ) -> str:
     params = run.get("params", {})
     domain = params.get("domain", {})
@@ -1443,14 +1444,32 @@ def render_html(
             )
         topology_fig = ""
         if topology_image is not None:
-            topology_fig = (
+            topo = next((st.get("data", {}).get("topology") for st in run.get("steps", [])
+                         if st.get("name") == "design_export"), None) or {}
+            dropped = topo.get("floating_pieces_dropped")
+            smooth = (
                 f"<figure><img src='{_e(topology_image)}' alt='Shaded 3D view of the optimized"
-                " topology'>"
-                "<figcaption>The optimized design as a solid: every element at density"
-                " \u2265 0.5, read back from <code>topology.stl</code> — the file to take into"
-                " Blender or CAD. It is blocky by construction; each step is one element."
+                " topology, smoothed'>"
+                "<figcaption>The optimized design as a smooth solid, read back from"
+                " <code>topology.stl</code> — the file to take into Blender or CAD. It is the"
+                " contour where the density, averaged onto the nodes, crosses 0.5: every"
+                " element is split into linear tetrahedra and cut where the density crosses,"
+                " so the surface runs through elements rather than along their faces. Pieces"
+                " that touch no support are dropped"
+                + (f" ({dropped} here)" if dropped is not None else "")
+                + ", and a few Taubin passes smooth what is left without shrinking it."
                 "</figcaption></figure>"
             )
+            blocky = ""
+            if elements_image is not None:
+                blocky = (
+                    f"<figure><img src='{_e(elements_image)}' alt='Shaded 3D view of the"
+                    " thresholded elements'>"
+                    "<figcaption>The same design element by element: every element at density"
+                    " \u2265 0.5, from <code>topology_elements.stl</code>. Blocky by"
+                    " construction; each step is one element.</figcaption></figure>"
+                )
+            topology_fig = (f"<div class='grid'>{smooth}{blocky}</div>" if blocky else smooth)
         optimization_section = (
             "<h2>Topology optimization</h2>"
             + (
@@ -1602,7 +1621,7 @@ def build_site(run_dir: Path, site_dir: Path, nav: list[tuple[str, str]] | None 
 
     from .cadview import render_brep, render_stl
 
-    cad_image = topology_image = None
+    cad_image = topology_image = elements_image = None
     brep = run_dir / "cad" / "design_domain.brep"
     if brep.exists():
         render_brep(brep, site_dir / "figures" / "cad_domain.png")
@@ -1611,12 +1630,16 @@ def build_site(run_dir: Path, site_dir: Path, nav: list[tuple[str, str]] | None 
     if stl.exists():
         render_stl(stl, site_dir / "figures" / "topology.png")
         topology_image = "figures/topology.png"
+    stl = run_dir / "optimization" / "topology_elements.stl"
+    if stl.exists():
+        render_stl(stl, site_dir / "figures" / "topology_elements.png")
+        elements_image = "figures/topology_elements.png"
 
     index = site_dir / "index.html"
     index.write_text(
         render_html(
             run, svg, copied, solve_figure, density_figure, history, cad_image, topology_image,
-            nav,
+            nav, elements_image,
         )
     )
     return index

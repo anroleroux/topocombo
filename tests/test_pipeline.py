@@ -981,7 +981,9 @@ from topocombo.topology import (  # noqa: E402
     boundary_faces,
     enclosed_volume,
     extrude,
+    linear_tets,
     save_topology_stl,
+    smooth_surface,
     solid_surface,
 )
 from topocombo.viz import available_views  # noqa: E402
@@ -1022,6 +1024,53 @@ def test_surface_of_a_thresholded_design_encloses_the_solid_elements():
     assert enclosed_volume(points, triangles) == pytest.approx(float((densities >= 0.5).sum()))
 
 
+def _ball(n: int, radius: float, centre) -> tuple[Mesh, np.ndarray]:
+    mesh = _brick_grid(n, n, n)
+    centres = mesh.nodes[mesh.cells].mean(axis=1)
+    return mesh, (np.linalg.norm(centres - np.asarray(centre, float), axis=1) < radius).astype(float)
+
+
+def test_hexes_split_into_tets_that_fill_them_and_share_faces():
+    mesh = _brick_grid(3, 2, 2)
+    points, tets, values = linear_tets(mesh, np.arange(mesh.n_nodes, dtype=float))
+    assert len(tets) == 24 * mesh.n_elements
+    assert np.array_equal(values[: mesh.n_nodes], np.arange(mesh.n_nodes))
+    tet_mesh = Mesh(points, tets, {}, "tetra")
+    assert np.all(tet_mesh.cell_measures() > 0)
+    assert tet_mesh.cell_measures().sum() == pytest.approx(mesh.cell_measures().sum())
+    # conforming: the only unshared facets are on the outside of the block
+    assert boundary_faces(tets, tet_mesh.element).shape[0] == 4 * 2 * (3 * 2 + 3 * 2 + 2 * 2)
+
+
+def test_smooth_surface_of_a_ball_is_closed_and_round():
+    mesh, rho = _ball(8, 3.0, (4, 4, 4))
+    for smoothing in (0, 10):
+        points, triangles, facts = smooth_surface(mesh, rho, smoothing=smoothing)
+        assert np.all(_edge_counts(triangles) == 2)  # watertight and manifold
+        # outward, and close to the ball the elements approximate
+        assert enclosed_volume(points, triangles) == pytest.approx(4 / 3 * np.pi * 27, rel=0.1)
+        radius = np.linalg.norm(points - 4.0, axis=1)
+        assert radius.std() < 0.05 * radius.mean()
+        assert facts["floating_pieces_dropped"] == 0
+
+
+def test_smooth_surface_closes_on_the_part_boundary_and_drops_floating_pieces():
+    mesh, rho = _ball(6, 2.5, (0, 3, 3))  # half a ball against the x = 0 face
+    island = np.linalg.norm(mesh.nodes[mesh.cells].mean(axis=1) - [5, 3, 3], axis=1) < 0.9
+    rho[island] = 1.0
+    wall = np.flatnonzero(mesh.nodes[:, 0] == 0.0)
+    kept = smooth_surface(mesh, rho, anchors=wall)
+    both = smooth_surface(mesh, rho)
+    assert kept[2]["floating_pieces_dropped"] == 1 and both[2]["floating_pieces_dropped"] == 0
+    for points, triangles, _ in (kept, both):
+        assert np.all(_edge_counts(triangles) == 2)
+    assert np.all(kept[0][:, 0] < 3.0)  # the island is gone
+    assert enclosed_volume(*kept[:2]) < enclosed_volume(*both[:2])
+    # the cap on the x = 0 face stays flat through the smoothing
+    on_wall = np.isclose(kept[0][:, 0], 0.0)
+    assert on_wall.sum() > 10
+
+
 def test_extruding_a_quad_mesh_gives_positive_hexes():
     nodes = np.array([[0, 0], [2, 0], [2, 1], [0, 1]], dtype=float)
     quad = Mesh(nodes, np.array([[0, 1, 2, 3]]), {}, "quad")
@@ -1042,8 +1091,13 @@ def test_pipeline_writes_a_closed_topology_stl(which, request):
     data = json.loads((out / "run.json").read_text())
     step = next(s for s in data["steps"] if s["name"] == "design_export")
     topo = step["data"]["topology"]
-    assert topo["volume"] == pytest.approx(topo["solid_element_volume"], rel=1e-9)
     assert enclosed_volume(stl.points, triangles) == pytest.approx(topo["volume"], rel=1e-6)
+    # a coarse, grey design: the contour and the thresholded elements differ in detail
+    assert topo["volume"] == pytest.approx(topo["element_volume"], rel=0.5)
+    blocky = meshio.read(str(out / "optimization" / "topology_elements.stl"))
+    assert topo["element_volume"] == pytest.approx(topo["solid_element_volume"], rel=1e-9)
+    assert enclosed_volume(blocky.points, blocky.cells[0].data) == pytest.approx(
+        topo["element_volume"], rel=1e-6)
 
 
 def test_viz_finds_the_views_of_a_run(coarse_run_3d, tmp_path):
@@ -1741,11 +1795,15 @@ def test_hex8_refuses_a_part_that_is_not_a_prism_and_tet10_meshes_it(tmp_path):
     # triangles — two, or four where two solid elements touch along an edge only
     # (its volume differs slightly from the elements': mid-nodes on the curved
     # bore make those elements curved, the STL flattens them into sub-triangles)
-    tri = meshio.read(str(tmp_path / "tet" / "optimization" / "topology.stl"))
+    tri = meshio.read(str(tmp_path / "tet" / "optimization" / "topology_elements.stl"))
     points, triangles = _weld(tri.points, tri.cells_dict["triangle"])
     edges = np.sort(triangles[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
     _, counts = np.unique(edges, axis=0, return_counts=True)
     assert np.all(counts % 2 == 0) and np.mean(counts == 2) > 0.9
+    # the smooth surface is closed and manifold: every edge has exactly two sides
+    tri = meshio.read(str(tmp_path / "tet" / "optimization" / "topology.stl"))
+    points, triangles = _weld(tri.points, tri.cells_dict["triangle"])
+    assert np.all(_edge_counts(triangles) == 2)
 
 
 def test_mesh_specs_reject_tets_on_a_grid_or_in_2d():

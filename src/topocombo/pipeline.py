@@ -900,16 +900,23 @@ def run(
 
             stl = save_topology_stl(
                 mesh, design.densities, out_dir / "optimization" / "topology.stl",
-                thickness=depth,
+                thickness=depth, anchors=fixed_nodes,
             )
             log.log(
                 f"topology: {stl['solid_elements']} of {mesh.n_elements} elements at "
-                f"rho >= {stl['threshold']:g} -> {stl['triangles']} triangles enclosing "
-                f"{stl['volume']:.4g} mm^3"
+                f"rho >= {stl['threshold']:g} -> {stl['element_triangles']} triangles enclosing "
+                f"{stl['element_volume']:.4g} mm^3"
                 + ("" if three_d else f" (extruded by the {depth:g} mm thickness)")
             )
-            log.artifact(stl["path"], "thresholded topology as a closed surface, for Blender (STL)")
-            log.record(topology={k: v for k, v in stl.items() if k != "path"})
+            log.log(
+                f"smooth surface: rho = {stl['threshold']:g} contour, "
+                f"{stl['floating_pieces_dropped']} unsupported piece(s) dropped, "
+                f"{stl['smoothing_passes']} Taubin passes -> {stl['triangles']} triangles "
+                f"enclosing {stl['volume']:.4g} mm^3"
+            )
+            log.artifact(stl["path"], "smooth topology (density contour) as a closed surface, for Blender (STL)")
+            log.artifact(stl["elements_path"], "thresholded elements as a closed surface (STL)")
+            log.record(topology={k: v for k, v in stl.items() if not k.endswith("path")})
 
     json_path, text_path = log.write()
     print(f"\nrun log: {json_path}")

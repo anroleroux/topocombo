@@ -85,7 +85,7 @@ python -m topocombo.viz --run results/cantilever3d
 ### A design as two Python scripts
 
 Any design is a directory with two scripts; `examples/cantilever/` is the
-published one:
+simplest (published at `cantilever/`; the bracket is the main page):
 
 ```
 examples/cantilever/
@@ -387,7 +387,7 @@ Checks, besides the registry invariants every element meets:
 the wall and a narrower arm with a pin hole, meshed with 2998 T10 at 2.5 mm
 (17k DOFs). Its study (described under *Boundary conditions*) loads the pin
 two ways and keeps a ring round it and a pad on the wall solid. CI publishes
-it at `bracket/`, drawn by its front surface — a tet mesh has no layers to
+it as the main page, drawn by its front surface — a tet mesh has no layers to
 show, so each front-facing boundary facet takes its element's value — and in
 3D as the thresholded STL.
 

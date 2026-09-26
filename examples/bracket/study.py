@@ -10,6 +10,11 @@ optimised together: the design minimises the sum of their compliances, so it
 must be stiff both ways.  Two passive regions stay solid whatever the
 optimizer does: a ring round the pin's bore (material to bear on) and a pad
 against the wall (material to bolt through).
+
+MMA with Heaviside projection (beta 1 -> 16) pushes the filter's grey edges to
+solid or void.  Without it nearly half the elements stay grey in so thin a
+part, and the design cut at density 0.5 (``topology.stl``) comes apart: the
+pin hangs on only through grey material.
 """
 from topocombo.study import Fix, Force, LoadCase, Material, Mesh, Passive, SimpParams, Study
 
@@ -28,6 +33,9 @@ study = Study(
         Passive("pin", state="solid", within=2.0),  # a 2 mm ring round the bore
         Passive("wall", state="solid", within=1.5),  # a 1.5 mm mounting pad
     ],
-    optimize=SimpParams(volume_fraction=0.3, penal=3.0, filter_radius=1.5 * size),
+    optimize=SimpParams(
+        volume_fraction=0.3, penal=3.0, filter_radius=1.5 * size,
+        optimizer="mma", projection=16.0, max_iterations=400,
+    ),
     crosscheck=True,  # solve again in CalculiX and compare
 )
